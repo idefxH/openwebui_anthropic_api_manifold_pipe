@@ -3,7 +3,7 @@ title: Anthropic API Integration
 author: Podden (https://github.com/Podden/)
 github: https://github.com/Podden/openwebui_anthropic_api_manifold_pipe
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.5.10
+version: 0.5.11
 license: MIT
 requirements: pydantic>=2.0.0, anthropic>=0.75.0
 environment_variables:
@@ -30,6 +30,9 @@ Supports:
 - Native PDF Upload (visual PDF analysis with charts/images)
 
 Changelog:
+v0.5.11
+- Added Compatibility to Build-in Tools from OpenWebUI 0.7.x 
+
 v0.5.10
 - Performance: Pre-compiled regex patterns at module level (5-10x faster pattern matching)
 - Performance: Added debug logging guards to prevent expensive JSON serialization
@@ -220,7 +223,7 @@ from anthropic import (
     UnprocessableEntityError,
 )
 from typing import Literal
-
+from requests import Request
 
 logger = logging.getLogger(__name__)
 
@@ -276,17 +279,14 @@ except ImportError:
     ModelForm = None
     MODELS_AVAILABLE = False
 
-# Import OpenWebUI Files and Storage for PDF native upload
+# Import OpenWebUI builtin tools helper
 try:
-    from open_webui.models.files import Files
-    from open_webui.storage.provider import Storage
-    from pathlib import Path
-    FILES_AVAILABLE = True
+    from open_webui.utils.tools import get_builtin_tools
+    BUILTIN_TOOLS_AVAILABLE = True
 except ImportError:
-    Files = None
-    Storage = None
-    Path = None
-    FILES_AVAILABLE = False
+    get_builtin_tools = None
+    BUILTIN_TOOLS_AVAILABLE = False
+
 
 class Pipe:
     API_VERSION = "2023-06-01"  # Current API version as of May 2025
@@ -1106,12 +1106,9 @@ class Pipe:
         # Correct Order for Caching: Tools, System, Messages
         tools_list = self._convert_tools_to_claude_format(
             __tools__,
-            actual_model_name,
+            body,
             __user__,
             __metadata__,
-            enable_programmatic_calling=enable_programmatic_calling,
-            enable_tool_search=enable_tool_search,
-            max_tool_description_length=max_tool_description_length,
         )
 
         # Decide on code execution inclusion early so we can set beta headers later
@@ -1384,43 +1381,72 @@ class Pipe:
     def _convert_tools_to_claude_format(
         self,
         __tools__,
-        actual_model_name: str,
+        body: Dict[str, Any],
         __user__: Dict[str, Any],
         __metadata__: dict[str, Any],
-        enable_programmatic_calling: bool = False,
-        enable_tool_search: bool = False,
-        max_tool_description_length: int = 100,
     ) -> List[dict]:
         """
         Convert OpenWebUI tools format to Claude API format.
+
+        Extracts tool specs from TWO sources:
+        1. body.tools - Built-in tools (OpenAI format specs only, no callables)
+        2. __tools__ - User tools (specs + callables for execution)
+
         Args:
-            __tools__: Dict of tools from OpenWebUI
+            __tools__: Dict of user tools with callables from OpenWebUI
+            body: Request body containing body.tools (built-in tool specs)
             actual_model_name: Model name for capability checking
             __user__: User dict for valve overrides
             __metadata__: Metadata dict for checking enforcement flags
-            enable_programmatic_calling: If True, add allowed_callers to tools
-            enable_tool_search: If True, defer tools with long descriptions
-            max_tool_description_length: Max length before deferring a tool
         Returns:
             list: Tools in Claude API format
         """
         claude_tools = []
         tool_names_seen = set()  # Track unique tool names
-        deferred_tools_count = 0
 
+        # Extract built-in tools from body.tools (OpenAI format)
+        body_tools = body.get("tools", [])
+        if body_tools:
+            logger.debug(f"Found {len(body_tools)} built-in tools in body.tools")
+            for tool_entry in body_tools:
+                if tool_entry.get("type") == "function":
+                    func = tool_entry.get("function", {})
+                    name = func.get("name")
+                    if not name or name in tool_names_seen:
+                        continue
+
+                    # Convert OpenAI format to Claude format
+                    claude_tool = {
+                        "name": name,
+                        "description": func.get("description", f"Tool: {name}"),
+                        "input_schema": func.get(
+                            "parameters", {"type": "object", "properties": {}}
+                        ),
+                    }
+                    claude_tools.append(claude_tool)
+                    tool_names_seen.add(name)
+                    logger.debug(f"Converted built-in tool from body.tools: {name}")
+
+        # Log user tools from __tools__
         if __tools__ and logger.isEnabledFor(logging.DEBUG):
             # Only attempt serialization if DEBUG is enabled
             try:
-                logger.debug(f" Converting {len(__tools__)} tools: {json.dumps(__tools__, indent=2)}")
+                logger.debug(
+                    f"Converting {len(__tools__)} user tools: {json.dumps(__tools__, indent=2)}"
+                )
             except (TypeError, ValueError):
                 # Log tool names only if full serialization fails
                 tool_names = list(__tools__.keys())[:10]
-                logger.debug(f" Converting {len(__tools__)} tools (names): {tool_names}{'...' if len(__tools__) > 10 else ''}")
+                logger.debug(
+                    f"Converting {len(__tools__)} user tools (names): {tool_names}{'...' if len(__tools__) > 10 else ''}"
+                )
         elif not __tools__:
-            logger.debug("No tools to convert")
+            logger.debug("No user tools to convert")
 
         # Add web search tool if enabled OR if metadata enforces it (even if valve is disabled)
-        web_search_enabled = self.valves.WEB_SEARCH or __metadata__.get("web_search_enforced", False)
+        web_search_enabled = self.valves.WEB_SEARCH or __metadata__.get(
+            "web_search_enforced", False
+        )
         if web_search_enabled:
             # Get user location values with fallback to global valves
             city = (
@@ -1470,50 +1496,74 @@ class Pipe:
         #     )
         #     tool_names_seen.add("memory")
 
-        if not __tools__ or len(__tools__) == 0:
-            logger.debug(f"No tools provided, using default Claude tools")
-            return claude_tools
+        # Process user tools from __tools__ (these have callables for execution)
+        if __tools__ and len(__tools__) > 0:
+            for tool_name, tool_data in __tools__.items():
+                if not isinstance(tool_data, dict) or "spec" not in tool_data:
+                    logger.debug(f"Skipping invalid tool: {tool_name} - missing spec")
+                    continue
 
-        for tool_name, tool_data in __tools__.items():
-            if not isinstance(tool_data, dict) or "spec" not in tool_data:
-                logger.debug(f"Skipping invalid tool: {tool_name} - missing spec")
-                continue
+                spec = tool_data["spec"]
 
-            spec = tool_data["spec"]
+                # Extract basic tool info
+                name = spec.get("name", tool_name)
 
-            # Extract basic tool info
-            name = spec.get("name", tool_name)
+                # Skip if tool name already exists
+                if name in tool_names_seen:
+                    logger.info(f"Skipping duplicate tool: {name}")
+                    continue
 
-            # Skip if tool name already exists
-            if name in tool_names_seen:
-                logger.info(f"Skipping duplicate tool: {name}")
-                continue
+                # Skip if toolname starts with _ or __
+                if name.startswith("_"):
+                    logger.debug(f"Skipping private tool: {name}")
+                    continue
 
-            # Skip if toolname starts with _ or __
-            if name.startswith("_"):
-                logger.debug(f"Skipping private tool: {name}")
-                continue
+                description = spec.get("description", f"Tool: {name}")
+                parameters = spec.get("parameters", {})
 
-            description = spec.get("description", f"Tool: {name}")
-            parameters = spec.get("parameters", {})
+                # Convert OpenWebUI parameters to Claude input_schema format
+                # OpenWebUI parameters are typically already in JSON Schema format
+                input_schema = {
+                    "type": "object",
+                    "properties": parameters.get("properties", {}),
+                }
 
-            # Convert OpenWebUI parameters to Claude input_schema format
-            # OpenWebUI parameters are typically already in JSON Schema format
-            input_schema = {
-                "type": "object",
-                "properties": parameters.get("properties", {}),
-            }
+                # Add required fields if they exist
+                if "required" in parameters:
+                    input_schema["required"] = parameters["required"]
 
-            # Add required fields if they exist
-            if "required" in parameters:
-                input_schema["required"] = parameters["required"]
+                # Create Claude tool format
+                claude_tool = {
+                    "name": name,
+                    "description": description,
+                    "input_schema": input_schema,
+                }
 
-            # Create Claude tool format
-            claude_tool = {
-                "name": name,
-                "description": description,
-                "input_schema": input_schema,
-            }
+                claude_tools.append(claude_tool)
+                tool_names_seen.add(name)
+
+        for claude_tool in claude_tools:
+            logger.debug(
+                f"Processing tool for deferral/programmatic calling: {claude_tool['name']}"
+            )
+            # Check if tool should be deferred for tool search
+            if self.valves.ENABLE_TOOL_SEARCH:
+                # Skip deferring if tool is in exclusion list
+                name = claude_tool["name"]
+                if name not in self.valves.TOOL_SEARCH_EXCLUDE_TOOLS:
+                    # Calculate tool definition size (JSON representation)
+                    tool_json = json.dumps(claude_tool)
+                    tool_len = len(tool_json)
+                    logger.debug(
+                        f"Tool '{name}' definition length: {tool_len} characters"
+                    )
+                    if len(tool_json) > self.valves.TOOL_SEARCH_MAX_DESCRIPTION_LENGTH:
+                        logger.debug(
+                            f"Deferring loading of tool '{name}' for tool search"
+                        )
+                        claude_tool["defer_loading"] = True
+                    else:
+                        logger.debug(f"Tool '{name}' will be loaded normally")
 
             # Add allowed_callers for programmatic tool calling (only if model supports it)
             # When enabled, tools can ONLY be called from code execution, not directly by Claude
@@ -1521,31 +1571,24 @@ class Pipe:
             # - Large data processing (filter/aggregate before returning to context)
             # - Multi-step workflows (save tokens by chaining tool calls in code)
             # - Conditional logic based on intermediate results
-            if enable_programmatic_calling:
-                model_info = self.get_model_info(actual_model_name)
-                if model_info.get("supports_programmatic_calling", False):
-                    claude_tool["allowed_callers"] = ["code_execution_20250825"]
+            # if self.valves.ENABLE_PROGRAMMATIC_TOOL_CALLING:
+            #     model_info = self.get_model_info(actual_model_name)
+            #     if model_info.get("supports_programmatic_calling", False):
+            #         claude_tool["allowed_callers"] = ["code_execution_20250825"]
+            #
 
-            # Check if tool should be deferred for tool search
-            if enable_tool_search:
-                # Skip deferring if tool is in exclusion list
-                if name not in self.valves.TOOL_SEARCH_EXCLUDE_TOOLS:
-                    # Calculate tool definition size (JSON representation)
-                    tool_json = json.dumps(claude_tool)
-                    if len(tool_json) > max_tool_description_length:
-                        claude_tool["defer_loading"] = True
-                        deferred_tools_count += 1
-                        logger.debug(
-                            f"Tool '{name}' deferred (size: {len(tool_json)} > {max_tool_description_length})"
-                        )
-                else:
-                    logger.debug(f"Tool '{name}' excluded from deferring (in TOOL_SEARCH_EXCLUDE_TOOLS)")
-
-            claude_tools.append(claude_tool)
-            tool_names_seen.add(name)
-
-        if deferred_tools_count > 0:
-            logger.debug(f"Deferred {deferred_tools_count} tools for tool search")
+        if any(tool.get("defer_loading", False) for tool in claude_tools):
+            if self.valves.TOOL_SEARCH_TYPE == "regex":
+                tool_search_tool = {
+                    "type": "tool_search_tool_regex_20251119",
+                    "name": "tool_search_tool_regex",
+                }
+            else:  # bm25 (default)
+                tool_search_tool = {
+                    "type": "tool_search_tool_bm25_20251119",
+                    "name": "tool_search_tool_bm25",
+                }
+            claude_tools.insert(0, tool_search_tool)
 
         logger.debug(f"Total tools converted: {len(claude_tools)}")
 
@@ -1554,6 +1597,7 @@ class Pipe:
     async def pipe(
         self,
         body: dict[str, Any],
+        __request__: Request,
         __user__: Dict[str, Any],
         __event_emitter__: Callable[[Dict[str, Any]], Awaitable[None]],
         __metadata__: dict[str, Any] = {},
@@ -1647,6 +1691,31 @@ class Pipe:
             # STEP 2: Await tools if needed
             if inspect.isawaitable(__tools__):
                 __tools__ = await __tools__
+
+            # STEP 2.5: Get builtin tools from OpenWebUI (for tools from body.tools)
+            builtin_tools = {}
+            if BUILTIN_TOOLS_AVAILABLE and __request__:
+                try:
+                    # Determine if memory feature is enabled
+                    memory_enabled = (
+                        __user__.get("settings", {}).get("ui", {}).get("memory", False)
+                        if __user__ else False
+                    )
+                    builtin_tools = get_builtin_tools(
+                        __request__,
+                        {
+                            "__user__": __user__,
+                            "__event_emitter__": __event_emitter__,
+                            "__chat_id__": __metadata__.get("chat_id") if __metadata__ else None,
+                            "__message_id__": __metadata__.get("message_id") if __metadata__ else None,
+                        },
+                        features={"memory": memory_enabled},
+                        model={},
+                    )
+                    logger.debug(f"Loaded {len(builtin_tools)} builtin tools: {list(builtin_tools.keys())}")
+                except Exception as e:
+                    logger.warning(f"Could not load builtin tools: {e}")
+                    builtin_tools = {}
 
             # STEP 3: Auto-enable native function calling if tools are present
             # This prevents OpenWebUI's function_calling task system from being triggered
@@ -2383,10 +2452,10 @@ class Pipe:
                                             }
                                         )
 
-                                        # Look up tool
-                                        tool = __tools__.get(tool_name)
-                                        if tool:
-                                            # Store metadata for later result matching
+                                        # Look up tool in __tools__ first (user tools with callable)
+                                        tool = __tools__.get(tool_name) if __tools__ else None
+                                        if tool and tool.get("callable"):
+                                            # User tool with callable - execute directly
                                             tool_call_data_list.append(tool_call_data)
 
                                             # Start execution immediately as async task (no extra status event needed)
@@ -2401,10 +2470,45 @@ class Pipe:
                                             running_tool_tasks.append(task)
 
                                             logger.debug(
-                                                f"🚀 Started immediate execution for '%s' (task #%d)",
+                                                f"🚀 Started immediate execution for user tool '%s' (task #%d)",
                                                 tool_name,
                                                 len(running_tool_tasks),
                                             )
+                                        elif tool_name in builtin_tools and builtin_tools[tool_name].get("callable"):
+                                            # Builtin tool from OpenWebUI - execute with proper context
+                                            tool_call_data_list.append(tool_call_data)
+                                            
+                                            args = (
+                                                tool_input
+                                                if isinstance(tool_input, dict)
+                                                else {}
+                                            )
+                                            task = asyncio.create_task(
+                                                builtin_tools[tool_name]["callable"](**args)
+                                            )
+                                            running_tool_tasks.append(task)
+                                            
+                                            logger.debug(
+                                                f"🚀 Started immediate execution for builtin tool '%s' (task #%d)",
+                                                tool_name,
+                                                len(running_tool_tasks),
+                                            )
+                                        else:
+                                            # Unknown tool - add error result
+                                            logger.warning(
+                                                f"Tool '{tool_name}' not found in __tools__ or known builtins"
+                                            )
+                                            tool_call_data_list.append(tool_call_data)
+                                            
+                                            # Capture tool_name in default arg to avoid closure issue
+                                            async def error_result(tn=tool_name):
+                                                return json.dumps({
+                                                    "error": f"Tool '{tn}' is not available. "
+                                                             f"It may require server context or is not configured."
+                                                }, ensure_ascii=False)
+                                            
+                                            task = asyncio.create_task(error_result())
+                                            running_tool_tasks.append(task)
                                     except Exception as e:
                                         logger.error(
                                             f"Failed to start tool execution: {e}"
@@ -2514,12 +2618,18 @@ class Pipe:
                                                         "name", ""
                                                     )
 
-                                                    # Determine if error
-                                                    is_error = isinstance(
-                                                        tool_result, str
-                                                    ) and tool_result.startswith(
-                                                        "Error:"
-                                                    )
+                                                    # Determine if error (check for "Error:" prefix or JSON {"error": ...})
+                                                    is_error = False
+                                                    if isinstance(tool_result, str):
+                                                        if tool_result.startswith("Error:"):
+                                                            is_error = True
+                                                        else:
+                                                            try:
+                                                                parsed = json.loads(tool_result)
+                                                                if isinstance(parsed, dict) and "error" in parsed:
+                                                                    is_error = True
+                                                            except (json.JSONDecodeError, TypeError):
+                                                                pass
 
                                                     # Build result block for API
                                                     result_block = {
