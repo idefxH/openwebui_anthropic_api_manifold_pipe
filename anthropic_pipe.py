@@ -2,7 +2,7 @@
 title: Anthropic API Integration
 author: Podden (https://github.com/Podden/)
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.2
+version: 0.3
 license: MIT
 requirements: pydantic>=2.0.0, aiohttp>=3.8.0
 environment_variables:
@@ -18,22 +18,43 @@ Supports:
 - Prompt caching (server-side)
 - Promt Caching of System Promts, Messages- and Tools Array
 - Comprehensive error handling
-
-Todo:
-- Image and PDF processing
+- Image processing
 - Web_Search Toggle Action
 - Fine Grained Tool Streaming
 - Extended Thinking Toggle Action
-- Bash Tool
-- Text Editor Tool
+- Code Execution Tool
+- Vision
+
+Todo:
 - Files API
 - PDF support
-- Vision
-- PDF support
-- Non-Streaming
-- Usage for OpenWebUI
 - API Key from UserValves as Alternative
 - MCP Connector (mcpo is enought for me atm)
+
+Changelog:
+v0.3 (September 2025)
+- Added Vision support (__files__ handling & image processing improvements)
+- Added Extended Thinking filter & metadata override with clamped budget logic (default 10K, safe min/max enforcement)
+- Added Web Search Enforcement toggle (one‑shot metadata flag forces web_search tool_choice)
+- Added Anthropic Code Execution Tool with toggle filter & beta header
+- Enabled fine‑grained tool streaming beta by default
+- Added metadata & valve controlled injection of code execution tool spec
+- Improved cache control: auto‑disables cache when dynamic Memory / RAG blocks detected; ephemeral caching for stable blocks
+- Refined tool_choice precedence (enforced web search before auto)
+- Added 1M context optional beta header for supported Sonnet 4 models
+- Improved malformed tool_use JSON salvage (_finalize_tool_buffer) & robust final chunk flush
+- Misc debug output refinements & system prompt cleanup
+
+v0.2 (August 2025)
+- Fixed caching by moving Memories to Messages instead of system prompt
+- You can show Cache Usage Statistics with a Valve as Source Event
+- Fixed error where last chunk is not shown in frontend
+- Fixed defective event_emitters and removed unneeded method
+- Fixed unnecessary requirements
+- Implemented Web Search Valves and error handling
+- Robust error handling
+- Added Cache_Control for System_Prompt, Tools, and Message Array
+- Refactored for readability and support for new models
 """
 
 from collections.abc import Awaitable
@@ -44,7 +65,18 @@ import random
 from typing import Any, Callable, List, Union, Dict, Optional
 from pydantic import BaseModel, Field
 import aiohttp
-from anthropic import APIStatusError, AsyncAnthropic, RateLimitError, APIConnectionError, AuthenticationError, BadRequestError, InternalServerError, PermissionDeniedError, NotFoundError, UnprocessableEntityError
+from anthropic import (
+    APIStatusError,
+    AsyncAnthropic,
+    RateLimitError,
+    APIConnectionError,
+    AuthenticationError,
+    BadRequestError,
+    InternalServerError,
+    PermissionDeniedError,
+    NotFoundError,
+    UnprocessableEntityError,
+)
 import json
 import inspect
 
@@ -121,7 +153,6 @@ class Pipe:
         300  # Increased timeout for longer responses with extended thinking
     )
     THINKING_BUDGET_TOKENS = 16000  # Default thinking budget tokens (max 16K)
-    CLAUDE_4_THINKING_BUDGET = 32000  # Enhanced thinking budget for Claude 4 models
 
     class Valves(BaseModel):
         ANTHROPIC_API_KEY: str = "Your API Key Here"
@@ -130,7 +161,7 @@ class Pipe:
         )
         MAX_OUTPUT_TOKENS: bool = True  # Valve to use maximum possible output tokens
         THINKING_BUDGET_TOKENS: int = Field(
-            default=16000, ge=0, le=16000
+            default=10000, ge=0, le=16000
         )  # Configurable thinking budget tokens 16,000 max
         ENABLE_1M_CONTEXT: bool = Field(
             default=False,
@@ -141,7 +172,9 @@ class Pipe:
             description="Enable web search tool for Claude models",
         )
         WEB_SEARCH_MAX_USES: int = Field(
-            default=5, ge=1, le=20,
+            default=5,
+            ge=1,
+            le=20,
             description="Maximum number of web searches allowed per conversation",
         )
         WEB_SEARCH_USER_CITY: str = Field(
@@ -159,6 +192,10 @@ class Pipe:
         WEB_SEARCH_USER_TIMEZONE: str = Field(
             default="Europe/Berlin",
             description="User's timezone for web search location context",
+        )
+        SHOW_USAGE: bool = Field(
+            default=False,
+            description="Show token usage statistics as citations",
         )
         DEBUG: bool = Field(
             default=False,
@@ -272,8 +309,10 @@ class Pipe:
     def _create_payload(
         self,
         body: Dict,
+        __metadata__: dict[str, Any],
         __user__: Optional[dict],
         __tools__: Optional[Dict[str, Dict[str, Any]]],
+        __files__: Optional[Dict[str, Any]] = None,
     ) -> tuple[dict, dict]:
         """
         Create the payload and headers for Claude API request.
@@ -299,12 +338,12 @@ class Pipe:
             )
 
         max_tokens_limit = self.MODEL_MAX_TOKENS.get(actual_model_name, 4096)
+        requested_max_tokens = body.get("max_tokens", max_tokens_limit)
         max_tokens = (
             max_tokens_limit
             if self.valves.MAX_OUTPUT_TOKENS
-            else min(body.get("max_tokens", max_tokens_limit), max_tokens_limit)
+            else min(requested_max_tokens, max_tokens_limit)
         )
-        print(body)
         payload: dict[str, Any] = {
             "model": actual_model_name,
             "max_tokens": max_tokens,
@@ -318,18 +357,32 @@ class Pipe:
         if body.get("top_p") is not None:
             payload["top_p"] = float(body.get("top_p"))
 
-        # TODO: Implement Thinking with a Toggle Actiom over __metadata__
-        # if actual_model_name in self.THINKING_SUPPORTED_MODELS:
-        #     # Hybrid models: enable thinking only when -thinking variant chosen
-        #     should_enable_thinking = is_thinking_variant
-        # else:
-        #     should_enable_thinking = self.valves.ENABLE_THINKING
+        if self.valves.DEBUG:
+            print(f"[DEBUG] Thinking Filter: {__metadata__.get('anthropic_thinking')}")
+            print(f"__metadata__: {json.dumps(__metadata__, indent=2)}")
+       
+        if "anthropic_thinking" in __metadata__:
+            should_enable_thinking = __metadata__.get("anthropic_thinking", False)
+        elif actual_model_name in self.THINKING_SUPPORTED_MODELS:
+            # Hybrid models: enable thinking only when -thinking variant chosen
+            should_enable_thinking = is_thinking_variant
+        else:
+            should_enable_thinking = self.valves.ENABLE_THINKING
+            
+        if self.valves.DEBUG:
+            print(f"[DEBUG] Thinking Enabled?: {should_enable_thinking}")
+            
 
-        # if should_enable_thinking and actual_model_name in self.THINKING_SUPPORTED_MODELS:
-        #     thinking_budget = self.valves.THINKING_BUDGET_TOKENS
-        #     if any(x in actual_model_name for x in ["claude-sonnet-4", "claude-opus-4"]):
-        #         thinking_budget = min(self.CLAUDE_4_THINKING_BUDGET, self.valves.THINKING_BUDGET_TOKENS * 2)
-        #     payload["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget}
+        if should_enable_thinking and actual_model_name in self.THINKING_SUPPORTED_MODELS:
+            # Ensure thinking.budget_tokens < max_tokens and at least 1024
+            requested_thinking_budget = self.valves.THINKING_BUDGET_TOKENS
+            # Clamp thinking budget to valid range
+            max_valid_thinking_budget = max(max_tokens - 1, 1023)
+            thinking_budget = max(1024, min(requested_thinking_budget, max_valid_thinking_budget))
+            # If max_tokens is too low, set thinking_budget to max_tokens - 1
+            if max_tokens <= 1024:
+                thinking_budget = max_tokens - 1 if max_tokens > 1 else 1
+            payload["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget}
 
         if "response_format" in body:
             payload["response_format"] = {"type": body["response_format"].get("type")}
@@ -337,31 +390,97 @@ class Pipe:
         raw_messages = body.get("messages", []) or []
         system_messages = []
         processed_messages: list[dict] = []
+        # Memory System Block
+        user_ctx_block = None
+        disable_cache = False
+        if self.valves.DEBUG:
+            print(f"[DEBUG] Raw Messages: {json.dumps(raw_messages, indent=2)}")
         for msg in raw_messages:
             role = msg.get("role")
             processed_content = self._process_content(msg.get("content"))
             if not processed_content:
                 continue
             if role == "system":
-                for sc in processed_content:
-                    system_messages.append(sc)
+                for block in processed_content:
+                    text = block["text"]
+                    # Remove Empty Memory
+                    if "User Context:\n\n" in text:
+                        # Split and reconstruct without "User Context:\n\n"
+                        parts = text.split("User Context:\n\n")
+                        if len(parts) > 1:
+                            # Reconstruct without the "User Context:\n\n" prefix
+                            text = parts[0] + parts[1]
+                            block["text"] = text
+                    #Disable Caching if Memory System or RAG is used as this always changes the system promt and invalidates the cache
+                    if "User Context:\n" in text or ("### Task:" in text and "</user_query>" in text):
+                        disable_cache = True
+                    # if "User Context:" in text:
+                    #     before, after = text.split("User Context:", 1)
+                    #     # Fix for OpenWebUI Memory System
+                    #     # Block vor User Context: cachebar
+                    #     if before.strip():
+                    #         cache_block = block.copy()
+                    #         cache_block["text"] = before.strip()
+                    #         cache_block["cache_control"] = {"type": "ephemeral"}
+                    #         system_messages.append(cache_block)
+                    #     # Block ab User Context: nicht cachebar
+                    #     user_ctx_block = after.strip()
+                    #     # system_messages.append(user_ctx_block)
+                    # else:
+                    #     system_messages.append(block)
+                    if (len(text.strip()) > 0) and (not text.isspace()):
+                        if not disable_cache:
+                            block["cache_control"] = {"type": "ephemeral"}
+                        system_messages.append(block)
             else:
                 processed_messages.append({"role": role, "content": processed_content})
 
+        if not processed_messages:
+            raise ValueError("No valid messages to process")
+        if self.valves.DEBUG:
+            print(f"[DEBUG] Processed Messages: {json.dumps(processed_messages, indent=2)}")
+            print(f"[DEBUG] System Messages: {json.dumps(system_messages, indent=2)}")
+            print(f"[DEBUG] Disable Cache: {disable_cache}")
         # Correct Order for Caching: Tools, System, Messages
         tools_list = self._convert_tools_to_claude_format(__tools__)
+        # Decide on code execution inclusion early so we can set beta headers later
+        activate_code_execution = __metadata__.get("activate_code_execution_tool", False)
+        # Append code execution tool (no parameters) if enabled
+        if activate_code_execution:
+            code_exec_tool = {"type": "code_execution_20250522", "name": "code_execution"}
+            # Avoid duplicates if already added
+            if not any(t.get("name") == "code_execution" for t in tools_list):
+                tools_list.append(code_exec_tool)
+        
         if tools_list and len(tools_list) > 0:
+            if not disable_cache and tools_list:
+                tools_list[-1]["cache_control"] = {"type": "ephemeral"}
+
+
+        if tools_list:
+            # Check for enforced web search or code execution in metadata (precedence: specific enforcement first)
+            if __metadata__.get("web_search_enforced"):
+                payload["tool_choice"] = {"type": "tool", "name": "web_search"}
+                __metadata__["web_search_enforced"] = False  # one-shot
+            else:
+                payload["tool_choice"] = {"type": "auto"}
             payload["tools"] = tools_list
-            payload["tool_choice"] = {"type": "auto"}
 
         if system_messages and len(system_messages) > 0:
-            system_messages[-1]["cache_control"] = {"type": "ephemeral"}
             payload["system"] = system_messages
 
         if processed_messages and len(processed_messages) > 0:
             last_msg = processed_messages[-1]
             content_blocks = last_msg.get("content", [])
-            if content_blocks:
+            # if (user_ctx_block is not None) and isinstance(content_blocks, list):
+            #     for block in content_blocks:
+            #         if isinstance(block, dict) and block.get("type") == "text":
+            #             block["text"] += (
+            #                 "\n\n[Injected Memories for Conversational Context. DONT REACT TO THIS: "
+            #                 + user_ctx_block
+            #                 + "]"
+            #             )
+            if not disable_cache and content_blocks:
                 last_content_block = content_blocks[-1]
                 last_content_block.setdefault("cache_control", {"type": "ephemeral"})
             payload["messages"] = processed_messages
@@ -376,6 +495,14 @@ class Pipe:
             "content-type": "application/json",
         }
         beta_headers: list[str] = []
+
+        # Enable fine-grained tool streaming beta unconditionally for now (AIT-86)
+        # This only affects chunking of tool input JSON; execution logic unchanged.
+        beta_headers.append("fine-grained-tool-streaming-2025-05-14")
+
+        # Add code execution beta if valve or metadata enforcement active
+        if activate_code_execution:
+            beta_headers.append("code-execution-2025-05-22")
 
         # Add 1M context header if enabled and model supports it
         if (
@@ -392,7 +519,8 @@ class Pipe:
             print(f"[DEBUG] Headers: {headers}")
         return payload, headers
 
-    def _convert_tools_to_claude_format(self, __tools__):
+    def _convert_tools_to_claude_format(
+        self, __tools__) -> List[dict]:
         """
         Convert OpenWebUI tools format to Claude API format.
         Args:
@@ -425,8 +553,6 @@ class Pipe:
         if not __tools__ or len(__tools__) == 0:
             if self.valves.DEBUG:
                 print(f"[DEBUG] No tools provided, using default Claude tools")
-            if claude_tools:
-                claude_tools[-1]["cache_control"] = {"type": "ephemeral"}
             return claude_tools
 
         for tool_name, tool_data in __tools__.items():
@@ -467,8 +593,7 @@ class Pipe:
         if self.valves.DEBUG:
             print(f"[DEBUG] Total tools converted: {len(claude_tools)}")
 
-        if claude_tools:
-            claude_tools[-1]["cache_control"] = {"type": "ephemeral"}
+        # Cache control for tools handled during payload creation where disable_cache is in scope.
         return claude_tools
 
     async def pipe(
@@ -478,7 +603,9 @@ class Pipe:
         __event_emitter__: Callable[[Dict[str, Any]], Awaitable[None]],
         __metadata__: dict[str, Any] = {},
         __tools__: Optional[Dict[str, Dict[str, Any]]] = None,
+        __files__: Optional[Dict[str, Any]] = None,
     ):
+        final_message = ""
         """
         OpenWebUI Claude streaming pipe with integrated streaming logic.
         """
@@ -503,7 +630,9 @@ class Pipe:
                 __tools__ = await __tools__
 
             try:
-                payload, headers = self._create_payload(body, __user__, __tools__)
+                payload, headers = self._create_payload(
+                    body,__metadata__, __user__, __tools__, __files__
+                )
             except Exception as e:
                 # Handle payload creation errors
                 await self.handle_errors(e, __event_emitter__)
@@ -513,7 +642,9 @@ class Pipe:
                 try:
                     api_key = self.valves.ANTHROPIC_API_KEY
                     client = AsyncAnthropic(api_key=api_key, default_headers=headers)
-                    payload_for_stream = {k: v for k, v in payload.items() if k != "stream"}
+                    payload_for_stream = {
+                        k: v for k, v in payload.items() if k != "stream"
+                    }
                 except Exception as e:
                     # Handle client creation errors
                     await self.handle_errors(e, __event_emitter__)
@@ -530,7 +661,7 @@ class Pipe:
                 tool_calls = []
                 chunk = ""
                 chunk_count = 0
-
+                final_message = ""
                 try:
                     while (
                         current_function_calls < max_function_calls
@@ -550,14 +681,58 @@ class Pipe:
                                             if k != "snapshot"
                                         }
                                         print(
-                                            f"[Anthropic] Received event: {event_type} with {str(event_dict)[:100]}{'...' if len(str(event_dict)) > 100 else ''}"
+                                            f"[Anthropic] Received event: {event_type} with {str(event_dict)[:200]}{'...' if len(str(event_dict)) > 200 else ''}"
                                         )
                                     else:
                                         print(
-                                            f"[Anthropic] Received event: {event_type} with {str(event)[:100]}{'...' if len(str(event)) > 100 else ''}"
+                                            f"[Anthropic] Received event: {event_type} with {str(event)[:200]}{'...' if len(str(event)) > 200 else ''}"
                                         )
                                 if event_type == "message_start":
-                                    pass
+                                    if self.valves.SHOW_USAGE:
+                                        message = getattr(event, "message", None)
+                                        if message:
+                                            self.request_id = getattr(
+                                                message, "id", None
+                                            )
+                                            if self.valves.DEBUG:
+                                                print(
+                                                    f"[DEBUG] Message started with ID: {self.request_id}"
+                                                )
+                                            usage = getattr(message, "usage", {})
+                                            if usage:
+
+                                                input_tokens = getattr(
+                                                    usage, "input_tokens", 0
+                                                )
+                                                output_tokens = getattr(
+                                                    usage, "output_tokens", 0
+                                                )
+                                                cache_creation_input_tokens = getattr(
+                                                    usage,
+                                                    "cache_creation_input_tokens",
+                                                    0,
+                                                )
+                                                cache_read_input_tokens = getattr(
+                                                    usage, "cache_read_input_tokens", 0
+                                                )
+                                                if self.valves.DEBUG:
+                                                    print(
+                                                        f"[DEBUG] Cache Usage: {usage}"
+                                                    )
+                                                await __event_emitter__(
+                                                    {
+                                                        "type": "source",
+                                                        "data": {
+                                                            "source": {
+                                                                "name": "Usage Statistics"
+                                                            },
+                                                            "document": [
+                                                                f"input_tokens: {input_tokens}\noutput_tokens: {output_tokens}\ncache_creation_input_tokens: {cache_creation_input_tokens}\ncache_read_input_tokens: {cache_read_input_tokens}"
+                                                            ],
+                                                            "metadata": [],
+                                                        },
+                                                    }
+                                                )
 
                                 elif event_type == "content_block_start":
                                     if current_function_calls > 0:
@@ -574,7 +749,7 @@ class Pipe:
                                         chunk += content_block.text or ""
                                     if content_type == "thinking":
                                         is_model_thinking = True
-                                        chunk += "<thinking>"
+                                        chunk += "<thinking>\n"
                                     if content_type == "tool_use":
                                         tools_buffer = (
                                             "{"
@@ -585,36 +760,77 @@ class Pipe:
                                         )
 
                                     if content_type == "server_tool_use":
-                                        await __event_emitter__(
-                                            {
-                                                "type": "status",
-                                                "data": {
-                                                    "description": "Searching the Web...",
-                                                    "done": False,
-                                                },
-                                            }
+                                        name = getattr(content_block, "name", "")
+                                        if name == "web_search":
+                                            await __event_emitter__(
+                                                {
+                                                    "type": "status",
+                                                    "data": {
+                                                        "description": "Searching the Web...",
+                                                        "done": False,
+                                                    },
+                                                }
+                                            
                                         )
+                                        if name == "code_execution":
+                                            await __event_emitter__(
+                                                {
+                                                    "type": "status",
+                                                    "data": {
+                                                        "description": "Executing Code...",
+                                                        "done": False,
+                                                    },
+                                                }
+                                            )
+                                            
+                                    if content_type == "code_execution_tool_result":
+                                        result_block = getattr(content_block, "content", {})
+                                        stdout = result_block.get("stdout", "")
+                                        stderr = result_block.get("stderr", "")
+                                        if stdout or stderr:
+                                            await __event_emitter__(
+                                            {
+                                                "type": "chat:message:delta",
+                                                "data": {
+                                                    "content": (
+                                                        f"\n<details>\n"
+                                                        f"<summary>Code Execution Result</summary>\n\n" +
+                                                        (f"```\n{stdout}\n```\n" if stdout else "") +
+                                                        (f"```\n{stderr}\n```" if stderr else "") +
+                                                        f"</details>\n"
+                                                    )
+                                                },
+                                            })
                                     if content_type == "web_search_tool_result":
                                         if self.valves.DEBUG:
                                             print(
                                                 f"[DEBUG] Processing web search result event: {event}"
                                             )
-                                        content_items = getattr(content_block, "content", [])
+                                        content_items = getattr(
+                                            content_block, "content", []
+                                        )
                                         if content_items and len(content_items) > 0:
-                                            error_code = getattr(content_block, "error_code", None)
+                                            error_code = getattr(
+                                                content_block, "error_code", None
+                                            )
                                             if error_code:
-                                                await self.handle_errors(Exception(f"Web search error: {error_code}"),__event_emitter__)
+                                                await self.handle_errors(
+                                                    Exception(
+                                                        f"Web search error: {error_code}"
+                                                    ),
+                                                    __event_emitter__,
+                                                )
                                             else:
                                                 await __event_emitter__(
-                                                {
-                                                    "type": "status",
-                                                    "data": {
-                                                        "description": "Web Search Complete",
-                                                        "done": True,
-                                                    },
-                                                }
-                                            )
-                                        
+                                                    {
+                                                        "type": "status",
+                                                        "data": {
+                                                            "description": "Web Search Complete",
+                                                            "done": True,
+                                                        },
+                                                    }
+                                                )
+
                                 elif event_type == "content_block_delta":
                                     delta = getattr(event, "delta", None)
                                     if delta:
@@ -626,9 +842,8 @@ class Pipe:
                                             chunk += text_delta
                                             chunk_count += 1
                                         elif delta_type == "input_json_delta":
-                                            tools_buffer += getattr(
-                                                delta, "partial_json", ""
-                                            )
+                                            partial = getattr(delta, "partial_json", "")
+                                            tools_buffer += partial
                                         elif delta_type == "citations_delta":
                                             # Handle citations within content_block_delta
                                             await self.handle_citation(
@@ -638,9 +853,11 @@ class Pipe:
                                 elif event_type == "content_block_stop":
                                     event_name = getattr(event, "name", "")
                                     if event_name == "web_search":
-                                        if tools_buffer.endswith("}"):
+                                        # Finalize tools_buffer into valid JSON (may wrap invalid JSON)
+                                        try:
+                                            finalized = self._finalize_tool_buffer(tools_buffer)
                                             message = ""
-                                            server_tool = json.loads(tools_buffer)
+                                            server_tool = json.loads(finalized)
                                             tool_name = server_tool.get("name", "")
                                             if tool_name == "web_search":
                                                 message = f"Searching the web for: {server_tool.get('input', {}).get('query', '')}"
@@ -653,17 +870,18 @@ class Pipe:
                                                     },
                                                 }
                                             )
-                                        else:
+                                        except Exception as e:
+                                            # If even finalization failed, emit an error but continue gracefully
                                             await self.handle_errors(
                                                 Exception(
-                                                    f"Malformed tool_use JSON, cannot execute tool. tools_buffer:\n {tools_buffer}" 
+                                                    f"Malformed tool_use JSON, cannot execute tool. tools_buffer:\n {tools_buffer} | error: {e}"
                                                 ),
                                                 __event_emitter__,
                                             )
                                             break
 
                                     if is_model_thinking:
-                                        chunk += "</thinking>"
+                                        chunk += "\n</thinking>"
                                         is_model_thinking = False
 
                                 elif event_type == "message_delta":
@@ -673,10 +891,17 @@ class Pipe:
                                             delta, "stop_reason", None
                                         )
                                         if stop_reason == "tool_use":
-                                            if tools_buffer.endswith('"input": '):
-                                                tools_buffer += "{}"
-                                            tools_buffer += "}"
-                                            tool_calls.append(tools_buffer)
+                                            # Ensure tools_buffer is finalized into valid JSON
+                                            try:
+                                                finalized = self._finalize_tool_buffer(
+                                                    tools_buffer
+                                                )
+                                                tool_calls.append(finalized)
+                                            except Exception:
+                                                # If finalization fails, still append a wrapped payload
+                                                tool_calls.append(
+                                                    self._finalize_tool_buffer(tools_buffer)
+                                                )
                                             tools_buffer = ""
                                             has_pending_tool_calls = True
                                         elif stop_reason == "max_tokens":
@@ -695,12 +920,14 @@ class Pipe:
                                     if error:
                                         # Handle stream errors through handle_errors method
                                         error_details = f"Stream Error: {getattr(error, 'message', str(error))}"
-                                        if hasattr(error, 'type'):
+                                        if hasattr(error, "type"):
                                             error_details = f"Stream Error ({error.type}): {getattr(error, 'message', str(error))}"
-                                        
+
                                         # Create a mock exception for consistent error handling
                                         stream_error = Exception(error_details)
-                                        await self.handle_errors(stream_error, __event_emitter__)
+                                        await self.handle_errors(
+                                            stream_error, __event_emitter__
+                                        )
                                         return
 
                                 if chunk_count > token_buffer_size:
@@ -713,6 +940,17 @@ class Pipe:
                                     chunk = ""
                                     chunk_count = 0
 
+                        # Sende letzten Chunk, falls noch etwas übrig ist
+                        if chunk.strip():
+                            await __event_emitter__(
+                                {
+                                    "type": "chat:message:delta",
+                                    "data": {"content": chunk},
+                                }
+                            )
+                            final_message += chunk
+                            chunk = ""
+                            chunk_count = 0
                         # Handle tool use at the end of the stream
                         if has_pending_tool_calls and tool_calls:
                             # Execute all tools with error handling
@@ -735,7 +973,7 @@ class Pipe:
                             # Add tool_use blocks to assistant message
                             for tool_call_json in tool_calls:
                                 try:
-                                    tool_call_data = json.loads(tool_call_json)
+                                    tool_call_data = json.loads(self._finalize_tool_buffer(tool_call_json))
                                     tool_use_block = {
                                         "type": "tool_use",
                                         "id": tool_call_data.get("id", ""),
@@ -828,7 +1066,7 @@ class Pipe:
 
         except Exception as e:
             await self.handle_errors(e, __event_emitter__)
-            return
+            return final_message
 
     async def handle_errors(self, exception, __event_emitter__):
         # Determine specific error message based on exception type
@@ -837,29 +1075,43 @@ class Pipe:
             user_msg = "⚠️ Rate limit reached. Please try again in a moment."
         elif isinstance(exception, AuthenticationError):
             error_msg = "Authentication failed. Please check your API key."
-            user_msg = "🔑 Invalid API key. Please verify your Anthropic API key is correct."
+            user_msg = (
+                "🔑 Invalid API key. Please verify your Anthropic API key is correct."
+            )
         elif isinstance(exception, PermissionDeniedError):
-            error_msg = "Permission denied. Your API key may not have access to this resource."
+            error_msg = (
+                "Permission denied. Your API key may not have access to this resource."
+            )
             user_msg = "🚫 Access denied. Your API key doesn't have permission for this request."
         elif isinstance(exception, NotFoundError):
-            error_msg = "Resource not found. The requested model or endpoint may not exist."
+            error_msg = (
+                "Resource not found. The requested model or endpoint may not exist."
+            )
             user_msg = "❓ Resource not found. Please check if the model is available."
         elif isinstance(exception, BadRequestError):
             error_msg = f"Bad request: {str(exception)}"
-            user_msg = "📝 Invalid request format. Please check your input and try again."
+            user_msg = (
+                "📝 Invalid request format. Please check your input and try again."
+            )
         elif isinstance(exception, UnprocessableEntityError):
             error_msg = f"Unprocessable entity: {str(exception)}"
             user_msg = "📄 Request format issue. Please check your message structure and try again."
         elif isinstance(exception, InternalServerError):
             error_msg = "Anthropic server error. Please try again later."
-            user_msg = "🔧 Server temporarily unavailable. Please try again in a few moments."
+            user_msg = (
+                "🔧 Server temporarily unavailable. Please try again in a few moments."
+            )
         elif isinstance(exception, APIConnectionError):
-            error_msg = "Network connection error. Please check your internet connection."
+            error_msg = (
+                "Network connection error. Please check your internet connection."
+            )
             user_msg = "🌐 Connection error. Please check your network and try again."
         elif isinstance(exception, APIStatusError):
-            status_code = getattr(exception, 'status_code', 'Unknown')
+            status_code = getattr(exception, "status_code", "Unknown")
             error_msg = f"API Error ({status_code}): {str(exception)}"
-            user_msg = f"⚡ API Error ({status_code}). Please try again or contact support."
+            user_msg = (
+                f"⚡ API Error ({status_code}). Please try again or contact support."
+            )
         else:
             error_msg = f"Unexpected error: {str(exception)}"
             user_msg = "💥 An unexpected error occurred. Please try again."
@@ -867,9 +1119,9 @@ class Pipe:
         if self.valves.DEBUG:
             print(f"[DEBUG] Exception: {error_msg}")
             # Add request ID if available for debugging
-            if isinstance(exception, APIStatusError) and hasattr(exception, 'response'):
+            if isinstance(exception, APIStatusError) and hasattr(exception, "response"):
                 try:
-                    request_id = exception.response.headers.get('request-id')
+                    request_id = exception.response.headers.get("request-id")
                     if request_id:
                         print(f"[DEBUG] Request ID: {request_id}")
                 except Exception:
@@ -879,20 +1131,29 @@ class Pipe:
             {
                 "type": "notification",
                 "data": {
-                    "type": "error",  # "success", "warning", "error"
+                    "type": "error",
                     "content": user_msg,
                 },
             }
         )
         import traceback
+
         tb = traceback.format_exc()
+        from datetime import datetime
+
         await __event_emitter__(
             {
                 "type": "source",
                 "data": {
-                    "type": "error",
-                    "source": "anthropic api",
-                    "content": tb,
+                    "source": {"name": "Anthropic Error", "url": None},
+                    "document": [tb],
+                    "metadata": [
+                        {
+                            "source": "anthropic api",
+                            "type": "error",
+                            "date_accessed": datetime.utcnow().isoformat(),
+                        }
+                    ],
                 },
             }
         )
@@ -984,7 +1245,7 @@ class Pipe:
             # Tool execution failed - create error results for all tools
             if self.valves.DEBUG:
                 print(f"🔧 [DEBUG] Tool execution failed: {ex}")
-            
+
             # Create error messages for each tool that failed
             results = []
             for tool_data in tool_call_data_list:
@@ -1072,32 +1333,150 @@ class Pipe:
     def _process_content(self, content: Union[str, List[dict]]) -> List[dict]:
         """
         Process content from OpenWebUI format to Claude API format.
-        Handles text, images, PDFs, tool_calls, and tool_results.
+        Handles text, images, PDFs, tool_calls, and tool_results according to
+        Anthropic API documentation.
         """
         if isinstance(content, str):
             return [{"type": "text", "text": content}]
 
         processed_content = []
         for item in content:
-            if item["type"] == "text":
-                processed_content.append({"type": "text", "text": item["text"]})
-            elif item["type"] == "image_url":
-                # Simple image processing - for now just pass through
-                # In a full implementation, we'd convert data URLs to Claude format
-                processed_content.append(
-                    {
-                        "type": "text",
-                        "text": "[Image content not supported in simplified version]",
-                    }
-                )
-            elif item["type"] == "tool_calls":
+            if item.get("type") == "text":
+                processed_content.append({"type": "text", "text": item.get("text", "")})
+
+            elif item.get("type") == "image_url":
+                image_url = item.get("image_url", {}).get("url", "")
+
+                if image_url.startswith("data:image"):
+                    # Handle base64 encoded image data
+                    try:
+                        header, encoded = image_url.split(",", 1)
+                        mime_type = header.split(":")[1].split(";")[0]
+
+                        # Validate supported image formats according to Anthropic docs
+                        supported_formats = [
+                            "image/jpeg",
+                            "image/png",
+                            "image/gif",
+                            "image/webp",
+                        ]
+
+                        if mime_type not in supported_formats:
+                            if self.valves.DEBUG:
+                                print(
+                                    f"[DEBUG] Unsupported image mime type: {mime_type}"
+                                )
+                            processed_content.append(
+                                {
+                                    "type": "text",
+                                    "text": f"[Image type {mime_type} not supported. Supported formats: JPEG, PNG, GIF, WebP]",
+                                }
+                            )
+                            continue
+
+                        # Check image size - API has 32MB request limit, but be conservative
+                        # Also check for API limits: 8000x8000 px for single image
+                        MAX_IMAGE_SIZE = 25 * 1024 * 1024  # 25 MB (conservative)
+                        try:
+                            import base64
+
+                            decoded_bytes = base64.b64decode(encoded)
+                            if len(decoded_bytes) > MAX_IMAGE_SIZE:
+                                if self.valves.DEBUG:
+                                    print(
+                                        f"[DEBUG] Image too large: {len(decoded_bytes)} bytes"
+                                    )
+                                processed_content.append(
+                                    {
+                                        "type": "text",
+                                        "text": f"[Image too large for Anthropic API. Max size: 25MB, received: {len(decoded_bytes)//1024//1024}MB]",
+                                    }
+                                )
+                                continue
+                        except Exception as decode_ex:
+                            if self.valves.DEBUG:
+                                print(
+                                    f"[DEBUG] Image base64 decode failed: {decode_ex}"
+                                )
+                            processed_content.append(
+                                {
+                                    "type": "text",
+                                    "text": "[Image data could not be decoded - invalid base64 format]",
+                                }
+                            )
+                            continue
+
+                        processed_content.append(
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": mime_type,
+                                    "data": encoded,
+                                },
+                            }
+                        )
+
+                    except ValueError as e:
+                        if self.valves.DEBUG:
+                            print(f"[DEBUG] Error parsing image data URL: {e}")
+                        processed_content.append(
+                            {
+                                "type": "text",
+                                "text": "[Error processing image - invalid data URL format]",
+                            }
+                        )
+                    except Exception as e:
+                        if self.valves.DEBUG:
+                            print(f"[DEBUG] Unexpected error processing image: {e}")
+                        processed_content.append(
+                            {
+                                "type": "text",
+                                "text": "[Unexpected error processing image]",
+                            }
+                        )
+                else:
+                    # For image URLs (not base64), Claude API supports URL references
+                    # but we need to validate the URL format
+                    if image_url.startswith(("http://", "https://")):
+                        processed_content.append(
+                            {
+                                "type": "image",
+                                "source": {"type": "url", "url": image_url},
+                            }
+                        )
+                    else:
+                        processed_content.append(
+                            {
+                                "type": "text",
+                                "text": f"[Invalid image URL format: {image_url}. Only HTTP/HTTPS URLs are supported]",
+                            }
+                        )
+
+            elif item.get("type") == "tool_calls":
                 # Convert OpenWebUI tool_calls to Claude tool_use format
                 converted_calls = self._process_tool_calls(item)
                 processed_content.extend(converted_calls)
-            elif item["type"] == "tool_results":
+
+            elif item.get("type") == "tool_results":
                 # Convert OpenWebUI tool_results to Claude tool_result format
                 converted_results = self._process_tool_results(item)
                 processed_content.extend(converted_results)
+
+            # Handle any other content types by converting to text
+            else:
+                if self.valves.DEBUG:
+                    print(
+                        f"[DEBUG] Unknown content type: {item.get('type')}, converting to text"
+                    )
+                # Convert unknown types to text representation
+                processed_content.append(
+                    {
+                        "type": "text",
+                        "text": f"[Unsupported content type: {item.get('type')}]",
+                    }
+                )
+
         return processed_content
 
     def _process_tool_calls(self, tool_calls_item):
@@ -1145,6 +1524,63 @@ class Pipe:
                         claude_tool_results.append(claude_result)
 
         return claude_tool_results
+
+    def _finalize_tool_buffer(self, tools_buffer: str) -> str:
+        """
+        Ensure the tools_buffer is valid JSON. If the buffer is incomplete or invalid
+        (common with fine-grained tool streaming), attempt to salvage name/id fields
+        and wrap the input portion in an object like {"INVALID_JSON": "<raw>"}
+        as recommended by Anthropic docs. This preserves the original malformed
+        content for debugging while keeping the outer structure valid JSON.
+        """
+        tb = tools_buffer or ""
+        tb = tb.strip()
+        # Quick path: already looks like complete JSON
+        if tb.endswith("}"):
+            try:
+                json.loads(tb)
+                return tb
+            except Exception:
+                # fall through to wrapping logic
+                pass
+
+        # Try to preserve prefix fields (type, id, name) before the "\"input\":"
+        try:
+            if '"input":' in tb:
+                prefix, remainder = tb.split('"input":', 1)
+                prefix = prefix.rstrip()
+                # Build a safe input value wrapping the remainder string
+                safe_input = {"INVALID_JSON": remainder}
+                safe_input_json = json.dumps(safe_input, ensure_ascii=False)
+
+                # If prefix ends with '{', just append the field
+                if prefix.endswith('{'):
+                    candidate = prefix + '"input": ' + safe_input_json + '}'
+                else:
+                    # Ensure there's a separating comma if needed
+                    if not prefix.endswith(','):
+                        candidate = prefix + ', "input": ' + safe_input_json + '}'
+                    else:
+                        candidate = prefix + ' "input": ' + safe_input_json + '}'
+
+                # Validate candidate JSON
+                try:
+                    json.loads(candidate)
+                    return candidate
+                except Exception:
+                    # Fallback to full wrapper below
+                    pass
+
+        except Exception:
+            # Fall through to full wrapper
+            pass
+
+        # As a last resort, return a JSON object containing the invalid raw string
+        try:
+            return json.dumps({"INVALID_JSON": tb}, ensure_ascii=False)
+        except Exception:
+            # If even that fails, return a minimal valid JSON
+            return json.dumps({"INVALID_JSON": "<unrecoverable>"})
 
     async def handle_citation(self, event, __event_emitter__):
         """
@@ -1196,6 +1632,7 @@ class Pipe:
 
             # Build source event data for OpenWebUI
             from datetime import datetime
+            import base64
 
             source_data = {
                 "document": [cited_text] if cited_text else [title],
@@ -1222,146 +1659,3 @@ class Pipe:
             if self.valves.DEBUG:
                 print(f"[DEBUG] Error handling citation: {str(e)}")
             await self.handle_errors(e, __event_emitter__)
-                
-
-    def _process_messages(self, messages: List[dict]) -> List[dict]:
-        """
-        Process messages for the Anthropic API format with full content processing.
-        """
-        processed_messages = []
-        for message in messages:
-            # Skip system messages - they are handled separately
-            if message.get("role") == "system":
-                continue
-
-            # Process content using the full content processor
-            processed_content = self._process_content(message["content"])
-
-            if processed_content:  # Only add messages with content
-                processed_messages.append(
-                    {"role": message["role"], "content": processed_content}
-                )
-        return processed_messages
-
-    async def _send_request(
-        self, url: str, headers: dict, payload: dict
-    ) -> tuple[dict, Optional[dict]]:
-        """
-        Send a request to the Anthropic API with enhanced retry logic.
-
-        Args:
-            url: The API endpoint URL
-            headers: Request headers
-            payload: Request payload
-
-        Returns:
-            Tuple of (response_data, cache_metrics)
-        """
-        retry_count = 0
-        base_delay = 1  # Start with 1 second delay
-        max_retries = 5  # Increased from 3 to 5 for better reliability
-        retry_status_codes = [429, 500, 502, 503, 504]  # Status codes to retry on
-
-        while retry_count < max_retries:
-            try:
-                async with aiohttp.ClientSession() as session:
-                    timeout = aiohttp.ClientTimeout(total=self.REQUEST_TIMEOUT)
-                    async with session.post(
-                        url, headers=headers, json=payload, timeout=timeout
-                    ) as response:
-                        self.request_id = response.headers.get("x-request-id")
-                        org_id = response.headers.get("anthropic-organization-id")
-
-                        response_text = await response.text()
-
-                        # Handle rate limiting and server errors with exponential backoff
-                        if response.status in retry_status_codes:
-                            # Use retry-after header if available, otherwise use exponential backoff
-                            retry_after = int(
-                                response.headers.get(
-                                    "retry-after", base_delay * (2**retry_count)
-                                )
-                            )
-                            # Add jitter to avoid thundering herd problem
-                            jitter = random.uniform(0, 0.1 * retry_after)
-                            retry_time = retry_after + jitter
-
-                            logging.warning(
-                                f"Request failed with status {response.status}. "
-                                f"Retrying in {retry_time:.2f} seconds. "
-                                f"Retry count: {retry_count + 1}/{max_retries}"
-                            )
-                            await asyncio.sleep(retry_time)
-                            retry_count += 1
-                            continue
-
-                        if response.status != 200:
-                            error_msg = f"Error: HTTP {response.status}"
-                            try:
-                                error_data = json.loads(response_text).get("error", {})
-                                error_msg += (
-                                    f": {error_data.get('message', response_text)}"
-                                )
-                                # Include error type and code if available
-                                if error_data.get("type"):
-                                    error_msg += f" (Type: {error_data.get('type')})"
-                                if error_data.get("code"):
-                                    error_msg += f" (Code: {error_data.get('code')})"
-                            except:
-                                error_msg += f": {response_text}"
-
-                            if self.request_id:
-                                error_msg += f" (Request ID: {self.request_id})"
-
-                            logging.error(error_msg)
-                            return {"content": error_msg, "format": "text"}, None
-
-                        result = json.loads(response_text)
-                        usage = result.get("usage", {})
-                        cache_metrics = {
-                            "cache_creation_input_tokens": usage.get(
-                                "cache_creation_input_tokens", 0
-                            ),
-                            "cache_read_input_tokens": usage.get(
-                                "cache_read_input_tokens", 0
-                            ),
-                            "input_tokens": usage.get("input_tokens", 0),
-                            "output_tokens": usage.get("output_tokens", 0),
-                        }
-
-                        # Log usage metrics for monitoring
-                        logging.info(
-                            f"Request successful. Input tokens: {usage.get('input_tokens', 0)}, "
-                            f"Output tokens: {usage.get('output_tokens', 0)}"
-                        )
-
-                        return result, cache_metrics
-
-            except aiohttp.ClientError as e:
-                logging.error(f"Request failed: {str(e)}")
-                if retry_count < max_retries - 1:
-                    retry_count += 1
-                    retry_time = base_delay * (2**retry_count)
-                    logging.info(
-                        f"Retrying in {retry_time} seconds. Retry count: {retry_count}/{max_retries}"
-                    )
-                    await asyncio.sleep(retry_time)
-                    continue
-                raise
-            except asyncio.TimeoutError:
-                logging.error(f"Request timed out after {self.REQUEST_TIMEOUT} seconds")
-                if retry_count < max_retries - 1:
-                    retry_count += 1
-                    retry_time = base_delay * (2**retry_count)
-                    logging.info(
-                        f"Retrying in {retry_time} seconds after timeout. Retry count: {retry_count}/{max_retries}"
-                    )
-                    await asyncio.sleep(retry_time)
-                    continue
-                raise
-
-        logging.error(f"Max retries ({max_retries}) exceeded.")
-        return {
-            "content": f"Max retries ({max_retries}) exceeded",
-            "format": "text",
-        }, None
