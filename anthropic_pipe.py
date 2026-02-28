@@ -2,7 +2,7 @@
 title: Anthropic API Integration
 author: Podden (https://github.com/Podden/)
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.3
+version: 0.3.1
 license: MIT
 requirements: pydantic>=2.0.0, aiohttp>=3.8.0
 environment_variables:
@@ -32,6 +32,9 @@ Todo:
 - MCP Connector (mcpo is enought for me atm)
 
 Changelog:
+v0.3.1 (September 2025)
+- Fixed a bug where message would disappear after Error occurs
+
 v0.3 (September 2025)
 - Added Vision support (__files__ handling & image processing improvements)
 - Added Extended Thinking filter & metadata override with clamped budget logic (default 10K, safe min/max enforcement)
@@ -937,6 +940,7 @@ class Pipe:
                                             "data": {"content": chunk},
                                         }
                                     )
+                                    final_message += chunk
                                     chunk = ""
                                     chunk_count = 0
 
