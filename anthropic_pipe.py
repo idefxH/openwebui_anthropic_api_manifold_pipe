@@ -3,7 +3,7 @@ title: Anthropic API Integration
 author: Podden (https://github.com/Podden/)
 github: https://github.com/Podden/openwebui_anthropic_api_manifold_pipe
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.4.7
+version: 0.4.8
 license: MIT
 requirements: pydantic>=2.0.0, aiohttp>=3.8.0
 environment_variables:
@@ -32,13 +32,17 @@ Todo:
 - Connect Anthropic Memory System with OpenWebUI Memory System
 
 Changelog:
+v0.4.8
+- Added configurable MAX_TOOL_CALLS valve (default: 15, range: 1-50)
+- Moved tool execution status events to content_block_start for immediate feedback
+- Added proactive warning to Claude when only 1 tool call remains before limit
+- System message injected before final call to encourage text response instead of more tool calls
+- Added user notifications when approaching limit (≤3 calls) and when limit is reached
+- Improved event loop yielding with asyncio.sleep() for reliable status event delivery
+
 v0.4.7
-- CRITICAL FIX: Eliminated cross-user data contamination vulnerability
-- Converted final_message from instance variable to local variable to prevent data leakage between users
-- Each request now has its own isolated final_message buffer (prevents cross-talk in concurrent requests)
-- Updated emit_message_delta() to accept final_message as parameter for thread-safe operation
-- Removed 3 unused methods (execute_tools, handle_server_tools_waiting, _finalize_tool_buffer) - cleaned up 207 lines of dead code
-- Verified with parallel multi-user testing: no cross-contamination in concurrent requests
+- Fixed potential data leakage between concurrent users
+- Code cleanup and stability improvements
 
 v0.4.6
 - Tool results now display input parameters at the top
@@ -370,6 +374,12 @@ class Pipe:
         WEB_SEARCH_USER_TIMEZONE: str = Field(
             default="Europe/Berlin",
             description="User's timezone for web search location context",
+        )
+        MAX_TOOL_CALLS: int = Field(
+            default=15,
+            ge=1,
+            le=50,
+            description="Maximum number of tool execution loops allowed per request. Each loop involves Claude generating tool calls, executing them, and feeding results back. Prevents infinite loops.",
         )
         MAX_RETRIES: int = Field(
             default=3,
@@ -854,8 +864,6 @@ class Pipe:
                 body, __metadata__, __user__, __tools__, __event_emitter__, __files__
             )
 
-            # API key is already set in headers by _create_payload
-            # Extract it from headers for client initialization
             api_key = headers.get("x-api-key", self.valves.ANTHROPIC_API_KEY)
             client = AsyncAnthropic(api_key=api_key, default_headers=headers)
             payload_for_stream = {
@@ -865,8 +873,9 @@ class Pipe:
             # Stream loop variables
             token_buffer_size = getattr(self.valves, "TOKEN_BUFFER_SIZE", 1)
             is_model_thinking = False
+            current_block_type = None  # Track current block type for stop events
             conversation_ended = False
-            max_function_calls = 5
+            max_function_calls = self.valves.MAX_TOOL_CALLS
             current_function_calls = 0
             has_pending_tool_calls = False
             tools_buffer = ""
@@ -969,6 +978,7 @@ class Pipe:
                                     event, "content_block", None
                                 )
                                 content_type = getattr(content_block, "type", None)
+                                current_block_type = content_type
                                 if not content_block:
                                     continue
                                 if content_type == "text":
@@ -990,6 +1000,22 @@ class Pipe:
                                         }
                                     )
                                 if content_type == "tool_use":
+                                    tool_name = getattr(content_block, "name", "unknown")
+                                    
+                                    if self.valves.DEBUG:
+                                        logger.debug(f"🔧 Tool use block started: {tool_name}")
+                                    
+                                    # Emit status immediately when tool_use block starts (before input generation)
+                                    await self.emit_event({
+                                        "type": "status",
+                                        "data": {
+                                            "description": f"🔧 Executing tool: {tool_name}",
+                                            "done": False,
+                                        },
+                                    })
+                                    # Give UI time to update
+                                    await asyncio.sleep(0.05)
+                                    
                                     tools_buffer = (
                                         "{"
                                         f'"type": "{content_block.type}", '
@@ -1190,6 +1216,10 @@ class Pipe:
                                     if content_block
                                     else None
                                 )
+                                # Fallback to tracked type if event doesn't have it (common in SDK)
+                                if not content_type and current_block_type:
+                                    content_type = current_block_type
+                                
                                 event_name = getattr(event, "name", "")
 
                                 # When a text block ends, emit any remaining chunk
@@ -1253,16 +1283,7 @@ class Pipe:
                                             # Store metadata for later result matching
                                             tool_call_data_list.append(tool_call_data)
                                             
-                                            # Emit status event when tool execution starts
-                                            await self.emit_event({
-                                                "type": "status",
-                                                "data": {
-                                                    "description": f"🔧 Executing tool: {tool_name}",
-                                                    "done": False,
-                                                },
-                                            })
-                                            
-                                            # Start execution immediately as async task
+                                            # Start execution immediately as async task (no extra status event needed)
                                             args = tool_input if isinstance(tool_input, dict) else {}
                                             task = asyncio.create_task(tool["callable"](**args))
                                             running_tool_tasks.append(task)
@@ -1287,6 +1308,9 @@ class Pipe:
                                     await self.emit_message_delta(thinking_message, final_message)
                                     is_model_thinking = False
                                     current_thinking_block = {}
+                                
+                                # Reset tracked type
+                                current_block_type = None
 
                             elif event_type == "message_delta":
                                 delta = getattr(event, "delta", None)
@@ -1306,28 +1330,22 @@ class Pipe:
                                             if self.valves.DEBUG:
                                                 logger.debug("⏳ Waiting for %d tool tasks to complete...", len(running_tool_tasks))
                                             
-                                            # Emit status event while waiting for tools
-                                            await self.emit_event({
-                                                "type": "status",
-                                                "data": {
-                                                    "description": f"⏳ Waiting for {len(running_tool_tasks)} tool(s) to complete...",
-                                                    "done": False,
-                                                },
-                                            })
+                                            # Emit status event only when multiple tools are executing
+                                            if len(running_tool_tasks) > 1:
+                                                await self.emit_event({
+                                                    "type": "status",
+                                                    "data": {
+                                                        "description": f"⏳ Waiting for {len(running_tool_tasks)} tool(s) to complete...",
+                                                        "done": False,
+                                                    },
+                                                })
+                                                # Give UI time to update
+                                                await asyncio.sleep(0.05)
                                             
                                             try:
                                                 results = await asyncio.gather(*running_tool_tasks)
                                                 if self.valves.DEBUG:
                                                     logger.debug("✅ All %d tool tasks completed", len(results))
-                                                
-                                                # Emit completion status
-                                                await self.emit_event({
-                                                    "type": "status",
-                                                    "data": {
-                                                        "description": f"✅ Tool execution complete",
-                                                        "done": True,
-                                                    },
-                                                })
                                                 
                                                 # Build tool_result messages and emit to UI
                                                 for tool_call_data, tool_result in zip(tool_call_data_list, results):
@@ -1434,6 +1452,22 @@ class Pipe:
                         chunk_count = 0
                     # Handle tool use at the end of the stream
                     if has_pending_tool_calls and tool_calls:
+                        # Check if we've reached the max tool call limit
+                        current_function_calls += 1
+                        if current_function_calls >= max_function_calls:
+                            await self.emit_event({
+                                "type": "status",
+                                "data": {
+                                    "description": f"⚠️ Maximum tool call limit ({max_function_calls}) reached. Stopping tool execution.",
+                                    "done": True,
+                                },
+                            })
+                            await self.emit_message_delta(
+                                f"\n\n⚠️ **SYSTEM MESSAGE**: Maximum tool call limit ({max_function_calls}) reached. Some tool results may not have been processed.",
+                                final_message
+                            )
+                            break
+                        
                         # Tools were already executed during stream (in message_delta)
                         # tool_calls now contains tool_result blocks ready for API
                         # UI output was already emitted during message_delta
@@ -1497,6 +1531,42 @@ class Pipe:
 
                         # Reset state for next iteration
                         current_function_calls += len(tool_calls)
+                        
+                        # Check if we're approaching the limit BEFORE next iteration
+                        remaining = max_function_calls - current_function_calls
+                        if remaining <= 0:
+                            # Hard limit reached - this shouldn't happen as we check above, but safety first
+                            break
+                        elif remaining == 1:
+                            # Only 1 call left - warn Claude this is the final chance
+                            await self.emit_event({
+                                "type": "status",
+                                "data": {
+                                    "description": f"⚠️ Final tool call available - after next tool use, conversation will be terminated",
+                                    "done": False,
+                                },
+                            })
+                            await asyncio.sleep(0.05)
+                            
+                            # Add system message to warn Claude
+                            payload_for_stream["messages"].append({
+                                "role": "user",
+                                "content": [{
+                                    "type": "text",
+                                    "text": "⚠️ SYSTEM WARNING: This is your final tool call. After this next tool use, the conversation will be automatically terminated due to the tool call limit. Please provide a comprehensive text response instead of calling more tools, and suggest the user continue manually if needed."
+                                }]
+                            })
+                        elif remaining <= 3:
+                            # Approaching limit - inform user
+                            await self.emit_event({
+                                "type": "status",
+                                "data": {
+                                    "description": f"⚠️ Only {remaining} tool call(s) remaining before limit",
+                                    "done": False,
+                                },
+                            })
+                            await asyncio.sleep(0.05)
+                        
                         has_pending_tool_calls = False
                         tool_calls = []
                         tool_use_blocks = []
