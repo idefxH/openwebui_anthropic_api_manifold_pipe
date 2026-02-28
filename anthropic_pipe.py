@@ -3,7 +3,7 @@ title: Anthropic API Integration
 author: Podden (https://github.com/Podden/)
 github: https://github.com/Podden/openwebui_anthropic_api_manifold_pipe
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.4.0
+version: 0.4.1
 license: MIT
 requirements: pydantic>=2.0.0, aiohttp>=3.8.0
 environment_variables:
@@ -32,6 +32,9 @@ Todo:
 - Connect Anthropic Memory System with OpenWebUI Memory System
 
 Changelog:
+v0.4.1
+- Auto-enable native function calling when tools are present (prevents OpenWebUI's function_calling task system)
+
 v0.4.0
 - Added Task Support (sorry, I forgot). Follow Ups, Titles and Tags are now generated.
 - Fix "invalid_request_error ", when a response contains both, a server tool and a local tool use (eg. web search and a local tool).
@@ -123,6 +126,15 @@ from anthropic import (
 import json
 import inspect
 from typing import Literal
+
+# Import OpenWebUI Models for auto-enabling native function calling
+try:
+    from open_webui.models.models import Models, ModelForm
+    MODELS_AVAILABLE = True
+except ImportError:
+    Models = None
+    ModelForm = None
+    MODELS_AVAILABLE = False
 
 class Pipe:
     API_VERSION = "2023-06-01"  # Current API version as of May 2025
@@ -733,8 +745,46 @@ class Pipe:
                     print(f"[DEBUG] Detected task model: {__task__}")
                 return await self._run_task_model_request(body, __event_emitter__)
             
+            # STEP 2: Await tools if needed
             if inspect.isawaitable(__tools__):
                 __tools__ = await __tools__
+            
+            # STEP 3: Auto-enable native function calling if tools are present
+            # This prevents OpenWebUI's function_calling task system from being triggered
+            if __tools__ and MODELS_AVAILABLE:
+                try:
+                    # Get the OpenWebUI model ID from metadata
+                    openwebui_model_id = __metadata__.get("model_id") if __metadata__ else None
+                    if not openwebui_model_id and body and "model" in body:
+                        openwebui_model_id = body["model"]
+                    
+                    if openwebui_model_id:
+                        model = Models.get_model_by_id(openwebui_model_id)
+                        if model:
+                            params = dict(model.params or {})
+                            if params.get("function_calling") != "native":
+                                if self.valves.DEBUG:
+                                    print(f"[DEBUG] Auto-enabling native function calling for model: {openwebui_model_id}")
+                                
+                                # Notify user
+                                await __event_emitter__(
+                                    {
+                                        "type": "notification",
+                                        "data": {
+                                            "type": "info",
+                                            "content": f"Enabling native function calling for model: {openwebui_model_id}. Please re-run your query."
+                                        }
+                                    }
+                                )
+                                
+                                params["function_calling"] = "native"
+                                form_data = model.model_dump()
+                                form_data["params"] = params
+                                Models.update_model_by_id(openwebui_model_id, ModelForm(**form_data))
+                except Exception as e:
+                    if self.valves.DEBUG:
+                        print(f"[DEBUG] Could not auto-enable native function calling: {e}")
+                    # Continue anyway - this is not critical
 
             payload, headers = await self._create_payload(
                 body, __metadata__, __user__, __tools__, __event_emitter__, __files__
