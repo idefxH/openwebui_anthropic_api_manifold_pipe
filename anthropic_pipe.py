@@ -3,7 +3,7 @@ title: Anthropic API Integration
 author: Podden (https://github.com/Podden/)
 github: https://github.com/Podden/openwebui_anthropic_api_manifold_pipe
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.4.8
+version: 0.5.0
 license: MIT
 requirements: pydantic>=2.0.0, aiohttp>=3.8.0
 environment_variables:
@@ -32,13 +32,21 @@ Todo:
 - Connect Anthropic Memory System with OpenWebUI Memory System
 
 Changelog:
+v0.5.0
+- **CRITICAL FIX**: Eliminated cross-talk between concurrent users/requests
+- Removed shared instance state (self.eventemitter, self.request_id) that caused response mixing
+
+v0.4.9
+- Performance optimization: Moved local imports to top level
+- Fixed fallback logic for model fetching when API fails
+
 v0.4.8
 - Added configurable MAX_TOOL_CALLS valve (default: 15, range: 1-50)
-- Moved tool execution status events to content_block_start for immediate feedback
+- Moved tool execution status events to content_block_start for immediate feedback (prevents stalling on long parameters)
 - Added proactive warning to Claude when only 1 tool call remains before limit
 - System message injected before final call to encourage text response instead of more tool calls
 - Added user notifications when approaching limit (≤3 calls) and when limit is reached
-- Improved event loop yielding with asyncio.sleep() for reliable status event delivery
+- Improved event loop yielding with asyncio.sleep() for reliable status event delivery on heavy tool calls loads
 
 v0.4.7
 - Fixed potential data leakage between concurrent users
@@ -146,6 +154,10 @@ v0.2
 - Refactored for readability and support for new models
 """
 
+import re
+import base64
+import traceback
+from datetime import datetime
 from collections.abc import Awaitable
 import asyncio
 import inspect
@@ -400,7 +412,6 @@ class Pipe:
         self.type = "manifold"
         self.id = "anthropic"
         self.valves = self.Valves()
-        self.request_id = None
         self.logger = logger
 
     async def get_anthropic_models(self) -> List[dict]:
@@ -444,6 +455,26 @@ class Pipe:
             logging.warning(
                 f"Could not fetch models from SDK/API, using static list. Reason: {e}"
             )
+            # Fallback to static list
+            for name, info in self.MODEL_CAPABILITIES.items():
+                models.append(
+                    {
+                        "id": f"anthropic/{name}",
+                        "name": name,
+                        "context_length": info["context_length"],
+                        "supports_vision": info["supports_vision"],
+                        "supports_thinking": info["supports_thinking"],
+                        "is_hybrid_model": info["supports_thinking"],
+                        "max_output_tokens": info["max_tokens"],
+                        "info": {
+                            "meta": {
+                                "capabilities": {
+                                    "status_updates": True
+                                }
+                            }
+                        }
+                    }
+                )
         return models
 
     async def pipes(self) -> List[dict]:
@@ -453,7 +484,7 @@ class Pipe:
         self,
         body: Dict,
         __metadata__: dict[str, Any],
-        __user__: Optional[dict],
+        __user__: Dict[str, Any],
         __tools__: Optional[Dict[str, Dict[str, Any]]],
         __event_emitter__: Callable[[Dict[str, Any]], Awaitable[None]],
         __files__: Optional[Dict[str, Any]] = None,
@@ -598,7 +629,8 @@ class Pipe:
                                 "type": "info",
                                 "content": "🧠 Thinking mode is active - Web search enforcement was disabled to allow extended thinking. Claude can still use web search if needed.",
                             },
-                        }
+                        },
+                        __event_emitter__,
                     )
             payload["tools"] = tools_list
 
@@ -791,7 +823,12 @@ class Pipe:
         # Local variable to store the final message for this request
         # DO NOT use self.final_message as pipe instances are reused across users
         final_message: list[str] = []
-        self.eventemitter = __event_emitter__
+
+        # Create request-local wrapper for emit_event to prevent cross-talk between parallel requests
+        # This ensures each request uses its own __event_emitter__ instead of shared self.eventemitter
+        async def emit_event_local(event: dict):
+            """Request-local event emitter wrapper"""
+            await self.emit_event(event, __event_emitter__)
 
         def final_text() -> str:
             return "".join(final_message)
@@ -802,7 +839,7 @@ class Pipe:
                 error_msg = "Error: No API key configured"
                 if self.valves.DEBUG:
                     logger.debug("{error_msg}")
-                    await self.emit_event( 
+                    await emit_event_local( 
                         {
                             "type": "status",
                             "data": {
@@ -841,7 +878,7 @@ class Pipe:
                                     logger.debug("Auto-enabling native function calling for model: {openwebui_model_id}")
                                 
                                 # Notify user
-                                await self.emit_event(
+                                await emit_event_local(
                                     {
                                         "type": "notification",
                                         "data": {
@@ -898,7 +935,7 @@ class Pipe:
             active_server_tool_name = None
             active_server_tool_id = None
             server_tool_input_buffer = ""  # Accumulate server tool input JSON
-            await self.emit_event(
+            await emit_event_local(
             {
                 "type": "status",
                 "data": {
@@ -930,11 +967,11 @@ class Pipe:
                             if event_type == "message_start":
                                 message = getattr(event, "message", None)
                                 if message:
-                                    self.request_id = getattr(
+                                    request_id = getattr(
                                         message, "id", None
                                     )
                                     if self.valves.DEBUG:
-                                        logger.debug(" Message started with ID: {self.request_id}")
+                                        logger.debug(f" Message started with ID: {request_id}")
                                     usage = getattr(message, "usage", {})
                                     if usage:
                                         input_tokens = getattr(
@@ -963,7 +1000,7 @@ class Pipe:
                                             "cache_read_input_tokens": cache_read_input_tokens,
                                         }
                                         
-                                        await self.emit_event( 
+                                        await emit_event_local( 
                                             {
                                                 "type": "chat:completion",
                                                 "data": {
@@ -990,7 +1027,7 @@ class Pipe:
                                         "type": "thinking",
                                         "thinking": ""
                                     }
-                                    await self.emit_event( 
+                                    await emit_event_local( 
                                         {
                                             "type": "status",
                                             "data": {
@@ -1006,7 +1043,7 @@ class Pipe:
                                         logger.debug(f"🔧 Tool use block started: {tool_name}")
                                     
                                     # Emit status immediately when tool_use block starts (before input generation)
-                                    await self.emit_event({
+                                    await emit_event_local({
                                         "type": "status",
                                         "data": {
                                             "description": f"🔧 Executing tool: {tool_name}",
@@ -1035,7 +1072,7 @@ class Pipe:
                                         logger.debug("Server tool started: {active_server_tool_name} (ID: {active_server_tool_id})")
                                     
                                     if active_server_tool_name == "code_execution":
-                                        await self.emit_event(
+                                        await emit_event_local(
                                             {
                                                 "type": "status",
                                                 "data": {
@@ -1045,7 +1082,7 @@ class Pipe:
                                             }
                                         )
                                     elif active_server_tool_name == "web_search":
-                                        await self.emit_event( 
+                                        await emit_event_local( 
                                             {
                                                 "type": "status",
                                                 "data": {
@@ -1077,7 +1114,7 @@ class Pipe:
                                             )
                                             + f"</details>\n"
                                         )
-                                        await self.emit_message_delta(code_result_msg, final_message)
+                                        await self.emit_message_delta(code_result_msg, final_message, __event_emitter__)
                                 if content_type == "web_search_tool_result":
                                     if self.valves.DEBUG:
                                         logger.debug(" Processing web search result event: {event}")
@@ -1107,7 +1144,7 @@ class Pipe:
                                             else:
                                                 status_desc = "Web Search Complete"
                                             
-                                            await self.emit_event(
+                                            await emit_event_local(
                                                 {
                                                     "type": "status",
                                                     "data": {
@@ -1137,7 +1174,7 @@ class Pipe:
                                         
                                         # Emit "Responding..." status on first text delta (only once)
                                         if not first_text_emitted and not is_model_thinking and not active_server_tool_name:
-                                            await self.emit_event(
+                                            await emit_event_local(
                                                 {
                                                     "type": "status",
                                                     "data": {
@@ -1170,7 +1207,7 @@ class Pipe:
                                                         # Emit status only once when we get the complete query
                                                         if new_query and new_query != current_search_query:
                                                             current_search_query = new_query
-                                                            await self.emit_event(
+                                                            await emit_event_local(
                                                                 {
                                                                     "type": "status",
                                                                     "data": {
@@ -1224,7 +1261,7 @@ class Pipe:
 
                                 # When a text block ends, emit any remaining chunk
                                 if content_type == "text" and chunk.strip():
-                                    await self.emit_message_delta(chunk + "\n", final_message)
+                                    await self.emit_message_delta(chunk + "\n", final_message, __event_emitter__)
                                     chunk = ""
                                     chunk_count = 0
 
@@ -1233,7 +1270,7 @@ class Pipe:
                                     if self.valves.DEBUG:
                                         logger.debug("Server tool block stopped: {active_server_tool_name}")
                                     # Add line break after server tool use
-                                    await self.emit_message_delta("\n", final_message)
+                                    await self.emit_message_delta("\n", final_message, __event_emitter__)
                                     active_server_tool_name = None
                                     active_server_tool_id = None
                                     server_tool_input_buffer = ""
@@ -1305,7 +1342,7 @@ class Pipe:
                                         if self.valves.DEBUG:
                                             logger.debug("Preserved thinking block with {len(current_thinking_block.get('thinking', ''))} chars")
                                     # Send closing tag to complete the details block
-                                    await self.emit_message_delta(thinking_message, final_message)
+                                    await self.emit_message_delta(thinking_message, final_message, __event_emitter__)
                                     is_model_thinking = False
                                     current_thinking_block = {}
                                 
@@ -1321,7 +1358,7 @@ class Pipe:
                                     if stop_reason == "tool_use":
                                         # Emit any remaining text chunk before tool results
                                         if chunk.strip():
-                                            await self.emit_message_delta(chunk, final_message)
+                                            await self.emit_message_delta(chunk, final_message, __event_emitter__)
                                             chunk = ""
                                             chunk_count = 0
                                         
@@ -1332,7 +1369,7 @@ class Pipe:
                                             
                                             # Emit status event only when multiple tools are executing
                                             if len(running_tool_tasks) > 1:
-                                                await self.emit_event({
+                                                await emit_event_local({
                                                     "type": "status",
                                                     "data": {
                                                         "description": f"⏳ Waiting for {len(running_tool_tasks)} tool(s) to complete...",
@@ -1390,7 +1427,7 @@ class Pipe:
                                                         f"**Output:**\n{formatted_result}\n"
                                                         f"</details>\n"
                                                     )
-                                                    await self.emit_message_delta(tool_result_msg, final_message)
+                                                    await self.emit_message_delta(tool_result_msg, final_message, __event_emitter__)
                                             except Exception as ex:
                                                 if self.valves.DEBUG:
                                                     logger.error("❌ Tool execution failed: %s", ex)
@@ -1434,20 +1471,18 @@ class Pipe:
 
                                     # Create a mock exception for consistent error handling
                                     stream_error = Exception(error_details)
-                                    await self.handle_errors(
-                                        stream_error
-                                    )
+                                    await self.handle_errors(stream_error, __event_emitter__)
                                     return final_text() + f"\n\nAn error occurred: {error_details}"
 
                             if chunk_count > token_buffer_size:
                                 if chunk.strip():
-                                    await self.emit_message_delta(chunk, final_message)
+                                    await self.emit_message_delta(chunk, final_message, __event_emitter__)
                                     chunk = ""
                                     chunk_count = 0
 
                     # Sende letzten Chunk, falls noch etwas übrig ist
                     if chunk.strip():
-                        await self.emit_message_delta(chunk, final_message)
+                        await self.emit_message_delta(chunk, final_message, __event_emitter__)
                         chunk = ""
                         chunk_count = 0
                     # Handle tool use at the end of the stream
@@ -1455,7 +1490,7 @@ class Pipe:
                         # Check if we've reached the max tool call limit
                         current_function_calls += 1
                         if current_function_calls >= max_function_calls:
-                            await self.emit_event({
+                            await emit_event_local({
                                 "type": "status",
                                 "data": {
                                     "description": f"⚠️ Maximum tool call limit ({max_function_calls}) reached. Stopping tool execution.",
@@ -1465,7 +1500,7 @@ class Pipe:
                             await self.emit_message_delta(
                                 f"\n\n⚠️ **SYSTEM MESSAGE**: Maximum tool call limit ({max_function_calls}) reached. Some tool results may not have been processed.",
                                 final_message
-                            )
+                            , __event_emitter__)
                             break
                         
                         # Tools were already executed during stream (in message_delta)
@@ -1539,7 +1574,7 @@ class Pipe:
                             break
                         elif remaining == 1:
                             # Only 1 call left - warn Claude this is the final chance
-                            await self.emit_event({
+                            await emit_event_local({
                                 "type": "status",
                                 "data": {
                                     "description": f"⚠️ Final tool call available - after next tool use, conversation will be terminated",
@@ -1558,7 +1593,7 @@ class Pipe:
                             })
                         elif remaining <= 3:
                             # Approaching limit - inform user
-                            await self.emit_event({
+                            await emit_event_local({
                                 "type": "status",
                                 "data": {
                                     "description": f"⚠️ Only {remaining} tool call(s) remaining before limit",
@@ -1579,36 +1614,36 @@ class Pipe:
 
                 except RateLimitError as e:
                     # Rate limit error (429) - retryable
-                    await self.handle_errors(e)
+                    await self.handle_errors(e, __event_emitter__)
                     return final_text() + (f"\n\n⚠️ Rate limit exceeded - maximum retries ({self.valves.MAX_RETRIES}) reached. Please try again later.")
                 except AuthenticationError as e:
                     # API key issues (401)
-                    await self.handle_errors(e)
+                    await self.handle_errors(e, __event_emitter__)
                     return final_text() + (
                         f"\n\nError: API key issues. Reason: {e.message}"
                     )
                 except PermissionDeniedError as e:
                     # Permission issues (403)
-                    await self.handle_errors(e)
+                    await self.handle_errors(e, __event_emitter__)
                     return final_text() + (
                         f"\n\nError: Permission denied. Reason: {e.message}"
                     )
                 except NotFoundError as e:
                     # Resource not found (404)
-                    await self.handle_errors(e)
+                    await self.handle_errors(e, __event_emitter__)
                     return final_text() + (
                         f"\n\nError: Resource not found. Reason: {e.message}"
                     )
                 except BadRequestError as e:
                     # Invalid request format (400)
-                    await self.handle_errors(e)
+                    await self.handle_errors(e, __event_emitter__)
                     return final_text() + (
                         f"\n\nError: Invalid request format. Reason: {e.message}"
                     )
 
                 except UnprocessableEntityError as e:
                     # Unprocessable entity (422)
-                    await self.handle_errors(e)
+                    await self.handle_errors(e, __event_emitter__)
                     return final_text() + (
                         f"\n\nError: Unprocessable entity. Reason: {e.message}"
                     )
@@ -1621,7 +1656,7 @@ class Pipe:
                         if self.valves.DEBUG:
                             logger.debug("{error_type} ({status_code}), retry {retry_attempts}/{self.valves.MAX_RETRIES}")
                         
-                        await self.emit_event({
+                        await emit_event_local({
                             "type": "status",
                             "data": {
                                 "description": f"⏳ API {error_type}, retrying...)",
@@ -1631,7 +1666,7 @@ class Pipe:
                         continue  # Retry the request
                     else:
                         # Max retries exceeded
-                        await self.handle_errors(e)
+                        await self.handle_errors(e, __event_emitter__)
                         error_type = "overloaded" if status_code == 529 else "server error"
                         return final_text() + (f"\n\n🔧 API {error_type} - maximum retries ({self.valves.MAX_RETRIES}) reached. Please try again later.")
                 except APIConnectionError as e:
@@ -1641,7 +1676,7 @@ class Pipe:
                         if self.valves.DEBUG:
                             logger.debug("Connection error, retry {retry_attempts}/{self.valves.MAX_RETRIES}")
                         
-                        await self.emit_event({
+                        await emit_event_local({
                             "type": "status",
                             "data": {
                                 "description": f"🌐 Connection error, retrying... ({retry_attempts}/{self.valves.MAX_RETRIES})",
@@ -1651,22 +1686,22 @@ class Pipe:
                         continue  # Retry the request
                     else:
                         # Max retries exceeded
-                        await self.handle_errors(e)
+                        await self.handle_errors(e, __event_emitter__)
                         return final_text() + (
                             f"\n\n🌐 Network connection failed after {self.valves.MAX_RETRIES} attempts. Please check your connection."
                         )
                 except APIStatusError as e:
                     # Catch any other Anthropic API errors
-                    await self.handle_errors(e)
+                    await self.handle_errors(e, __event_emitter__)
                     return final_text() + (
                         f"\n\nError: Anthropic API error. Reason: {e.message}"
                     )
                 except Exception as e:
                     # Catch all other exceptions
-                    await self.handle_errors(e)
+                    await self.handle_errors(e, __event_emitter__)
                     return final_text() + f"\n\nError: {type(e).__name__} occurred. Reason: {e}"
         except Exception as e:
-            await self.handle_errors(e)
+            await self.handle_errors(e, __event_emitter__)
 
         # Preserve existing generated content; append completion marker
         final_status = "✅ Response processing complete."
@@ -1695,7 +1730,7 @@ class Pipe:
 
             final_status += f" [{bar}] {format_num(total_tokens)}/200k ({percentage:.1f}%)"
 
-        await self.emit_event({
+        await emit_event_local({
                             "type": "status",
                             "data": {
                                 "description": final_status,
@@ -1764,7 +1799,7 @@ class Pipe:
         except Exception as e:
             if self.valves.DEBUG:
                 logger.debug("Task model error: {e}")
-            await self.handle_errors(e)
+            await self.handle_errors(e, __event_emitter__)
             return ""
     
     def _process_messages_for_task(self, messages: List[dict]) -> List[dict]:
@@ -1798,7 +1833,7 @@ class Pipe:
         
         return processed
 
-    async def handle_errors(self, exception):
+    async def handle_errors(self, exception, __event_emitter__: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None):
         # Determine specific error message based on exception type
         if isinstance(exception, RateLimitError):
             error_msg = "Rate limit exceeded. Please wait before making more requests."
@@ -1862,11 +1897,9 @@ class Pipe:
                 "type": "error",
                 "content": user_msg,
             },
-        })
-        import traceback
+        }, __event_emitter__)
 
         tb = traceback.format_exc()
-        from datetime import datetime
 
         await self.emit_event({
             "type": "source",
@@ -1881,14 +1914,14 @@ class Pipe:
                     }
                 ],
             },
-        })
+        }, __event_emitter__)
         await self.emit_event({
             "type": "status",
             "data": {
                 "description": "❌ Response with Errors",
                 "done": True,
             }
-        })
+        }, __event_emitter__)
 
     async def _run_tool_callable(
         self,
@@ -1923,20 +1956,22 @@ class Pipe:
         
         Note: Does not strip whitespace - stripping is handled elsewhere as needed.
         """
-        import re
         # Pattern to match details blocks with thinking content
         # Non-greedy match to handle multiple blocks
         pattern = r'<details>\s*<summary>🧠.*?</summary>.*?</details>\s*'
         cleaned = re.sub(pattern, '', content, flags=re.DOTALL)
         return cleaned
 
-    def _process_content(self, content: Union[str, List[dict]]) -> List[dict]:
+    def _process_content(self, content: Union[str, List[dict], None]) -> List[dict]:
         """
         Process content from OpenWebUI format to Claude API format.
         Handles text, images, PDFs, tool_calls, and tool_results according to
         Anthropic API documentation.
         Filters out empty text blocks to prevent API errors.
         """
+        if content is None:
+            return []
+
         if isinstance(content, str):
             # Remove thinking blocks from historical messages
             content = self._remove_thinking_blocks(content)
@@ -1986,8 +2021,6 @@ class Pipe:
                         # Also check for API limits: 8000x8000 px for single image
                         MAX_IMAGE_SIZE = 25 * 1024 * 1024  # 25 MB (conservative)
                         try:
-                            import base64
-
                             decoded_bytes = base64.b64decode(encoded)
                             if len(decoded_bytes) > MAX_IMAGE_SIZE:
                                 if self.valves.DEBUG:
@@ -2137,7 +2170,6 @@ class Pipe:
             - cleaned_text: Original text with User Context removed (stripped)
             - extracted_context: The extracted User Context block with label, or None if not found
         """
-        import re
         pattern = r'\nUser Context:\n(.*?)\n\n'
         match = re.search(pattern, text, re.DOTALL)
         
@@ -2192,7 +2224,6 @@ class Pipe:
             url = getattr(citation, "url", "")
             title = getattr(citation, "title", "Unknown Source")
             cited_text = getattr(citation, "cited_text", "")
-            from datetime import datetime
 
             # CRITICAL: metadata.source is used by OpenWebUI as the grouping ID
             # Must be unique for each citation to prevent Citation merging
@@ -2214,14 +2245,18 @@ class Pipe:
             }
 
             # Emit the source event
-            await self.emit_event({"type": "source", "data": source_data})
+            await self.emit_event({"type": "source", "data": source_data}, __event_emitter__)
 
         except Exception as e:
             if self.valves.DEBUG:
                 logger.debug("Error handling citation: {str(e)}")
-            await self.handle_errors(e)
+            await self.handle_errors(e, __event_emitter__)
 
-    async def emit_event(self, event: Dict[str, Any]) -> None:
+    async def emit_event(
+        self,
+        event: Dict[str, Any],
+        __event_emitter__: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
+    ) -> None:
         """
         Safely emit an event, handling None __event_emitter__ (e.g., in Channel contexts).
         
@@ -2229,17 +2264,18 @@ class Pipe:
         because the channel context doesn't provide a socket connection for status updates.
         This helper prevents 'NoneType' object is not callable errors.
         """
-        if self.eventemitter is None:
+        if __event_emitter__ is None:
             return
         try:
-            await self.eventemitter(event)
+            await __event_emitter__(event)
         except Exception as e:
-            logger.warning("Event emitter failed: {e}")
+            logger.warning(f"Event emitter failed: {e}")
     
     async def emit_message_delta(
         self,
         content: str,
         final_message: list[str] | None = None,
+        __event_emitter__: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
     ) -> None:
         """
         Emit content as chat:message:delta and automatically append to final message.
@@ -2248,11 +2284,11 @@ class Pipe:
         Args:
             content: The content to emit
             final_message: The request-local final_message list to append to (prevents cross-user contamination)
+            __event_emitter__: Event emitter function for this specific request
         """
         await self.emit_event({
             "type": "chat:message:delta",
             "data": {"content": content}
-        })
+        }, __event_emitter__)
         if content and final_message is not None:
             final_message.append(content)
-    
