@@ -1,8 +1,9 @@
 """
 title: Anthropic API Integration
 author: Podden (https://github.com/Podden/)
+github: https://github.com/Podden/openwebui_anthropic_api_manifold_pipe
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.3.8
+version: 0.4.0
 license: MIT
 requirements: pydantic>=2.0.0, aiohttp>=3.8.0
 environment_variables:
@@ -16,7 +17,7 @@ Supports:
 - citations for web_search
 - Streaming responses
 - Prompt caching (server-side)
-- Promt Caching of System Promts, Messages- and Tools Array
+- Promt Caching of System Promts, Messages- and Tools Array (controllable via Valve)
 - Comprehensive error handling
 - Image processing
 - Web_Search Toggle Action
@@ -26,17 +27,26 @@ Supports:
 - Vision
 
 Todo:
-- Files API
-- PDF support
-- API Key from UserValves as Alternative
-- MCP Connector (mcpo is enought for me atm)
+- Correct Caching/Requests with RAG and Memories
+- Files API support so uploaded PDFs can be used with code_execution tool
+- Connect Anthropic Memory System with OpenWebUI Memory System
 
 Changelog:
+v0.4.0
+- Added Task Support (sorry, I forgot). Follow Ups, Titles and Tags are now generated.
+- Fix "invalid_request_error ", when a response contains both, a server tool and a local tool use (eg. web search and a local tool).
+
+v0.3.9
+- Added fine grained cache control valve with 4 levels: disabled, tools only, tools + system prompt, tools + system prompt + user messages
+
 v0.3.8
 - Removed MAX_OUTPUT_TOKENS valve - now always respects requested max_tokens up to model limit
 - Simplified token calculation logic
 - Reworked the caching with active Openwebui Memory System, Memories are now extracted from system prompt and injected into user messages as context blocks
 - Refactored Model Info structure for maintainability
+- Pipe is now retrying request on overloaded, rate_limit or transient errors up to MAX_RETRIES valve
+- Status indicator is now shown while waiting for the first response (first response took very long when using eg. web_search tool)
+- Removed unused aiohttp and random imports
 
 v0.3.7
 - Fixed Extended Thinking compatibility with Tool Use (API now requires thinking blocks before tool_use blocks)
@@ -112,7 +122,7 @@ from anthropic import (
 )
 import json
 import inspect
-
+from typing import Literal
 
 class Pipe:
     API_VERSION = "2023-06-01"  # Current API version as of May 2025
@@ -311,6 +321,10 @@ class Pipe:
             le=50,
             description="Maximum number of retries for failed requests (due to rate limiting, transient errors or connection issues)",
         )
+        CACHE_CONTROL: Literal["cache disabled", "cache tools array only", "cache tools array and system promt", "cache tools array, system prompt and messages"] = Field(
+            default="cache disabled",
+            description="Cache control scope for prompts",
+        )
         DEBUG: bool = Field(
             default=False,
             description="Enable debug logging to see requests and responses",
@@ -467,9 +481,9 @@ class Pipe:
                     block["text"] = cleaned_text
                     
                     # Only add non-empty blocks to system
-                    if cleaned_text:
+                    if cleaned_text and self.valves.CACHE_CONTROL != "cache disabled" and self.valves.CACHE_CONTROL != "cache tools array only":
                         block["cache_control"] = {"type": "ephemeral"}
-                        system_messages.append(block)
+                    system_messages.append(block)
             else:
                 # Keep all historical messages as-is (they contain context from their time)
                 processed_messages.append({"role": role, "content": processed_content})
@@ -494,7 +508,7 @@ class Pipe:
                 tools_list.append(code_exec_tool)
 
         if tools_list and len(tools_list) > 0:
-            if not disable_cache and tools_list:
+            if not disable_cache and tools_list and self.valves.CACHE_CONTROL != "cache disabled":
                 tools_list[-1]["cache_control"] = {"type": "ephemeral"}
 
         if tools_list:
@@ -538,7 +552,7 @@ class Pipe:
                     content_blocks.append(context_block)
             
             # Apply cache control to last content block
-            if content_blocks:
+            if content_blocks and self.valves.CACHE_CONTROL == "cache tools array, system prompt and messages":
                 last_content_block = content_blocks[-1]
                 last_content_block.setdefault("cache_control", {"type": "ephemeral"})
             payload["messages"] = processed_messages
@@ -690,6 +704,8 @@ class Pipe:
         __metadata__: dict[str, Any] = {},
         __tools__: Optional[Dict[str, Dict[str, Any]]] = None,
         __files__: Optional[Dict[str, Any]] = None,
+        __task__: Optional[dict[str, Any]] = None,
+        __task_body__: Optional[dict[str, Any]] = None,
     ):
         """
         OpenWebUI Claude streaming pipe with integrated streaming logic.
@@ -711,6 +727,12 @@ class Pipe:
             return error_msg
 
         try:
+            # STEP 1: Detect if task model (generate title, tags, follow-ups etc.), handle it separately
+            if __task__:
+                if self.valves.DEBUG:
+                    print(f"[DEBUG] Detected task model: {__task__}")
+                return await self._run_task_model_request(body, __event_emitter__)
+            
             if inspect.isawaitable(__tools__):
                 __tools__ = await __tools__
 
@@ -855,6 +877,14 @@ class Pipe:
                                     )
 
                                 if content_type == "server_tool_use":
+                                    # Reset tools_buffer for server tools (web_search, code_execution)
+                                    tools_buffer = (
+                                        "{"
+                                        f'"type": "tool_use", '
+                                        f'"id": "{content_block.id}", '
+                                        f'"name": "{content_block.name}", '
+                                        f'"input": '
+                                    )
                                     name = getattr(content_block, "name", "")
                                     if name == "code_execution":
                                         await __event_emitter__(
@@ -1222,16 +1252,27 @@ class Pipe:
                                 {"type": "text", "text": chunk}
                             )
 
-                        # Add tool_use blocks to assistant message
+                        # Add tool_use blocks to assistant message (ONLY client-side tools)
+                        # Server-side tools (web_search, code_execution) are executed by Anthropic
+                        # and don't need tool_use/tool_result blocks in subsequent messages
                         for tool_call_json in tool_calls:
                             try:
                                 tool_call_data = json.loads(
                                     self._finalize_tool_buffer(tool_call_json)
                                 )
+                                tool_id = tool_call_data.get("id", "")
+                                tool_name = tool_call_data.get("name", "")
+                                
+                                # Skip server-side tools - they're already handled in the stream
+                                if tool_id.startswith("srvtoolu_") or tool_name in ["web_search", "code_execution"]:
+                                    if self.valves.DEBUG:
+                                        print(f"🔧 [DEBUG] Skipping server-side tool {tool_name} (ID: {tool_id}) in assistant message")
+                                    continue
+                                
                                 tool_use_block = {
                                     "type": "tool_use",
-                                    "id": tool_call_data.get("id", ""),
-                                    "name": tool_call_data.get("name", ""),
+                                    "id": tool_id,
+                                    "name": tool_name,
                                     "input": tool_call_data.get("input", {}),
                                 }
                                 assistant_content.append(tool_use_block)
@@ -1388,6 +1429,98 @@ class Pipe:
                         })
         return final_message
 
+    async def _run_task_model_request(
+        self,
+        body: dict[str, Any],
+        __event_emitter__: Callable[[Dict[str, Any]], Awaitable[None]],
+    ) -> str:
+        """
+        Handle task model requests (title generation, tags, follow-ups etc.) by making a
+        non-streaming request to Anthropic API and returning only the text response.
+        
+        Task models should return plain text without any JSON formatting or status updates
+        mixed into the response.
+        """
+        try:
+            # Extract model and messages from body
+            actual_model_name = body["model"].split("/")[-1]
+            messages = body.get("messages", [])
+            
+            # Build simple payload for task request (non-streaming)
+            task_payload = {
+                "model": actual_model_name,
+                "max_tokens": body.get("max_tokens", 4096),
+                "messages": self._process_messages_for_task(messages),
+                "stream": False,
+            }
+            
+            # Add system message if present
+            system_messages = [msg for msg in messages if msg.get("role") == "system"]
+            if system_messages:
+                task_payload["system"] = [
+                    {"type": "text", "text": msg.get("content", "")}
+                    for msg in system_messages
+                ]
+            
+            if self.valves.DEBUG:
+                print(f"[DEBUG] Task payload: {json.dumps(task_payload, indent=2)}")
+            
+            # Make synchronous request to Anthropic API
+            api_key = self.valves.ANTHROPIC_API_KEY
+            client = AsyncAnthropic(api_key=api_key)
+            
+            response = await client.messages.create(**task_payload)
+            
+            # Extract text from response
+            text_parts = []
+            for content_block in response.content:
+                if content_block.type == "text":
+                    text_parts.append(content_block.text)
+            
+            result = "".join(text_parts)
+            
+            if self.valves.DEBUG:
+                print(f"[DEBUG] Task response: {result}")
+            
+            return result
+            
+        except Exception as e:
+            if self.valves.DEBUG:
+                print(f"[DEBUG] Task model error: {e}")
+            await self.handle_errors(e, __event_emitter__)
+            return ""
+    
+    def _process_messages_for_task(self, messages: List[dict]) -> List[dict]:
+        """
+        Process messages for task requests - convert to simple Anthropic format.
+        Task requests don't need complex content processing.
+        """
+        processed = []
+        for msg in messages:
+            role = msg.get("role")
+            if role == "system":
+                continue  # System messages handled separately
+            
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                processed.append({
+                    "role": role,
+                    "content": content
+                })
+            elif isinstance(content, list):
+                # Extract text from content blocks
+                text_parts = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text_parts.append(block.get("text", ""))
+                if text_parts:
+                    processed.append({
+                        "role": role,
+                        "content": " ".join(text_parts)
+                    })
+        
+        return processed
+
     async def handle_errors(self, exception, __event_emitter__):
         # Determine specific error message based on exception type
         if isinstance(exception, RateLimitError):
@@ -1506,18 +1639,20 @@ class Pipe:
             # Parse the JSON string to get tool call data
             try:
                 tool_call_data = json.loads(fc_item)
-                tool_type = tool_call_data.get("type", "")
-                if tool_type == "server_tool_use":
-                    if self.valves.DEBUG:
-                        print(f"🔧 [DEBUG] Parsed tool call is Server sided - Skipping")
-                    continue
+                tool_id = tool_call_data.get("id", "")
                 tool_name = tool_call_data.get("name", "")
+                
+                # Skip server-side tools (executed by Anthropic, not by us)
+                # Server tools have ID prefix "srvtoolu_" or are known server tool names
+                if tool_id.startswith("srvtoolu_") or tool_name in ["web_search", "code_execution"]:
+                    if self.valves.DEBUG:
+                        print(f"🔧 [DEBUG] Skipping server-side tool: {tool_name} (ID: {tool_id})")
+                    continue
                 # if tool_name == "memory":
                 #     # Handle Memory Tool Calls
                 #     await self.handle_memory_call(tool_call_data, __event_emitter__)
                 #     continue
                 tool_input = tool_call_data.get("input", {})
-                tool_id = tool_call_data.get("id", "")
                 tool_call_data_list.append(tool_call_data)
 
                 if self.valves.DEBUG:
