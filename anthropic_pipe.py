@@ -4,7 +4,7 @@ id: anthropic_new
 author: Podden (https://github.com/Podden/)
 github: https://github.com/Podden/openwebui_anthropic_api_manifold_pipe
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.8.0
+version: 0.8.1
 license: MIT
 requirements: pydantic>=2.0.0, anthropic>=0.75.0
 environment_variables:
@@ -37,6 +37,10 @@ Supports:
 - Programmatic Tool Calling (tools callable from code execution)
 
 Changelog:
+v0.8.1
+- Added experimental Files API Support for uploading files to the Container. Feedback welcome!
+- Added a Valve to control wheter Opus/Sonnet 4.6 should use the new dynamic web_fetching and web_searching (At least I have issues with that)
+
 v0.8.0
 - Major streaming refactor: uses Anthropic SDK message accumulation instead of manual block tracking
 - Implemented Fine-grained tool streaming with eager_input_streaming
@@ -320,6 +324,24 @@ PATTERN_EMPTY_CONTEXT = re.compile(r"<context>\s*</context>", flags=re.DOTALL)
 # Pattern to find remaining source tags (for checking if all were removed)
 PATTERN_SOURCE_TAGS = re.compile(r"<source[^>]*>.*?</source>", flags=re.DOTALL)
 
+# RAG message detection: matches "### Task:...<context>...</context>" blocks
+PATTERN_RAG_MESSAGE = re.compile(r"### Task:.*?<context>.*?</context>", re.DOTALL)
+
+# Individual <source> tag with name attribute extraction
+PATTERN_SOURCE_TAG = re.compile(
+    r'<source[^>]*name="([^"]+)"[^>]*>.*?</source>\s*', re.DOTALL
+)
+
+# Empty <attached_files> blocks after file tag removal
+PATTERN_EMPTY_ATTACHED = re.compile(
+    r"<attached_files>\s*</attached_files>\s*", re.DOTALL
+)
+
+# Note: Some patterns are compiled dynamically at runtime because they depend
+# on user-provided data (filenames, file IDs). See:
+#   - _remove_specific_sources_from_rag_message() - dynamic filename pattern
+#   - _remove_attached_files_tags() - dynamic file ID pattern
+
 # =============================================================================
 # IMPORTS
 # =============================================================================
@@ -356,6 +378,10 @@ except ImportError:
     Path = None
     FILES_AVAILABLE = False
 
+# =============================================================================
+# CONSTANTS
+# =============================================================================
+
 # Claude memory tool uses filesystem storage (no dependency on OpenWebUI Memories)
 # Files stored under DATA_DIR/claude_memories/{user_id}/memories/
 CLAUDE_MEMORY_DIR = os.path.join(
@@ -364,12 +390,6 @@ CLAUDE_MEMORY_DIR = os.path.join(
 
 
 class Pipe:
-    # Pre-compile static regex patterns for RAG message and <source> tags
-    PATTERN_RAG_MESSAGE = re.compile(r"### Task:.*?<context>.*?</context>", re.DOTALL)
-    PATTERN_SOURCE_TAG = re.compile(
-        r'<source[^>]*name="([^"]+)"[^>]*>.*?</source>\s*', re.DOTALL
-    )
-
     API_VERSION = "2023-06-01"  # Current API version as of May 2025
     MODEL_URL = "https://api.anthropic.com/v1/messages"
 
@@ -496,6 +516,10 @@ class Pipe:
     )
     THINKING_BUDGET_TOKENS = 4096  # Default thinking budget tokens (max 16K)
     TOOL_CALL_TIMEOUT = 120  # Seconds before a tool call is treated as timed out
+
+    # =========================================================================
+    # MODEL INFO & INITIALIZATION
+    # =========================================================================
 
     @classmethod
     def get_model_info(cls, model_name: str) -> dict:
@@ -701,11 +725,15 @@ class Pipe:
             default="",
             description="User's timezone for web search.",
         )
+        ENABLE_DYNAMIC_FILTERING: bool = Field(
+            default=True,
+            description="Use dynamic filtering for web search/fetch on supported models (4.6+). When disabled, falls back to standard web tools.",
+        )
         # Files API and Skills Settings
-        # USE_FILES_API: bool = Field(
-        #     default=False,
-        #     description="Enable Anthropic Files API for document uploads.",
-        # )
+        USE_FILES_API: bool = Field(
+            default=False,
+            description="Upload files to Anthropic Files API for code execution access. Overrides native PDF upload. Requires code execution.",
+        )
         SKILLS: List[str] = Field(
             default=[],
             description="Anthropic Skills to use (e.g., 'pptx', 'xlsx', 'docx', 'pdf' or custom skill IDs). Skills are validated against the API.",
@@ -786,6 +814,10 @@ class Pipe:
 
     async def pipes(self) -> List[dict]:
         return await self.get_anthropic_models()
+
+    # =========================================================================
+    # PDF & FILE HANDLING
+    # =========================================================================
 
     def _get_pdf_base64_from_file_id(self, file_id: str) -> Optional[tuple[str, str]]:
         """
@@ -908,6 +940,10 @@ class Pipe:
 
         return pdf_documents, markers
 
+    # =========================================================================
+    # RAG (RETRIEVAL-AUGMENTED GENERATION) HANDLING
+    # =========================================================================
+
     def _extract_rag_from_system_message(
         self, system_messages: List[Dict[str, Any]]
     ) -> Optional[str]:
@@ -935,7 +971,7 @@ class Pipe:
                 continue
 
             # Extract the RAG portion (from ### Task: to end of </context>)
-            match = self.PATTERN_RAG_MESSAGE.search(text)
+            match = PATTERN_RAG_MESSAGE.search(text)
             if match:
                 logger.debug(
                     f"📋 RAG: Found RAG content in system message ({len(match.group(0))} chars)"
@@ -958,7 +994,7 @@ class Pipe:
                 continue
 
             text = block.get("text", "")
-            match = self.PATTERN_RAG_MESSAGE.search(text)
+            match = PATTERN_RAG_MESSAGE.search(text)
 
             if match:
                 # Remove RAG content
@@ -994,7 +1030,7 @@ class Pipe:
             for block in content:
                 if block.get("type") == "text":
                     text = block.get("text", "")
-                    m = self.PATTERN_RAG_MESSAGE.search(text)
+                    m = PATTERN_RAG_MESSAGE.search(text)
                     if m:
                         start, end = m.span()
                         trimmed = text[:start] + text[end:]
@@ -1091,7 +1127,7 @@ class Pipe:
                     continue
 
                 text = block.get("text", "")
-                match = self.PATTERN_RAG_MESSAGE.search(text)
+                match = PATTERN_RAG_MESSAGE.search(text)
 
                 if not match:
                     new_content.append(block)
@@ -1157,9 +1193,7 @@ class Pipe:
         )
 
         # Pattern to match empty attached_files blocks after removal
-        empty_attached_pattern = re.compile(
-            r"<attached_files>\s*</attached_files>\s*", re.DOTALL
-        )
+        # PATTERN_EMPTY_ATTACHED is pre-compiled at module level
 
         for msg in processed_messages:
             if msg.get("role") != "user":
@@ -1175,73 +1209,114 @@ class Pipe:
                 # First remove matching file tags
                 text = file_tag_pattern.sub("", text)
                 # Then remove empty attached_files blocks
-                text = empty_attached_pattern.sub("", text)
+                text = PATTERN_EMPTY_ATTACHED.sub("", text)
                 if len(text) != original_len:
                     block["text"] = text
                     logger.debug(
                         f"📋 Removed attached_files tags for {len(file_ids_to_remove)} file(s)"
                     )
 
+    # =========================================================================
+    # FILES API (UPLOAD, DOWNLOAD, DEDUPLICATION)
+    # =========================================================================
+
+    async def _generate_file_download_link(
+        self,
+        file_id: str,
+        api_key: str,
+        user_id: str,
+    ) -> str:
+        """Download file from Anthropic Files API, save to OpenWebUI, return markdown link."""
+        try:
+            from anthropic import AsyncAnthropic
+            import hashlib
+            import uuid
+
+            client = AsyncAnthropic(api_key=api_key)
+
+            # Get file metadata first
+            file_meta = await client.beta.files.retrieve_metadata(file_id=file_id)
+            filename = getattr(file_meta, "filename", file_id) or file_id
+
+            # Download file content
+            response = await client.beta.files.download(file_id=file_id)
+            content = response.read()
+
+            # Save to OpenWebUI storage
+            owui_file_id = str(uuid.uuid4())
+            storage_filename = f"code_exec_{owui_file_id}_{filename}"
+            file_path = Storage.upload_file(content, storage_filename)
+
+            # Create OpenWebUI file record
+            file_hash = hashlib.sha256(content).hexdigest()
+            Files.insert_new_file(
+                user_id=user_id,
+                form_data=type("FileForm", (), {
+                    "model_dump": lambda self_: {
+                        "id": owui_file_id,
+                        "hash": file_hash,
+                        "filename": filename,
+                        "path": file_path,
+                        "data": {},
+                        "meta": {
+                            "content_type": getattr(file_meta, "mime_type", "application/octet-stream"),
+                            "size": len(content),
+                            "source": "anthropic_code_execution",
+                            "anthropic_file_id": file_id,
+                        },
+                    }
+                })(),
+            )
+
+            # Return markdown download link
+            base_url = os.environ.get("WEBUI_URL", "")
+            download_url = f"{base_url}/api/v1/files/{owui_file_id}/content"
+            return f"[📥 {filename}]({download_url})"
+
+        except Exception as e:
+            logger.error(f"Failed to download file {file_id}: {e}")
+            return f"⚠️ Failed to download file {file_id}"
+
     async def _process_files_api_data(
         self,
         __files__: Optional[List[Dict[str, Any]]],
-        __user__: Dict[str, Any],
         __event_emitter__: Callable[[Dict[str, Any]], Awaitable[None]],
-        previous_marker_metadata: dict[str, Any],
-    ) -> tuple[List[Dict[str, Any]], List[str]]:
+        processed_messages: List[Dict[str, Any]],
+    ) -> tuple[Dict[int, List[Dict[str, Any]]], List[str]]:
         """
-        Process files for Anthropic Files API, uploading them and preparing content blocks.
+        Process files for Anthropic Files API using container_upload.
 
-        Tracks message indices for proper cache optimization - files are associated
-        with the user message that uploaded them.
-
-        Args:
-            __files__: Files from OpenWebUI
-            __metadata__: Metadata dict
-            __user__: User dict with valves
-            __event_emitter__: Event emitter for status updates
-            current_user_msg_idx: Index of the current user message (for file association)
+        Uploads files to Anthropic and caches the file_id in OpenWebUI file metadata.
+        Tracks which user message each file belongs to for correct positioning.
 
         Returns:
-            dict: Accumulated metadata state:
-                - files_by_msg: Dict[int, List[str]] - message index to Files API IDs
-                - container: str | None - Container ID for Skills
-                - uploaded_files: Dict[str, str] - filename to Anthropic file ID
-                - new_file_ids: List[str] - newly uploaded file IDs (for this turn only)
-                - uploaded_openwebui_file_ids: List[str] - OpenWebUI IDs that were uploaded
+            tuple: (
+                Dict mapping user_msg_number → list of container_upload blocks,
+                List of filenames that were processed (for RAG source removal)
+            )
         """
-        file_ids_content_blocks: List[Dict[str, Any]] = []
-        markers: List[str] = []
-        # If no new files, return accumulated state
-        if not __files__:
-            logger.debug("No new files to process")
-            return file_ids_content_blocks, markers
+        blocks_by_user_msg: Dict[int, List[Dict[str, Any]]] = {}
+        processed_filenames: List[str] = []
 
-        if all(file.get("context") != "full" for file in __files__) or all(
-            file.get("type") != "file" for file in __files__
-        ):
-            logger.debug("No full context files or file types to process for Files API")
-            return file_ids_content_blocks, markers
+        if not __files__ or not FILES_AVAILABLE:
+            return blocks_by_user_msg, processed_filenames
 
         import io
 
-        # Process new files
-        api_key = self.valves.ANTHROPIC_API_KEY
+        # Count user messages to determine "current" position for new files
+        user_msg_count = sum(1 for m in processed_messages if m["role"] == "user")
+        current_user_msg_num = max(0, user_msg_count - 1)  # 0-based
+
         client = None
-        if api_key:
-            try:
-                from anthropic import AsyncAnthropic
-
-                client = AsyncAnthropic(api_key=api_key)
-            except ImportError:
-                logger.warning("Anthropic SDK not available for file upload")
-
-        file_count = 0
-        skipped_count = 0
-        new_file_ids_for_this_msg = []
+        try:
+            from anthropic import AsyncAnthropic
+            client = AsyncAnthropic(api_key=self.valves.ANTHROPIC_API_KEY)
+        except ImportError:
+            logger.warning("Anthropic SDK not available for file upload")
+            return blocks_by_user_msg, processed_filenames
 
         for file in __files__:
-            # Skip RAG/knowledge base references
+            # Skip non-file entries (RAG chunks, knowledge base refs, etc.)
             if (
                 file.get("type") != "file"
                 or file.get("context") != "full"
@@ -1250,78 +1325,102 @@ class Pipe:
             ):
                 continue
 
+            file_id_owui = file.get("id")
             file_name = file.get("name", "unknown")
-            file_type = file.get("type", "file")
-            file_id_openwebui = file.get("id")
-
-            # Check if this file was already uploaded (by filename)
-            if file_name in previous_marker_metadata:
-                skipped_count += 1
+            if not file_id_owui:
                 continue
 
-            file_count += 1
+            # Skip images — they use Vision (base64/URL), not Files API
+            content_type = file.get("content_type", "")
+            if not content_type:
+                # Fallback: check OpenWebUI file meta for content_type
+                file_record_check = Files.get_file_by_id(file_id_owui)
+                if file_record_check and file_record_check.meta:
+                    content_type = file_record_check.meta.get("content_type", "")
+            if content_type and content_type.startswith("image/"):
+                logger.debug(f"Skipping image file for Files API: {file_name} ({content_type})")
+                continue
 
-            file_content = None
-            if file_type == "file" and file_id_openwebui and FILES_AVAILABLE:
-                try:
-                    file_record = Files.get_file_by_id(file_id_openwebui)
-                    if file_record:
-                        file_path = Storage.get_file(file_record.path)
-                        if file_path and Path(file_path).is_file():
-                            with open(file_path, "rb") as f:
-                                file_content = f.read()
-                except Exception as e:
-                    logger.error(f"Failed to read file {file_id_openwebui}: {e}")
+            # Look up OpenWebUI file record for cached anthropic_file_id
+            file_record = Files.get_file_by_id(file_id_owui)
+            if not file_record:
+                logger.warning(f"File not found in DB: {file_id_owui}")
+                continue
 
-            # Upload to Anthropic Files API if we have content
-            if file_content and client:
+            meta = file_record.meta or {}
+            anthropic_file_id = meta.get("anthropic_file_id")
+            msg_num = meta.get("anthropic_file_msg_idx")
+
+            if anthropic_file_id:
+                # Cached — reuse without re-uploading
+                if msg_num is None:
+                    msg_num = current_user_msg_num
+                logger.debug(f"♻️ Reusing cached file {file_name} → {anthropic_file_id} (msg {msg_num})")
+            else:
+                # New file — upload to Anthropic
                 try:
+                    file_path = Storage.get_file(file_record.path)
+                    if not file_path or not Path(file_path).is_file():
+                        logger.warning(f"File not on disk: {file_id_owui}")
+                        continue
+
+                    with open(file_path, "rb") as f:
+                        file_content = f.read()
+
                     await self.emit_event(
                         {
                             "type": "status",
-                            "data": {
-                                "description": f"☁️ Uploading {file_name} to Anthropic...",
-                                "done": False,
-                            },
+                            "data": {"description": f"☁️ Uploading {file_name}...", "done": False},
                         },
                         __event_emitter__,
                     )
 
-                    file_obj = (file_name, io.BytesIO(file_content))
                     upload_result = await client.beta.files.upload(
-                        file=file_obj,
-                        betas=["files-api-2025-04-14"],
+                        file=(file_name, io.BytesIO(file_content)),
                     )
-                    file_ids_content_blocks.append(
-                        {
-                            "type": "container_upload",
-                            "file_id": upload_result.id,
-                        }
-                    )
-                    markers.append(
-                        self._create_metadata_marker(
-                            "file_api",
-                            f"{upload_result.id}:{file_name}:{file_id_openwebui}",
-                        )
-                    )
-                    logger.debug(
-                        f"Uploaded {file_name} to Anthropic: {upload_result.id}"
-                    )
+                    anthropic_file_id = upload_result.id
+                    msg_num = current_user_msg_num
 
+                    # Cache in OpenWebUI file metadata
+                    Files.update_file_metadata_by_id(file_id_owui, {
+                        "anthropic_file_id": anthropic_file_id,
+                        "anthropic_file_msg_idx": msg_num,
+                    })
+
+                    logger.info(f"☁️ Uploaded {file_name} → {anthropic_file_id} (msg {msg_num})")
+
+                    await self.emit_event(
+                        {
+                            "type": "status",
+                            "data": {"description": f"☁️ Uploaded {file_name}", "done": True},
+                        },
+                        __event_emitter__,
+                    )
                 except Exception as e:
-                    logger.error(f"Failed to upload {file_name} to Anthropic: {e}")
+                    logger.error(f"Failed to upload {file_name}: {e}")
                     await self.emit_event(
                         {
                             "type": "notification",
-                            "data": {
-                                "type": "warning",
-                                "content": f"Failed to upload {file_name}: {str(e)[:100]}",
-                            },
+                            "data": {"type": "warning", "content": f"Failed to upload {file_name}: {str(e)[:100]}"},
                         },
                         __event_emitter__,
                     )
+                    continue
 
-        return file_ids_content_blocks, markers
+            # Group container_upload block by user message number
+            if msg_num not in blocks_by_user_msg:
+                blocks_by_user_msg[msg_num] = []
+            blocks_by_user_msg[msg_num].append({
+                "type": "container_upload",
+                "file_id": anthropic_file_id,
+            })
+            processed_filenames.append(file_name)
+
+        return blocks_by_user_msg, processed_filenames
+
+    # =========================================================================
+    # PAYLOAD BUILDING & MESSAGE/TOOL CONVERSION
+    # =========================================================================
 
     async def _create_payload(
         self,
@@ -1434,29 +1533,55 @@ class Pipe:
         )
         new_marker_metadata = ""
 
-        if __files__:
-            # if __metadata__.get("activate_code_execution_tool", False):
-            #     # Process Files API data - uploads files and returns accumulated metadata
-            #     file_id_content_blocks, new_marker_metadata = (
-            #         await self._process_files_api_data(
-            #             __files__, __user__, __event_emitter__, previous_marker_metadata
-            #         )
-            #     )
-            #     if file_id_content_blocks:
-            #         processed_messages[-1]["content"].append(file_id_content_blocks)
+        # Extract container_id from previous metadata markers for multi-turn container reuse
+        previous_container_id = None
+        for metadata_entry in previous_marker_metadata:
+            # Format: "N:container_id:ENCODED_VALUE"
+            parts = metadata_entry.split(":", 2)
+            if len(parts) >= 3 and parts[1] == "container_id":
+                previous_container_id = unquote(parts[2])
+                logger.debug(f"📦 Restored container_id from marker: {previous_container_id}")
 
-            # Check if user wants native PDF upload instead of RAG text extraction
-            if __user__["valves"].USE_PDF_NATIVE_UPLOAD:
+        # Track if Files API uploaded any files (for auto-enabling code execution)
+        has_files_api_uploads = False
+
+        if __files__:
+            use_files_api = __user__["valves"].USE_FILES_API
+
+            if use_files_api:
+                # Files API overrules native PDF upload — all files go as container_upload
+                blocks_by_user_msg, uploaded_filenames = await self._process_files_api_data(
+                    __files__, __event_emitter__, processed_messages
+                )
+                if blocks_by_user_msg:
+                    has_files_api_uploads = True
+                    # Insert container_upload blocks at the correct user messages
+                    user_msg_num = 0
+                    for i, msg in enumerate(processed_messages):
+                        if msg["role"] == "user" and user_msg_num in blocks_by_user_msg:
+                            # Ensure content is a list
+                            if isinstance(msg["content"], str):
+                                msg["content"] = [{"type": "text", "text": msg["content"]}]
+                            msg["content"] = blocks_by_user_msg[user_msg_num] + msg["content"]
+                        if msg["role"] == "user":
+                            user_msg_num += 1
+
+                    # Remove RAG sources for uploaded files
+                    if uploaded_filenames:
+                        logger.debug(f"📋 RAG: Removing {len(uploaded_filenames)} file source(s) from RAG")
+                        self._remove_specific_sources_from_rag_message(processed_messages, uploaded_filenames)
+
+            elif __user__["valves"].USE_PDF_NATIVE_UPLOAD:
+                # Native PDF upload (base64 document blocks) — only PDFs
                 pdf_documents_content_blocks, new_marker_metadata = (
-                    self._get_full_context_pdfs(__files__)
+                    self._get_full_context_pdfs(__files__, previous_marker_metadata)
                 )
                 if pdf_documents_content_blocks:
                     processed_messages[0]["content"] = (
                         pdf_documents_content_blocks + processed_messages[0]["content"]
                     )
-                    
+
                     # Remove RAG sources for files that were uploaded natively
-                    # Extract filenames of PDFs that were processed as native documents
                     native_pdf_filenames = []
                     for file in __files__:
                         if (
@@ -1466,14 +1591,12 @@ class Pipe:
                         ):
                             file_id = file.get("id")
                             filename = file.get("name")
-                            # Only add if not previously processed and has valid filename
                             if file_id and filename and not any(
                                 file_id in metadata
                                 for metadata in previous_marker_metadata
                             ):
                                 native_pdf_filenames.append(filename)
-                    
-                    # Remove these sources from RAG message (or remove entire RAG if all sources gone)
+
                     if native_pdf_filenames:
                         logger.debug(
                             f"📋 RAG: Removing {len(native_pdf_filenames)} native PDF source(s) from RAG"
@@ -1491,6 +1614,10 @@ class Pipe:
         activate_code_execution = __metadata__.get(
             "activate_code_execution_tool", False
         )
+
+        # Auto-enable code execution when Files API uploaded files (container_upload needs it)
+        if has_files_api_uploads:
+            activate_code_execution = True
 
         # Auto-enable code execution when programmatic tool calling is active
         # (programmatic calling requires code execution to orchestrate tool calls)
@@ -1577,14 +1704,10 @@ class Pipe:
         if self.valves.WEB_FETCH and uses_old_web_fetch:
             beta_headers.append("web-fetch-2025-09-10")
 
-        # # Add memory tool beta header if enabled and model supports it
-        # if self.valves.ENABLE_CLAUDE_MEMORY and model_info.get("supports_memory", False):
-        #     if "context-management-2025-06-27" not in beta_headers:
-        #         beta_headers.append("context-management-2025-06-27")
-            
-        # Add Files API beta header if using uploaded files
-        # if __user__["valves"].USE_FILES_API:
-        #     beta_headers.append("files-api-2025-04-14")
+        # Add Files API beta header when files were uploaded but code_execution
+        # wasn't otherwise activated (standalone file upload scenario)
+        if has_files_api_uploads and "files-api-2025-04-14" not in beta_headers:
+            beta_headers.append("files-api-2025-04-14")
 
         # Skills Integration
         if activate_code_execution and __user__["valves"].SKILLS:
@@ -1598,6 +1721,10 @@ class Pipe:
             )
             payload["container"] = validated_skills
             logger.debug(f"🔧 Added {len(validated_skills)} skills")
+        elif previous_container_id:
+            # Reuse container from previous turn for code execution state continuity
+            payload["container"] = previous_container_id
+            logger.info(f"📦 Reusing container from previous turn: {previous_container_id}")
 
         # Add advanced tool use beta (for programmatic calling and tool search)
         if self.valves.ENABLE_TOOL_SEARCH or self.valves.ENABLE_PROGRAMMATIC_TOOL_CALLING:
@@ -1798,7 +1925,7 @@ class Pipe:
             role = msg.get("role")
             raw_content = msg.get("content")
 
-            claude_message = self._convert_content_to_claude_format(raw_content)
+            claude_message = self._convert_content_to_claude_format(raw_content, role=role)
             if not claude_message:
                 continue
             if role == "system":
@@ -1827,13 +1954,16 @@ class Pipe:
                     if block["text"].strip():
                         system_messages.append(block)
             else:
+                # Wrap as dict so _extract_metadata_marker_from_message can check role
+                # and modify content blocks in-place to strip markers
+                wrapped_msg = {"role": role, "content": claude_message}
                 extracted_metadata = self._extract_metadata_marker_from_message(
-                    claude_message
+                    wrapped_msg
                 )
                 if extracted_metadata:
                     previous_marker_metadata.extend(extracted_metadata)
 
-                processed_messages.append({"role": role, "content": claude_message})
+                processed_messages.append(wrapped_msg)
 
                 if (
                     user_has_memory_system_enabled
@@ -1950,7 +2080,8 @@ class Pipe:
             # web_search_20260209 has dynamic filtering (code execution post-processes results)
             # web_search_20250305 works on all models without dynamic filtering
             model_info_ws = self.get_model_info(actual_model_name)
-            if model_info_ws.get("supports_dynamic_filtering", False):
+            use_dynamic = __user__["valves"].ENABLE_DYNAMIC_FILTERING
+            if use_dynamic and model_info_ws.get("supports_dynamic_filtering", False):
                 web_search_type = "web_search_20260209"
             else:
                 web_search_type = "web_search_20250305"
@@ -1984,7 +2115,8 @@ class Pipe:
         # web_fetch_20250910 works on all models without dynamic filtering
         model_info = self.get_model_info(actual_model_name)
         if self.valves.WEB_FETCH:
-            if model_info.get("supports_dynamic_filtering", False):
+            use_dynamic_fetch = __user__["valves"].ENABLE_DYNAMIC_FILTERING
+            if use_dynamic_fetch and model_info.get("supports_dynamic_filtering", False):
                 web_fetch_type = "web_fetch_20260209"
             else:
                 web_fetch_type = "web_fetch_20250910"
@@ -2120,6 +2252,192 @@ class Pipe:
             logger.info(f"  🔧 Tool: {t.get('name')} [{', '.join(flags) or 'normal'}]")
 
         return claude_tools
+
+    def _remove_thinking_blocks(self, content: str) -> str:
+        """Remove thinking blocks from assistant message content to prevent re-send to API."""
+        return PATTERN_THINKING_BLOCK.sub("", content)
+
+    def _convert_content_to_claude_format(
+        self, content: Union[str, List[dict], None], role: str = "user"
+    ) -> List[dict]:
+        """
+        Process content from OpenWebUI format to Claude API format.
+        Handles text, images, PDFs, tool_calls, and tool_results according to
+        Anthropic API documentation.
+        Filters out empty text blocks to prevent API errors.
+        """
+        if content is None:
+            return []
+
+        if isinstance(content, str):
+            # Only assistant messages can contain thinking blocks
+            if role == "assistant":
+                content = self._remove_thinking_blocks(content)
+            # Only return non-empty text blocks
+            if content.strip():
+                return [{"type": "text", "text": content}]
+            else:
+                return []
+
+        processed_content = []
+        for item in content:
+            if item.get("type") == "text":
+                text_content = item.get("text", "")
+                # Only add non-empty text blocks (Anthropic API requirement)
+                if text_content.strip():
+                    processed_content.append({"type": "text", "text": text_content})
+
+            elif item.get("type") == "image_url":
+                image_url = item.get("image_url", {}).get("url", "")
+
+                if image_url.startswith("data:image"):
+                    # Handle base64 encoded image data
+                    try:
+                        header, encoded = image_url.split(",", 1)
+                        mime_type = header.split(":")[1].split(";")[0]
+
+                        # Validate supported image formats according to Anthropic docs
+                        supported_formats = [
+                            "image/jpeg",
+                            "image/png",
+                            "image/gif",
+                            "image/webp",
+                        ]
+
+                        if mime_type not in supported_formats:
+                            logger.debug(f" Unsupported image mime type: {mime_type}")
+                            processed_content.append(
+                                {
+                                    "type": "text",
+                                    "text": f"[Image type {mime_type} not supported. Supported formats: JPEG, PNG, GIF, WebP]",
+                                }
+                            )
+                            continue
+
+                        # Check image size - API has 32MB request limit, but be conservative
+                        MAX_IMAGE_SIZE = 25 * 1024 * 1024  # 25 MB (conservative)
+                        try:
+                            decoded_bytes = base64.b64decode(encoded)
+                            if len(decoded_bytes) > MAX_IMAGE_SIZE:
+                                logger.debug(
+                                    f" Image too large: {len(decoded_bytes)} bytes"
+                                )
+                                processed_content.append(
+                                    {
+                                        "type": "text",
+                                        "text": f"[Image too large for Anthropic API. Max size: 25MB, received: {len(decoded_bytes)//1024//1024}MB]",
+                                    }
+                                )
+                                continue
+                        except Exception as decode_ex:
+                            logger.debug(f" Image base64 decode failed: {decode_ex}")
+                            processed_content.append(
+                                {
+                                    "type": "text",
+                                    "text": "[Image data could not be decoded - invalid base64 format]",
+                                }
+                            )
+                            continue
+
+                        processed_content.append(
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": mime_type,
+                                    "data": encoded,
+                                },
+                            }
+                        )
+
+                    except ValueError as e:
+                        logger.debug(f"Error parsing image data URL: {e}")
+                        processed_content.append(
+                            {
+                                "type": "text",
+                                "text": "[Error processing image - invalid data URL format]",
+                            }
+                        )
+                    except Exception as e:
+                        logger.debug(f"Unexpected error processing image: {e}")
+                        processed_content.append(
+                            {
+                                "type": "text",
+                                "text": "[Unexpected error processing image]",
+                            }
+                        )
+                else:
+                    # For image URLs (not base64), Claude API supports URL references
+                    if image_url.startswith(("http://", "https://")):
+                        processed_content.append(
+                            {
+                                "type": "image",
+                                "source": {"type": "url", "url": image_url},
+                            }
+                        )
+                    else:
+                        processed_content.append(
+                            {
+                                "type": "text",
+                                "text": f"[Invalid image URL format: {image_url}. Only HTTP/HTTPS URLs are supported]",
+                            }
+                        )
+
+            elif item.get("type") == "tool_calls":
+                converted_calls = self._process_tool_calls(item)
+                processed_content.extend(converted_calls)
+
+            elif item.get("type") == "tool_results":
+                converted_results = self._process_tool_results(item)
+                processed_content.extend(converted_results)
+
+            else:
+                logger.debug(
+                    f" Unknown content type: {item.get('type')}, converting to text"
+                )
+                processed_content.append(
+                    {
+                        "type": "text",
+                        "text": f"[Unsupported content type: {item.get('type')}]",
+                    }
+                )
+
+        return processed_content
+
+    def _process_tool_calls(self, tool_calls_item):
+        """Convert OpenWebUI tool_calls format to Claude tool_use format."""
+        claude_tool_uses = []
+        if "tool_calls" in tool_calls_item:
+            for tool_call in tool_calls_item["tool_calls"]:
+                if tool_call.get("type") == "function" and "function" in tool_call:
+                    function_def = tool_call["function"]
+                    claude_tool_uses.append({
+                        "type": "tool_use",
+                        "id": tool_call.get("id", ""),
+                        "name": function_def.get("name", ""),
+                        "input": function_def.get("arguments", {}),
+                    })
+        return claude_tool_uses
+
+    def _process_tool_results(self, tool_results_item):
+        """Convert OpenWebUI tool_results format to Claude tool_result format."""
+        claude_tool_results = []
+        if "results" in tool_results_item:
+            for result_item in tool_results_item["results"]:
+                if "call" in result_item and "result" in result_item:
+                    tool_call = result_item["call"]
+                    tool_use_id = tool_call.get("id", "")
+                    if tool_use_id:
+                        claude_tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": tool_use_id,
+                            "content": str(result_item["result"]),
+                        })
+        return claude_tool_results
+
+    # =========================================================================
+    # MAIN ENTRY POINT
+    # =========================================================================
 
     async def pipe(
         self,
@@ -2483,33 +2801,6 @@ class Pipe:
                     logger.debug(
                         f"📦 Container in payload before stream: {payload_for_stream.get('container', 'NOT SET')}"
                     )
-
-                    # DEFINITIVE pre-API dump: show exact keys and sizes for every content block
-                    if tool_loop_iteration > 1:
-                        for mi, msg in enumerate(payload_for_stream.get("messages", [])):
-                            role = msg.get("role", "?")
-                            content = msg.get("content", "")
-                            if isinstance(content, list):
-                                block_descs = []
-                                for bi, blk in enumerate(content):
-                                    btype = blk.get("type", "?")
-                                    keys = sorted(blk.keys())
-                                    extra = ""
-                                    if btype == "thinking":
-                                        extra = f" think={len(blk.get('thinking',''))}c sig={len(blk.get('signature',''))}c"
-                                    elif btype == "redacted_thinking":
-                                        extra = f" data={len(blk.get('data',''))}c"
-                                    elif btype == "tool_use":
-                                        extra = f" name={blk.get('name','?')}"
-                                    elif btype == "tool_result":
-                                        extra = f" tid={blk.get('tool_use_id','?')[:15]}"
-                                    block_descs.append(f"[{bi}]{btype}(keys={keys}{extra})")
-                                logger.info(
-                                    f"📋 PRE-API msg[{mi}] {role}: {len(content)} blocks: "
-                                    + " | ".join(block_descs)
-                                )
-                            else:
-                                logger.info(f"📋 PRE-API msg[{mi}] {role}: str({len(str(content))}c)")
 
                     stream_event_counts = {}  # Track event types for diagnostics
                     async with client.beta.messages.stream(
@@ -3623,12 +3914,13 @@ class Pipe:
                                                             "is_error": is_error,
                                                         })
                                                     else:
-                                                        # Emit completed tool result block
+                                                        # Show completed tool result block instantly (replace, not delta)
                                                         formatted = self._format_tool_result_block(
                                                             tool_use_id, tool_name, tool_input,
                                                             str(tool_result), is_error=is_error, done=True
                                                         )
-                                                        await emit_message_delta(formatted)
+                                                        final_message.append(formatted)
+                                                        await emit_message_replace(final_text())
 
                                                 logger.debug(
                                                     f"Emitted {len(results)} tool result(s)"
@@ -4149,6 +4441,10 @@ class Pipe:
             await emit("Final_Text", final_text())
         return final_text()
 
+    # =========================================================================
+    # TASK MODEL (TITLE, TAGS, FOLLOW-UPS)
+    # =========================================================================
+
     async def _run_task_model_request(
         self,
         body: dict[str, Any],
@@ -4223,6 +4519,10 @@ class Pipe:
                     processed.append({"role": role, "content": " ".join(text_parts)})
 
         return processed
+
+    # =========================================================================
+    # MEMORY SYSTEM (FILESYSTEM-BACKED CLAUDE MEMORY TOOL)
+    # =========================================================================
 
     def _get_user_memory_dir(self, user_id: str) -> str:
         """Get the memory directory for a specific user, creating it if needed."""
@@ -4412,6 +4712,10 @@ class Pipe:
             logger.error(f"Memory tool error: {e}")
             return f"Error: {str(e)}"
 
+    # =========================================================================
+    # ERROR HANDLING
+    # =========================================================================
+
     async def handle_errors(
         self,
         exception,
@@ -4515,6 +4819,10 @@ class Pipe:
             __event_emitter__,
         )
 
+    # =========================================================================
+    # TOOL EXECUTION
+    # =========================================================================
+
     async def _run_tool_callable(
         self,
         tool_callable: Callable[..., Awaitable[Any]],
@@ -4534,210 +4842,9 @@ class Pipe:
             self.logger.debug(f"Tool '%s' failed", tool_name, exc_info=exc)
             return f"Error executing tool '{tool_name}': {exc}"
 
-    def _remove_thinking_blocks(self, content: str) -> str:
-        """
-        Remove thinking blocks from message content to prevent them from being
-        re-sent to the API in subsequent requests.
-        """
-        return PATTERN_THINKING_BLOCK.sub("", content)
-
-    def _convert_content_to_claude_format(
-        self, content: Union[str, List[dict], None]
-    ) -> List[dict]:
-        """
-        Process content from OpenWebUI format to Claude API format.
-        Handles text, images, PDFs, tool_calls, and tool_results according to
-        Anthropic API documentation.
-        Filters out empty text blocks to prevent API errors.
-        """
-        if content is None:
-            return []
-
-        if isinstance(content, str):
-            # Remove thinking blocks from historical messages
-            content = self._remove_thinking_blocks(content)
-            # Only return non-empty text blocks
-            if content.strip():
-                return [{"type": "text", "text": content}]
-            else:
-                return []
-
-        processed_content = []
-        for item in content:
-            if item.get("type") == "text":
-                text_content = item.get("text", "")
-                # Only add non-empty text blocks (Anthropic API requirement)
-                if text_content.strip():
-                    processed_content.append({"type": "text", "text": text_content})
-
-            elif item.get("type") == "image_url":
-                image_url = item.get("image_url", {}).get("url", "")
-
-                if image_url.startswith("data:image"):
-                    # Handle base64 encoded image data
-                    try:
-                        header, encoded = image_url.split(",", 1)
-                        mime_type = header.split(":")[1].split(";")[0]
-
-                        # Validate supported image formats according to Anthropic docs
-                        supported_formats = [
-                            "image/jpeg",
-                            "image/png",
-                            "image/gif",
-                            "image/webp",
-                        ]
-
-                        if mime_type not in supported_formats:
-                            logger.debug(f" Unsupported image mime type: {mime_type}")
-                            processed_content.append(
-                                {
-                                    "type": "text",
-                                    "text": f"[Image type {mime_type} not supported. Supported formats: JPEG, PNG, GIF, WebP]",
-                                }
-                            )
-                            continue
-
-                        # Check image size - API has 32MB request limit, but be conservative
-                        # Also check for API limits: 8000x8000 px for single image
-                        MAX_IMAGE_SIZE = 25 * 1024 * 1024  # 25 MB (conservative)
-                        try:
-                            decoded_bytes = base64.b64decode(encoded)
-                            if len(decoded_bytes) > MAX_IMAGE_SIZE:
-                                logger.debug(
-                                    f" Image too large: {len(decoded_bytes)} bytes"
-                                )
-                                processed_content.append(
-                                    {
-                                        "type": "text",
-                                        "text": f"[Image too large for Anthropic API. Max size: 25MB, received: {len(decoded_bytes)//1024//1024}MB]",
-                                    }
-                                )
-                                continue
-                        except Exception as decode_ex:
-                            logger.debug(f" Image base64 decode failed: {decode_ex}")
-                            processed_content.append(
-                                {
-                                    "type": "text",
-                                    "text": "[Image data could not be decoded - invalid base64 format]",
-                                }
-                            )
-                            continue
-
-                        processed_content.append(
-                            {
-                                "type": "image",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": mime_type,
-                                    "data": encoded,
-                                },
-                            }
-                        )
-
-                    except ValueError as e:
-                        logger.debug(f"Error parsing image data URL: {e}")
-                        processed_content.append(
-                            {
-                                "type": "text",
-                                "text": "[Error processing image - invalid data URL format]",
-                            }
-                        )
-                    except Exception as e:
-                        logger.debug(f"Unexpected error processing image: {e}")
-                        processed_content.append(
-                            {
-                                "type": "text",
-                                "text": "[Unexpected error processing image]",
-                            }
-                        )
-                else:
-                    # For image URLs (not base64), Claude API supports URL references
-                    # but we need to validate the URL format
-                    if image_url.startswith(("http://", "https://")):
-                        processed_content.append(
-                            {
-                                "type": "image",
-                                "source": {"type": "url", "url": image_url},
-                            }
-                        )
-                    else:
-                        processed_content.append(
-                            {
-                                "type": "text",
-                                "text": f"[Invalid image URL format: {image_url}. Only HTTP/HTTPS URLs are supported]",
-                            }
-                        )
-
-            elif item.get("type") == "tool_calls":
-                # Convert OpenWebUI tool_calls to Claude tool_use format
-                converted_calls = self._process_tool_calls(item)
-                processed_content.extend(converted_calls)
-
-            elif item.get("type") == "tool_results":
-                # Convert OpenWebUI tool_results to Claude tool_result format
-                converted_results = self._process_tool_results(item)
-                processed_content.extend(converted_results)
-
-            # Handle any other content types by converting to text
-            else:
-                logger.debug(
-                    f" Unknown content type: {item.get('type')}, converting to text"
-                )
-                # Convert unknown types to text representation
-                processed_content.append(
-                    {
-                        "type": "text",
-                        "text": f"[Unsupported content type: {item.get('type')}]",
-                    }
-                )
-
-        return processed_content
-
-    def _process_tool_calls(self, tool_calls_item):
-        """
-        Convert OpenWebUI tool_calls format to Claude tool_use format.
-        """
-        claude_tool_uses = []
-
-        if "tool_calls" in tool_calls_item:
-            for tool_call in tool_calls_item["tool_calls"]:
-                if tool_call.get("type") == "function" and "function" in tool_call:
-                    function_def = tool_call["function"]
-
-                    claude_tool_use = {
-                        "type": "tool_use",
-                        "id": tool_call.get("id", ""),
-                        "name": function_def.get("name", ""),
-                        "input": function_def.get("arguments", {}),
-                    }
-                    claude_tool_uses.append(claude_tool_use)
-
-        return claude_tool_uses
-
-    def _process_tool_results(self, tool_results_item):
-        """
-        Convert OpenWebUI tool_results format to Claude tool_result format.
-        """
-        claude_tool_results = []
-
-        if "results" in tool_results_item:
-            for result_item in tool_results_item["results"]:
-                if "call" in result_item and "result" in result_item:
-                    tool_call = result_item["call"]
-                    result_content = result_item["result"]
-
-                    # Extract tool_use_id from the call
-                    tool_use_id = tool_call.get("id", "")
-
-                    if tool_use_id:
-                        claude_result = {
-                            "type": "tool_result",
-                            "tool_use_id": tool_use_id,
-                            "content": str(result_content),
-                        }
-                        claude_tool_results.append(claude_result)
-
-        return claude_tool_results
+    # =========================================================================
+    # TEXT PROCESSING & MEMORY EXTRACTION
+    # =========================================================================
 
     def _extract_and_remove_memories(self, text: str) -> tuple[str, Optional[str]]:
         """
@@ -4764,6 +4871,10 @@ class Pipe:
 
         # No User Context found
         return text.strip(), None
+
+    # =========================================================================
+    # CITATIONS & EVENT EMISSION
+    # =========================================================================
 
     async def handle_citation(self, event, __event_emitter__, citation_counter=None):
         """
@@ -5005,9 +5116,6 @@ class Pipe:
                 f"</details>\n"
             )
 
-    # FINAL MESSAGE FORMATTING
-    # Formats code execution results with proper <details> blocks
-    # =========================================================================
     def _format_code_execution_block(
         self,
         code: str,
@@ -5071,9 +5179,10 @@ class Pipe:
         parts.append("</details>\n")
         return "".join(parts)
 
-    # ========================================================================
+    # =========================================================================
     # SKILLS VALIDATION AND CONTAINER BUILDING
-    # =======================================================================
+    # =========================================================================
+
     async def _validate_and_get_skills(
         self,
         skill_names: List[str],
