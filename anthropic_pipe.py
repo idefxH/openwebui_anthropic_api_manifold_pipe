@@ -4,7 +4,7 @@ id: anthropic_new
 author: Podden (https://github.com/Podden/)
 github: https://github.com/Podden/openwebui_anthropic_api_manifold_pipe
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.6.1
+version: 0.7.0
 license: MIT
 requirements: pydantic>=2.0.0, anthropic>=0.75.0
 environment_variables:
@@ -16,6 +16,7 @@ Supports:
 - Fetch Claude Models from API Endpoint
 - Tool Call Loop (call multiple Tools in the same response)
 - web_search Tool
+- web_fetch Tool (URL content retrieval)
 - citations for web_search
 - Streaming responses
 - Prompt caching (server-side) compatible with Openwebui Memory and RAG System
@@ -31,8 +32,30 @@ Supports:
 - Tool Search (BM25/Regex)
 - Native PDF Upload (visual PDF analysis with charts/images)
 - Agent Skills (pptx, xlsx, docx, pdf and custom skills)
+- Fast Mode (research preview) for Opus 4.6
+- Memory Tool (integrated with OpenWebUI memory system)
+- Programmatic Tool Calling (tools callable from code execution)
 
 Changelog:
+v0.7.0
+- Added Sonnet 4.6 model support
+- Added Fast Mode support (speed: "fast" for Opus 4.6)
+- Added web_fetch tool (URL content retrieval)
+- Added memory tool integration with OpenWebUI memory system
+- Added programmatic tool calling (allowed_callers for code execution)
+- Fixed task model bug: _run_task_model_request() was called with extra argument
+
+v0.6.3
+- Added Opus 4.6
+- Added Support for effort: max
+- Added Support for Data residency
+- Added messages for stop_reason in case of refusal, stop_sequence or context window exceeded
+- Added ENABLE_INTERLEAVED_THINKING valve for enabling Thinking between Tool Calls
+- Homogenized Thinking and Tool Call/Results streaming to match build in OpenAI/Ollama system
+
+v0.6.2
+- Reordered Payload for better Caching
+
 v0.6.1
 - Full Skills Support: Users can add skills (eg. pptx, xlsx, docx, pdf) or custom skills already uploaded to the Anthropic Site
 - Skills are validated against the List Skills API endpoint with caching to avoid redundant API calls
@@ -48,6 +71,12 @@ v0.6
 - USE_PDF_NATIVE_UPLOAD is now True by default, PDF Files now are embedded in to the correct user message every conversation step, added invisible Markdown Markers for storing this data in assistant messages
 - Container ID persists across multi-turn conversations for code execution state continuity
 - RAG is now working correctly in conjunction with Native PDF File upload, removing all sources from the RAG message which were already uploaded as native documents
+
+v0.5.12
+- Thinking is now streamed in the UI and folded when the thought process has ended
+
+v0.5.11
+- Added Compatibility to Build-in Tools from OpenWebUI 0.7.x 
 
 v0.5.10
 - Performance: Pre-compiled regex patterns at module level (5-10x faster pattern matching)
@@ -222,8 +251,10 @@ import inspect
 from datetime import datetime
 from collections.abc import Awaitable
 import asyncio
+import html
 import json
 import logging
+import time
 from urllib.parse import quote, unquote
 from typing import Any, Callable, List, Union, Dict, Optional
 from pydantic import BaseModel, Field
@@ -241,6 +272,8 @@ from anthropic import (
 )
 from typing import Literal
 
+from fastapi import Request
+
 logger = logging.getLogger(__name__)
 
 # =============================================================================
@@ -249,38 +282,26 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 # Pattern to match thinking blocks in message content (for removal from history)
-# Matches: <details><summary>🧠 Thinking...</summary>\n...\n</details>
+# Matches both old format (<details><summary>🧠...) and new native format (<details type="reasoning"...)
 PATTERN_THINKING_BLOCK = re.compile(
-    r"<details>\s*<summary>🧠.*?</summary>.*?</details>\s*",
-    flags=re.DOTALL
+    r'<details[^>]*(?:type="reasoning"|<summary>🧠)[^>]*>.*?</details>\s*', flags=re.DOTALL
 )
 
 # Pattern to extract User Context from OpenWebUI Memory System in system prompts
 # Matches everything after "\nUser Context:\n" to end of string
-PATTERN_USER_CONTEXT = re.compile(
-    r"\nUser Context:\n(.*)$",
-    flags=re.DOTALL
-)
+PATTERN_USER_CONTEXT = re.compile(r"\nUser Context:\n(.*)$", flags=re.DOTALL)
 
 # Patterns for RAG template cleanup when all sources are native PDFs
 PATTERN_RAG_TEMPLATE_WITH_CONTEXT = re.compile(
-    r'###\s*Task:.*?<context>.*?</context>',
-    flags=re.DOTALL | re.MULTILINE
+    r"###\s*Task:.*?<context>.*?</context>", flags=re.DOTALL | re.MULTILINE
 )
 PATTERN_RAG_TEMPLATE_FALLBACK = re.compile(
-    r'###\s*Task:.*?$',
-    flags=re.DOTALL | re.MULTILINE
+    r"###\s*Task:.*?$", flags=re.DOTALL | re.MULTILINE
 )
-PATTERN_EMPTY_CONTEXT = re.compile(
-    r'<context>\s*</context>',
-    flags=re.DOTALL
-)
+PATTERN_EMPTY_CONTEXT = re.compile(r"<context>\s*</context>", flags=re.DOTALL)
 
 # Pattern to find remaining source tags (for checking if all were removed)
-PATTERN_SOURCE_TAGS = re.compile(
-    r'<source[^>]*>.*?</source>',
-    flags=re.DOTALL
-)
+PATTERN_SOURCE_TAGS = re.compile(r"<source[^>]*>.*?</source>", flags=re.DOTALL)
 
 # =============================================================================
 # IMPORTS
@@ -289,17 +310,28 @@ PATTERN_SOURCE_TAGS = re.compile(
 # Import OpenWebUI Models for auto-enabling native function calling
 try:
     from open_webui.models.models import Models, ModelForm
+
     MODELS_AVAILABLE = True
 except ImportError:
     Models = None
     ModelForm = None
     MODELS_AVAILABLE = False
 
+# Import OpenWebUI builtin tools helper
+try:
+    from open_webui.utils.tools import get_builtin_tools
+
+    BUILTIN_TOOLS_AVAILABLE = True
+except ImportError:
+    get_builtin_tools = None
+    BUILTIN_TOOLS_AVAILABLE = False
+
 # Import OpenWebUI Files and Storage for PDF native upload
 try:
     from open_webui.models.files import Files
     from open_webui.storage.provider import Storage
     from pathlib import Path
+
     FILES_AVAILABLE = True
 except ImportError:
     Files = None
@@ -307,10 +339,22 @@ except ImportError:
     Path = None
     FILES_AVAILABLE = False
 
+# Import OpenWebUI Memory APIs for Claude memory tool integration
+try:
+    from open_webui.models.memories import Memories
+
+    MEMORIES_AVAILABLE = True
+except ImportError:
+    Memories = None
+    MEMORIES_AVAILABLE = False
+
+
 class Pipe:
     # Pre-compile static regex patterns for RAG message and <source> tags
-    PATTERN_RAG_MESSAGE = re.compile(r'### Task:.*?<context>.*?</context>', re.DOTALL)
-    PATTERN_SOURCE_TAG = re.compile(r'<source[^>]*name="([^"]+)"[^>]*>.*?</source>\s*', re.DOTALL)
+    PATTERN_RAG_MESSAGE = re.compile(r"### Task:.*?<context>.*?</context>", re.DOTALL)
+    PATTERN_SOURCE_TAG = re.compile(
+        r'<source[^>]*name="([^"]+)"[^>]*>.*?</source>\s*', re.DOTALL
+    )
 
     API_VERSION = "2023-06-01"  # Current API version as of May 2025
     MODEL_URL = "https://api.anthropic.com/v1/messages"
@@ -321,26 +365,6 @@ class Pipe:
     # Therefore, we must maintain this static configuration.
     MODEL_CAPABILITIES = {
         # Claude 3 family
-        "claude-3-opus-20240229": {
-            "max_tokens": 4096,
-            "context_length": 200000,
-            "supports_thinking": False,
-            "supports_1m_context": False,
-            "supports_memory": False,
-            "supports_vision": True,
-            "supports_effort": False,
-            "supports_programmatic_calling": False,
-        },
-        "claude-3-sonnet-20240229": {
-            "max_tokens": 4096,
-            "context_length": 200000,
-            "supports_thinking": False,
-            "supports_1m_context": False,
-            "supports_memory": False,
-            "supports_vision": True,
-            "supports_effort": False,
-            "supports_programmatic_calling": False,
-        },
         "claude-3-haiku-20240307": {
             "max_tokens": 4096,
             "context_length": 200000,
@@ -350,37 +374,8 @@ class Pipe:
             "supports_vision": True,
             "supports_effort": False,
             "supports_programmatic_calling": False,
-        },
-        # Claude 3.5 family
-        "claude-3-5-sonnet-20240620": {
-            "max_tokens": 8192,
-            "context_length": 200000,
-            "supports_thinking": False,
-            "supports_1m_context": False,
-            "supports_memory": False,
-            "supports_vision": True,
-            "supports_effort": False,
-            "supports_programmatic_calling": False,
-        },
-        "claude-3-5-sonnet-20241022": {
-            "max_tokens": 8192,
-            "context_length": 200000,
-            "supports_thinking": False,
-            "supports_1m_context": False,
-            "supports_memory": False,
-            "supports_vision": True,
-            "supports_effort": False,
-            "supports_programmatic_calling": False,
-        },
-        "claude-3-5-haiku-20241022": {
-            "max_tokens": 8192,
-            "context_length": 200000,
-            "supports_thinking": False,
-            "supports_1m_context": False,
-            "supports_memory": False,
-            "supports_vision": True,
-            "supports_effort": False,
-            "supports_programmatic_calling": False,
+            "supports_adaptive_thinking": False,
+            "supports_effort_max": False,
         },
         # Claude 3.7 family
         "claude-3-7-sonnet-20250219": {
@@ -392,6 +387,8 @@ class Pipe:
             "supports_vision": True,
             "supports_effort": False,
             "supports_programmatic_calling": False,
+            "supports_adaptive_thinking": False,
+            "supports_effort_max": False,
         },
         # Claude 4 family
         "claude-sonnet-4-20250514": {
@@ -403,6 +400,8 @@ class Pipe:
             "supports_vision": True,
             "supports_effort": False,
             "supports_programmatic_calling": False,
+            "supports_adaptive_thinking": False,
+            "supports_effort_max": False,
         },
         "claude-opus-4-20250514": {
             "max_tokens": 32000,
@@ -413,6 +412,8 @@ class Pipe:
             "supports_vision": True,
             "supports_effort": False,
             "supports_programmatic_calling": False,
+            "supports_adaptive_thinking": False,
+            "supports_effort_max": False,
         },
         "claude-opus-4-1-20250805": {
             "max_tokens": 32000,
@@ -423,6 +424,8 @@ class Pipe:
             "supports_vision": True,
             "supports_effort": False,
             "supports_programmatic_calling": False,
+            "supports_adaptive_thinking": False,
+            "supports_effort_max": False,
         },
         "claude-sonnet-4-5-20250929": {
             "max_tokens": 64000,
@@ -433,6 +436,8 @@ class Pipe:
             "supports_vision": True,
             "supports_effort": False,
             "supports_programmatic_calling": True,
+            "supports_adaptive_thinking": False,
+            "supports_effort_max": False,
         },
         "claude-haiku-4-5-20251001": {
             "max_tokens": 64000,
@@ -443,6 +448,8 @@ class Pipe:
             "supports_vision": True,
             "supports_effort": False,
             "supports_programmatic_calling": False,  # Haiku 4.5 only supports allowed_callers=['direct']
+            "supports_adaptive_thinking": False,
+            "supports_effort_max": False,
         },
         "claude-opus-4-5-20251101": {
             "max_tokens": 64000,
@@ -453,15 +460,40 @@ class Pipe:
             "supports_vision": True,
             "supports_effort": True,
             "supports_programmatic_calling": True,
+            "supports_adaptive_thinking": False,
+            "supports_effort_max": False,
+        },
+        "claude-opus-4-6": {
+            "max_tokens": 128000,
+            "context_length": 200000,
+            "supports_thinking": True,
+            "supports_adaptive_thinking": True,
+            "supports_1m_context": True,
+            "supports_memory": True,
+            "supports_vision": True,
+            "supports_effort": True,
+            "supports_effort_max": True,
+            "supports_programmatic_calling": True,
+            "supports_fast_mode": True,
+        },
+        "claude-sonnet-4-6": {
+            "max_tokens": 64000,
+            "context_length": 200000,
+            "supports_thinking": True,
+            "supports_adaptive_thinking": True,
+            "supports_1m_context": True,
+            "supports_memory": True,
+            "supports_vision": True,
+            "supports_effort": True,
+            "supports_effort_max": True,
+            "supports_programmatic_calling": True,
+            "supports_fast_mode": False,
         }
     }
-    
+
     # Aliases map to dated model versions
     MODEL_ALIASES = {
-        "claude-3-opus-latest": "claude-3-opus-20240229",
-        "claude-3-sonnet-latest": "claude-3-sonnet-20240229",
         "claude-3-haiku-latest": "claude-3-haiku-20240307",
-        "claude-3-5-sonnet-latest": "claude-3-5-sonnet-20241022",
         "claude-3-5-haiku-latest": "claude-3-5-haiku-20241022",
         "claude-3-7-sonnet-latest": "claude-3-7-sonnet-20250219",
         "claude-sonnet-4": "claude-sonnet-4-20250514",
@@ -499,22 +531,37 @@ class Pipe:
                 "supports_vision": True,
                 "supports_effort": False,
                 "supports_programmatic_calling": False,
+                "supports_adaptive_thinking": False,
+                "supports_effort_max": False,
+                "supports_fast_mode": False,
             },
         )
 
     class Valves(BaseModel):
         ANTHROPIC_API_KEY: str = "Your API Key Here"
-        # ENABLE_CLAUDE_MEMORY: bool = Field(
-        #     default=False,
-        #     description="Enable Claude memory tool",
-        # )
+        ENABLE_FAST_MODE: bool = Field(
+            default=False,
+            description="Enable Fast Mode (research preview) for Opus 4.6. Up to 2.5x faster output at higher cost.",
+        )
+        ENABLE_CLAUDE_MEMORY: bool = Field(
+            default=False,
+            description="Enable Claude memory tool (integrated with OpenWebUI memory system)",
+        )
         ENABLE_1M_CONTEXT: bool = Field(
             default=False,
             description="Enable 1M token context window for Claude Sonnet 4 (requires Tier 4 API access)",
         )
+        ENABLE_INTERLEAVED_THINKING: bool = Field(
+            default=False,
+            description="Enable interleaved thinking. Claude can generate thinking blocks between tool calls instead of only at the end.",
+        )
         WEB_SEARCH: bool = Field(
             default=True,
             description="Enable web search tool for Claude models. Use Anthropic Web Search Toggle Function for fine grained control",
+        )
+        WEB_FETCH: bool = Field(
+            default=False,
+            description="Enable web fetch tool for Claude models. Allows Claude to fetch and analyze content from URLs.",
         )
         MAX_TOOL_CALLS: int = Field(
             default=15,
@@ -553,11 +600,11 @@ class Pipe:
             default="",
             description="User's timezone for web search.",
         )
-        # # Programmatic Tool Calling
-        # ENABLE_PROGRAMMATIC_TOOL_CALLING: bool = Field(
-        #     default=False,
-        #     description="Enable programmatic tool calling. Claude can call tools from within code execution.",
-        # )
+        # Programmatic Tool Calling
+        ENABLE_PROGRAMMATIC_TOOL_CALLING: bool = Field(
+            default=False,
+            description="Enable programmatic tool calling. Claude can call tools from within code execution. Requires code execution to be active.",
+        )
         # Tool Search
         ENABLE_TOOL_SEARCH: bool = Field(
             default=False,
@@ -574,7 +621,7 @@ class Pipe:
             description="Maximum tool description length. Tools with longer JSON definitions will be deferred for lazy loading.",
         )
         TOOL_SEARCH_EXCLUDE_TOOLS: List[str] = Field(
-           default=["web_search", "code_execution_20250825"],
+            default=["web_search", "web_fetch", "code_execution_20250825"],
             description="Tools to exclude from defer_loading when tool search is enabled. These tools will always be loaded immediately.",
         )
         # Context Editing
@@ -614,6 +661,10 @@ class Pipe:
             default=False,
             description="Also clear tool input parameters when clearing tool results.",
         )
+        DATA_RESIDENCY: Literal["global", "us"] = Field(
+            default="global",
+            description="Data residency for API requests. 1.1x Token Cost for \"us\".",
+        ) 
 
     class UserValves(BaseModel):
         ENABLE_THINKING: bool = Field(
@@ -622,11 +673,11 @@ class Pipe:
         )
         THINKING_BUDGET_TOKENS: int = Field(
             default=8192,
-            ge=0,
+            ge=1024,
             le=64000,
             description="Thinking budget tokens",
         )
-        EFFORT: Literal["low", "medium", "high"] = Field(
+        EFFORT: Literal["low", "medium", "high", "max"] = Field(
             default="high",
             description="Effort level for this user. Also Controllable with OpenWebUI's reasoning_effort parameter.",
         )
@@ -643,6 +694,12 @@ class Pipe:
             ge=1,
             le=20,
             description="Maximum number of web searches",
+        )
+        WEB_FETCH_MAX_USES: int = Field(
+            default=5,
+            ge=1,
+            le=20,
+            description="Maximum number of web fetch requests per conversation turn",
         )
         WEB_SEARCH_USER_CITY: str = Field(
             default="",
@@ -669,7 +726,7 @@ class Pipe:
             default=[],
             description="Anthropic Skills to use (e.g., 'pptx', 'xlsx', 'docx', 'pdf' or custom skill IDs). Skills are validated against the API.",
         )
-    
+          
     def __init__(self):
         self.type = "manifold"
         self.id = "anthropic"
@@ -678,7 +735,9 @@ class Pipe:
         # Track if we've warned about thinking+cache conflict per chat_id
         self._warned_thinking_cache_conflict: set = set()
         # Cache for validated skills: {api_key: {skill_name: skill_info_or_None}}
-        self._validated_skills_cache: Dict[str, Dict[str, Optional[Dict[str, Any]]]] = {}
+        self._validated_skills_cache: Dict[str, Dict[str, Optional[Dict[str, Any]]]] = (
+            {}
+        )
 
     async def get_anthropic_models(self) -> List[dict]:
         """
@@ -740,93 +799,62 @@ class Pipe:
     async def pipes(self) -> List[dict]:
         return await self.get_anthropic_models()
 
-    def _is_rag_message(self, content: List[dict], __files__: Optional[Any] = None) -> bool:
-        """
-        Detect if a message contains RAG content.
-        
-        RAG is active when at least one file doesn't have context="full":
-        - Native PDF Upload only works with full context
-        - Files API Upload only works with full context
-        - Any file without full context means RAG text extraction is active
-        
-        Returns:
-            bool: True if message contains RAG content (should NOT be cached)
-        """
-        # Check files first - if ANY file lacks full context, RAG is active
-        if __files__:
-            for file in __files__:
-                file_type = file.get("type", "file")
-                # RAG/knowledge base or web search files
-                if file_type in ["collection", "web_search"]:
-                    logger.debug(f"📋 RAG: Detected {file_type} type file")
-                    return True
-                # 'file' without full context means RAG chunking is active
-                if file_type == "file" and file.get("context") != "full":
-                    logger.debug("📋 RAG: Detected chunked file (context != full)")
-                    return True
-        
-        # Fallback: Check message content for RAG markers
-        # (Handles historical messages where RAG content exists from previous turns)
-        for block in content:
-            if block.get("type") == "text":
-                text = block.get("text", "")
-                if "<context>" in text or ("### Task:" in text and "<source" in text):
-                    logger.debug("📋 RAG: Detected RAG markers in message content")
-                    return True
-        
-        # No RAG detected
-        return False
-
     def _get_pdf_base64_from_file_id(self, file_id: str) -> Optional[tuple[str, str]]:
         """
         Read a PDF file from storage and return base64 encoded data.
-        
+
         Args:
             file_id: The OpenWebUI file ID
-            
+
         Returns:
             tuple[str, str]: (base64_data, filename) or None if not available
         """
         if not FILES_AVAILABLE:
             logger.warning("Files/Storage modules not available for PDF native upload")
             return None
-            
+
         try:
             file = Files.get_file_by_id(file_id)
             if not file:
                 logger.warning(f"File not found: {file_id}")
                 return None
-            
+
             # Check if it's a PDF
             content_type = file.meta.get("content_type", "")
             filename = file.meta.get("name", file.filename)
-            
-            if content_type != "application/pdf" and not filename.lower().endswith(".pdf"):
+
+            if content_type != "application/pdf" and not filename.lower().endswith(
+                ".pdf"
+            ):
                 logger.debug(f"File {file_id} is not a PDF: {content_type}")
                 return None
-            
+
             # Get file path from storage
             file_path = Storage.get_file(file.path)
             file_path = Path(file_path)
-            
+
             if not file_path.is_file():
                 logger.warning(f"PDF file not found on disk: {file_path}")
                 return None
-            
+
             # Read and encode the PDF
             with open(file_path, "rb") as pdf_file:
                 pdf_data = pdf_file.read()
                 encoded_data = base64.b64encode(pdf_data).decode("utf-8")
-                
+
             # Check size limits (Anthropic has 32MB request limit, be conservative)
             MAX_PDF_SIZE = 25 * 1024 * 1024  # 25 MB
             if len(pdf_data) > MAX_PDF_SIZE:
-                logger.warning(f"PDF too large for native upload: {len(pdf_data)} bytes")
+                logger.warning(
+                    f"PDF too large for native upload: {len(pdf_data)} bytes"
+                )
                 return None
-                
-            logger.debug(f"Successfully encoded PDF: {filename} ({len(pdf_data)} bytes)")
+
+            logger.debug(
+                f"Successfully encoded PDF: {filename} ({len(pdf_data)} bytes)"
+            )
             return (encoded_data, filename)
-            
+
         except Exception as e:
             logger.error(f"Error reading PDF file {file_id}: {e}")
             return None
@@ -837,49 +865,53 @@ class Pipe:
     ) -> tuple[List[Dict[str, Any]], List[str]]:
         """
         Extract PDFs from __files__ that should be uploaded as native documents.
-        
+
         Args:
             __files__: List of file objects from OpenWebUI
-            
+
         Returns:
             tuple: (List of document blocks for Anthropic API, List of openwebui file ids processed as native PDFs)
         """
         pdf_documents = []
-        processed_file_ids = []
-        
+        markers = []
+
         if not __files__ or not FILES_AVAILABLE:
-            return pdf_documents, processed_file_ids
-            
+            return pdf_documents, markers
+
         for file in __files__:
             # Only process files with 'full' context (not RAG chunks)
             if file.get("type") != "file" or file.get("context") != "full":
                 continue
-                
+
             file_id = file.get("id")
             if not file_id:
                 continue
-                
+
             # Check if it's a PDF
             file_name = file.get("name", "")
             if not file_name.lower().endswith(".pdf"):
                 continue
-                
+
             # Get base64 encoded PDF
             result = self._get_pdf_base64_from_file_id(file_id)
             if result:
                 encoded_data, filename = result
-                pdf_documents.append({
-                    "type": "document",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "application/pdf",
-                        "data": encoded_data,
-                    },
-                    "title": filename,
-                })
-                processed_file_ids.append(file_id)
-                
-        return pdf_documents, processed_file_ids
+                pdf_documents.append(
+                    {
+                        "type": "document",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "application/pdf",
+                            "data": encoded_data,
+                        },
+                        "title": filename,
+                    }
+                )
+                # markers.append(
+                #     self._create_metadata_marker("pdf", f"{file_id}:{filename}")
+                # )
+
+        return pdf_documents, markers
 
     def _extract_rag_from_system_message(
         self, system_messages: List[Dict[str, Any]]
@@ -887,32 +919,34 @@ class Pipe:
         """
         Extract RAG content from system messages (when RAG_SYSTEM_CONTEXT is True).
         Returns the RAG message string if found, None otherwise.
-        
+
         This handles the case where OpenWebUI puts RAG content in system prompts
         instead of user messages based on RAG_SYSTEM_CONTEXT env var.
-        
+
         Args:
             system_messages: List of system message blocks
-            
+
         Returns:
             str: Extracted RAG content including template and context tags, or None
         """
         for block in system_messages:
             if block.get("type") != "text":
                 continue
-                
+
             text = block.get("text", "")
-            
+
             # Check if this contains RAG template markers
             if "### Task:" not in text or "<context>" not in text:
                 continue
-            
+
             # Extract the RAG portion (from ### Task: to end of </context>)
             match = self.PATTERN_RAG_MESSAGE.search(text)
             if match:
-                logger.debug(f"📋 RAG: Found RAG content in system message ({len(match.group(0))} chars)")
+                logger.debug(
+                    f"📋 RAG: Found RAG content in system message ({len(match.group(0))} chars)"
+                )
                 return match.group(0)
-        
+
         return None
 
     def _remove_rag_from_system_messages(
@@ -920,20 +954,20 @@ class Pipe:
     ) -> None:
         """
         Remove RAG content from system messages in-place.
-        
+
         Args:
             system_messages: List of system message blocks to modify
         """
         for i, block in enumerate(system_messages):
             if block.get("type") != "text":
                 continue
-            
+
             text = block.get("text", "")
             match = self.PATTERN_RAG_MESSAGE.search(text)
-            
+
             if match:
                 # Remove RAG content
-                cleaned = text[:match.start()] + text[match.end():]
+                cleaned = text[: match.start()] + text[match.end() :]
                 system_messages[i]["text"] = cleaned.strip()
                 logger.debug(f"📋 RAG: Removed RAG from system message")
                 break
@@ -985,40 +1019,44 @@ class Pipe:
                 processed_messages[i]["content"] = new_content
                 # Only operate on the last user message that contains RAG content
                 return
-    
+
     def _remove_sources_from_rag(
         self, rag_content: str, file_ids_to_remove: List[str]
     ) -> str:
         """
         Remove specific <source> tags from RAG content by file ID.
-        
+
         Args:
             rag_content: RAG message with <context> and <source> tags
             file_ids_to_remove: List of OpenWebUI file IDs to remove
-            
+
         Returns:
             str: RAG content with specified sources removed, or empty string if all sources removed
         """
         if not file_ids_to_remove:
             return rag_content
-        
+
         # Remove each source tag that matches the file IDs
         modified = rag_content
         for file_id in file_ids_to_remove:
             # Match source tags with this file ID in the name attribute
             pattern = re.compile(
                 rf'<source[^>]*name="[^"]*{re.escape(file_id)}[^"]*"[^>]*>.*?</source>\s*',
-                re.DOTALL
+                re.DOTALL,
             )
-            modified = pattern.sub('', modified)
-        
+            modified = pattern.sub("", modified)
+
         # Check if all sources were removed (only <context></context> or empty context remains)
-        if PATTERN_EMPTY_CONTEXT.search(modified) or not PATTERN_SOURCE_TAGS.search(modified):
+        if PATTERN_EMPTY_CONTEXT.search(modified) or not PATTERN_SOURCE_TAGS.search(
+            modified
+        ):
             # All sources removed - remove entire RAG template
             logger.debug(f"📋 RAG: All sources removed, clearing entire RAG message")
             return ""
-        
-        logger.debug(f"📋 RAG: Removed {len(file_ids_to_remove)} source(s) from RAG content")
+
+        logger.debug(
+            f"📋 RAG: Removed {len(file_ids_to_remove)} source(s) from RAG content"
+        )
         return modified
 
     def _remove_specific_sources_from_rag_message(
@@ -1030,62 +1068,68 @@ class Pipe:
         Remove specific sources from RAG messages by file ID.
         Only removes the sources matching the given file IDs, keeps other sources.
         If all sources are removed, the entire RAG template is removed.
-        
+
         Args:
             processed_messages: List of messages to process
             file_ids_to_remove: List of OpenWebUI file IDs whose sources should be removed
         """
         if not file_ids_to_remove:
             return
-        
+
         # Find the last user message with RAG content
         for i in range(len(processed_messages) - 1, -1, -1):
             msg = processed_messages[i]
             if msg.get("role") != "user":
                 continue
-            
+
             content = msg.get("content")
             if not isinstance(content, list):
                 continue
-            
+
             modified = False
             new_content: List[Dict[str, Any]] = []
-            
+
             for block in content:
                 if block.get("type") != "text":
                     new_content.append(block)
                     continue
-                
+
                 text = block.get("text", "")
                 match = self.PATTERN_RAG_MESSAGE.search(text)
-                
+
                 if not match:
                     new_content.append(block)
                     continue
-                
+
                 # Found RAG content - extract and modify it
                 rag_content = match.group(0)
-                modified_rag = self._remove_sources_from_rag(rag_content, file_ids_to_remove)
-                
+                modified_rag = self._remove_sources_from_rag(
+                    rag_content, file_ids_to_remove
+                )
+
                 start, end = match.span()
                 if not modified_rag:
                     # All sources removed - remove entire RAG block
                     new_text = text[:start] + text[end:]
-                    logger.debug(f"📋 RAG: Removed entire RAG block (all sources matched)")
+                    logger.debug(
+                        f"📋 RAG: Removed entire RAG block (all sources matched)"
+                    )
                 else:
                     # Some sources remain - update with modified RAG
                     new_text = text[:start] + modified_rag + text[end:]
-                    logger.debug(f"📋 RAG: Kept partial RAG content (some sources remain)")
-                
+                    logger.debug(
+                        f"📋 RAG: Kept partial RAG content (some sources remain)"
+                    )
+
                 # Strip whitespace to prevent cache invalidation from leftover newlines
                 new_text = new_text.strip()
                 if new_text:
                     new_block = dict(block)
                     new_block["text"] = new_text
                     new_content.append(new_block)
-                
+
                 modified = True
-            
+
             if modified:
                 processed_messages[i]["content"] = new_content
                 return  # Only process the first matching user message
@@ -1097,32 +1141,30 @@ class Pipe:
     ) -> None:
         """
         Remove <attached_files> or individual <file> tags for files that were processed natively.
-        
+
         These tags are removed because:
         - Native PDF uploads are embedded as base64 in the message
         - Files API uploads are referenced via file_id
         - Code execution cannot access files by OpenWebUI URL
-        
+
         Args:
             processed_messages: List of messages to process
             file_ids_to_remove: List of OpenWebUI file IDs whose attached_files tags should be removed
         """
         if not file_ids_to_remove:
             return
-        
+
         # Build pattern to match individual file tags with specific IDs
         escaped_ids = [re.escape(fid) for fid in file_ids_to_remove]
         file_tag_pattern = re.compile(
-            r'<file[^>]*url="(' + '|'.join(escaped_ids) + r')"[^>]*/?>\s*',
-            re.DOTALL
+            r'<file[^>]*url="(' + "|".join(escaped_ids) + r')"[^>]*/?>\s*', re.DOTALL
         )
-        
+
         # Pattern to match empty attached_files blocks after removal
         empty_attached_pattern = re.compile(
-            r'<attached_files>\s*</attached_files>\s*',
-            re.DOTALL
+            r"<attached_files>\s*</attached_files>\s*", re.DOTALL
         )
-        
+
         for msg in processed_messages:
             if msg.get("role") != "user":
                 continue
@@ -1140,31 +1182,30 @@ class Pipe:
                 text = empty_attached_pattern.sub("", text)
                 if len(text) != original_len:
                     block["text"] = text
-                    logger.debug(f"📋 Removed attached_files tags for {len(file_ids_to_remove)} file(s)")
+                    logger.debug(
+                        f"📋 Removed attached_files tags for {len(file_ids_to_remove)} file(s)"
+                    )
 
     async def _process_files_api_data(
         self,
         __files__: Optional[List[Dict[str, Any]]],
-        body: Dict[str, Any],
-        __metadata__: Dict[str, Any],
         __user__: Dict[str, Any],
         __event_emitter__: Callable[[Dict[str, Any]], Awaitable[None]],
-        current_user_msg_idx: int = -1,
-    ) -> Dict[str, Any]:
+        previous_marker_metadata: dict[str, Any],
+    ) -> tuple[List[Dict[str, Any]], List[str]]:
         """
         Process files for Anthropic Files API, uploading them and preparing content blocks.
-        
+
         Tracks message indices for proper cache optimization - files are associated
         with the user message that uploaded them.
-        
+
         Args:
             __files__: Files from OpenWebUI
-            body: Request body with messages for extracting previous IDs
             __metadata__: Metadata dict
             __user__: User dict with valves
             __event_emitter__: Event emitter for status updates
             current_user_msg_idx: Index of the current user message (for file association)
-        
+
         Returns:
             dict: Accumulated metadata state:
                 - files_by_msg: Dict[int, List[str]] - message index to Files API IDs
@@ -1173,81 +1214,57 @@ class Pipe:
                 - new_file_ids: List[str] - newly uploaded file IDs (for this turn only)
                 - uploaded_openwebui_file_ids: List[str] - OpenWebUI IDs that were uploaded
         """
-        result = {
-            "files_by_msg": {},
-            "container": None,
-            "uploaded_files": {},
-            "new_file_ids": [],
-            "uploaded_openwebui_file_ids": [],
-        }
-        
-        # Extract previous metadata from conversation history
-        messages = body.get("messages", [])
-        prev_metadata = self._extract_anthropic_metadata_from_messages(messages)
-        
-        # Copy previous state to accumulate
-        result["files_by_msg"] = dict(prev_metadata.get("files_by_msg", {}))
-        result["container"] = prev_metadata.get("container")
-        result["uploaded_files"] = dict(prev_metadata.get("uploaded_files", {}))
-        
-        prev_files_count = sum(len(v) for v in result["files_by_msg"].values())
-        if prev_files_count > 0:
-            logger.debug(f"📋 Found {prev_files_count} previous file IDs across {len(result['files_by_msg'])} messages")
-        if result["container"]:
-            logger.debug(f"📋 Found previous container ID: {result['container']}")
-        if result["uploaded_files"]:
-            logger.debug(f"📋 Found {len(result['uploaded_files'])} previously uploaded files: {list(result['uploaded_files'].keys())}")
-        
+        file_ids_content_blocks: List[Dict[str, Any]] = []
+        markers: List[str] = []
         # If no new files, return accumulated state
         if not __files__:
             logger.debug("No new files to process")
-            return result
-        
-        if all(file.get("context") != "full" for file in __files__) or all(file.get("type") != "file" for file in __files__):
+            return file_ids_content_blocks, markers
+
+        if all(file.get("context") != "full" for file in __files__) or all(
+            file.get("type") != "file" for file in __files__
+        ):
             logger.debug("No full context files or file types to process for Files API")
-            return result
+            return file_ids_content_blocks, markers
 
         import io
-        
+
         # Process new files
         api_key = self.valves.ANTHROPIC_API_KEY
         client = None
         if api_key:
             try:
                 from anthropic import AsyncAnthropic
+
                 client = AsyncAnthropic(api_key=api_key)
             except ImportError:
                 logger.warning("Anthropic SDK not available for file upload")
-        
+
         file_count = 0
         skipped_count = 0
         new_file_ids_for_this_msg = []
-        
+
         for file in __files__:
             # Skip RAG/knowledge base references
-            if file.get("type") != "file" or file.get("context") != "full" or file.get("collection_name") or file.get("docs"):
+            if (
+                file.get("type") != "file"
+                or file.get("context") != "full"
+                or file.get("collection_name")
+                or file.get("docs")
+            ):
                 continue
-            
+
             file_name = file.get("name", "unknown")
             file_type = file.get("type", "file")
             file_id_openwebui = file.get("id")
-            
+
             # Check if this file was already uploaded (by filename)
-            if file_name in result["uploaded_files"]:
-                existing_file_id = result["uploaded_files"][file_name]
-                logger.debug(f"Skipping {file_name} - already uploaded as {existing_file_id}")
+            if file_name in previous_marker_metadata:
                 skipped_count += 1
                 continue
-            
-            # Get content type
-            content_type = file.get("meta", {}).get("content_type", "")
-            if not content_type:
-                content_type = file.get("content_type", "")
-                if not content_type:
-                    content_type = self._guess_content_type_from_extension(file_name)
-            
+
             file_count += 1
-            
+
             file_content = None
             if file_type == "file" and file_id_openwebui and FILES_AVAILABLE:
                 try:
@@ -1259,7 +1276,7 @@ class Pipe:
                                 file_content = f.read()
                 except Exception as e:
                     logger.error(f"Failed to read file {file_id_openwebui}: {e}")
-            
+
             # Upload to Anthropic Files API if we have content
             if file_content and client:
                 try:
@@ -1273,23 +1290,28 @@ class Pipe:
                         },
                         __event_emitter__,
                     )
-                    
-                    file_obj = (file_name, io.BytesIO(file_content), content_type)
+
+                    file_obj = (file_name, io.BytesIO(file_content))
                     upload_result = await client.beta.files.upload(
                         file=file_obj,
                         betas=["files-api-2025-04-14"],
                     )
-                    
-                    anthropic_file_id = upload_result.id
-                    
-                    # Track for this message
-                    new_file_ids_for_this_msg.append(anthropic_file_id)
-                    result["new_file_ids"].append(anthropic_file_id)
-                    result["uploaded_files"][file_name] = anthropic_file_id
-                    result["uploaded_openwebui_file_ids"].append(file_id_openwebui)
-                    
-                    logger.debug(f"Uploaded {file_name} to Anthropic: {anthropic_file_id}")
-                    
+                    file_ids_content_blocks.append(
+                        {
+                            "type": "container_upload",
+                            "file_id": upload_result.id,
+                        }
+                    )
+                    markers.append(
+                        self._create_metadata_marker(
+                            "file_api",
+                            f"{upload_result.id}:{file_name}:{file_id_openwebui}",
+                        )
+                    )
+                    logger.debug(
+                        f"Uploaded {file_name} to Anthropic: {upload_result.id}"
+                    )
+
                 except Exception as e:
                     logger.error(f"Failed to upload {file_name} to Anthropic: {e}")
                     await self.emit_event(
@@ -1302,37 +1324,8 @@ class Pipe:
                         },
                         __event_emitter__,
                     )
-        
-        # Add new files to the current message's mapping
-        if new_file_ids_for_this_msg:
-            if current_user_msg_idx not in result["files_by_msg"]:
-                result["files_by_msg"][current_user_msg_idx] = []
-            result["files_by_msg"][current_user_msg_idx].extend(new_file_ids_for_this_msg)
-                    
-        if file_count > 0 or skipped_count > 0:
-            parts = []
-            if file_count > 0:
-                parts.append(f"{file_count} new")
-            if skipped_count > 0:
-                parts.append(f"{skipped_count} reused")
-            await self.emit_event(
-                {
-                    "type": "status",
-                    "data": {
-                        "description": f"📄 Files: {', '.join(parts)}",
-                        "done": True,
-                    },
-                },
-                __event_emitter__,
-            )
-        
-        total_files = sum(len(v) for v in result["files_by_msg"].values())
-        logger.debug(
-            f"📋 Files API result: {total_files} total file IDs across {len(result['files_by_msg'])} messages, "
-            f"{len(result['new_file_ids'])} new uploads, container={result['container']}"
-        )
-        
-        return result
+
+        return file_ids_content_blocks, markers
 
     async def _create_payload(
         self,
@@ -1342,8 +1335,8 @@ class Pipe:
         __tools__: Optional[Dict[str, Dict[str, Any]]],
         __event_emitter__: Callable[[Dict[str, Any]], Awaitable[None]],
         __files__: Optional[List[Dict[str, Any]]] = None,
-    ) -> tuple[dict, dict]:
-        
+    ) -> tuple[dict, dict, List[str]]:
+
         ## General payload creation
         actual_model_name = body["model"].split("/")[-1]
         model_info = self.get_model_info(actual_model_name)
@@ -1363,47 +1356,61 @@ class Pipe:
         if body.get("top_p") is not None:
             payload["top_p"] = float(body.get("top_p", 0))
 
-        ## Debugging Output
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(f" Thinking Filter: {__metadata__.get('anthropic_thinking')}")
-            try:
-                logger.debug(f"Tools: {json.dumps(__tools__, indent=2)}")
-            except (TypeError, ValueError):
-                logger.debug(f"Tools: {list(__tools__.keys()) if __tools__ else None}")
-            logger.debug(f"raw __metadata__: {__metadata__}")
-            
-            
-        ## Thinking Enabling
-        enable_thinking = __user__["valves"].ENABLE_THINKING
-        thinking_budget_tokens = __user__["valves"].THINKING_BUDGET_TOKENS
-        if "anthropic_thinking" in __metadata__:
-            should_enable_thinking = __metadata__.get("anthropic_thinking", False)
-        else:
-            should_enable_thinking = enable_thinking
+        # Add data residency if set to US (1.1x token cost)       
+        if self.valves.DATA_RESIDENCY == "us":  
+            payload["inference_geo"] = "us"
 
-        if should_enable_thinking and model_info["supports_thinking"]:
-            # Ensure thinking.budget_tokens < max_tokens and at least 1024
-            requested_thinking_budget = thinking_budget_tokens
-            # Clamp thinking budget to valid range
-            max_valid_thinking_budget = max(max_tokens - 1, 1023)
-            thinking_budget = max(
-                1024, min(requested_thinking_budget, max_valid_thinking_budget)
-            )
-            # If max_tokens is too low, set thinking_budget to max_tokens - 1
-            if max_tokens <= 1024:
-                thinking_budget = max_tokens - 1 if max_tokens > 1 else 1
-            payload["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget}
-
-        # Handle effort parameter (maps from OpenWebUI's reasoning_effort or user valves)
-        # Priority: reasoning_effort param > user valve
+        # Add Fast Mode if enabled and model supports it (Opus 4.6 only)
+        if self.valves.ENABLE_FAST_MODE and model_info.get("supports_fast_mode", False):
+            payload["speed"] = "fast"
+            logger.debug("Fast Mode enabled for this request")
+            
+        # Handle "Effort" parameter (maps from OpenWebUI's reasoning_effort or user valves)
+        # Effort works differently based on model capabilities
         effort_config = None
+        effective_effort = None
+        
         if model_info["supports_effort"]:
-            effort_level = __user__["valves"].EFFORT
-            if body.get("reasoning_effort") in ["low", "medium", "high"]:
-                effective_effort = body.get("reasoning_effort")
+            # Determine effective effort level
+            body_effort = body.get("reasoning_effort")
+            if body_effort in ["low", "medium", "high", "max"]:
+                effective_effort = body_effort
+            elif model_info["supports_effort_max"] and __user__["valves"].EFFORT == "max":
+                effective_effort = "max"
             else:
-                effective_effort = effort_level
+                effective_effort = __user__["valves"].EFFORT
+            
             effort_config = {"effort": effective_effort}
+            logger.debug(f"Effort level set to: {effective_effort}")
+
+        # Handle Thinking
+        enable_thinking = __user__["valves"].ENABLE_THINKING or __metadata__.get(
+            "anthropic_thinking", False
+        )
+        if enable_thinking and model_info["supports_thinking"]:
+            # Opus 4.6 (supports adaptive thinking) uses effort as the control
+            if model_info["supports_adaptive_thinking"]:
+                payload["thinking"] = {"type": "adaptive"}
+            else:
+                user_budget = __user__["valves"].THINKING_BUDGET_TOKENS
+                max_tokens = min(
+                    body.get("max_tokens", model_info["max_tokens"]),
+                    model_info["max_tokens"],
+                )
+                context_limit = model_info.get("context_length", 200000)
+                
+                # For Claude 4 models with interleaved thinking+tools, allow up to context window
+                if model_info.get("supports_thinking") and model_info.get(
+                    "supports_programmatic_calling"
+                ):
+                    thinking_budget = min(user_budget, context_limit)
+                else:
+                    # budget_tokens must be < max_tokens
+                    thinking_budget = (
+                        min(user_budget, max_tokens - 1) if max_tokens > 1 else 1
+                    )
+                payload["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget}
+                logger.debug(f"Using manual thinking with budget_tokens: {thinking_budget}, effort: {effective_effort}")
 
         # Check if user has memory system enabled
         user_has_memory_system_enabled = False
@@ -1414,141 +1421,44 @@ class Pipe:
         except (AttributeError, TypeError):
             pass
         logger.debug(f"Memory system enabled: {user_has_memory_system_enabled}")
-        
 
-        
-        system_messages, processed_messages, extracted_memories = self._convert_messages_to_claude_format(body.get("messages", []) or [], user_has_memory_system_enabled)
+        raw_messages = body.get("messages", []) or []
 
-        # Append extracted memories to last user message
-        if extracted_memories and processed_messages:
-            # Find last user message
-            for i in range(len(processed_messages) - 1, -1, -1):
-                if processed_messages[i]["role"] == "user":
-                    content = processed_messages[i]["content"]
-                    if isinstance(content, list):
-                        content.append(
-                            {
-                                "type": "text",
-                                "text": f"\n\n---\n**IMPORTANT:** The following is NOT part of the user's message, but context from a memory system to help answer the user's questions:\n\n{extracted_memories}",
-                            }
-                        )
-                    break
-        
-        # Initialize metadata accumulator for file handling
-        files_metadata = {
-            "files_by_msg": {},
-            "pdfs_by_msg": {},
-            "container": None,
-            "uploaded_files": {},
-            "new_file_ids": [],
-        }
-        
-        # Determine current user message index for file association
-        current_user_msg_idx = len([m for m in processed_messages if m.get("role") == "user"]) - 1
-        if current_user_msg_idx < 0:
-            current_user_msg_idx = 0
-        
+        system_messages, processed_messages, previous_marker_metadata = (
+            self._convert_messages_to_claude_format(
+                raw_messages, user_has_memory_system_enabled
+            )
+        )
+        new_marker_metadata = ""
+
         if __files__:
-            if __metadata__.get("activate_code_execution_tool", False):
-                # Process Files API data - uploads files and returns accumulated metadata
-                files_metadata = await self._process_files_api_data(
-                    __files__, body, __metadata__, __user__, __event_emitter__, 
-                    current_user_msg_idx=current_user_msg_idx
-                )
-                
-                # Build document blocks by message index
-                # files_by_msg maps: user_message_index -> list of file IDs
-                # We need to inject document blocks at the correct message positions
-                files_by_msg = files_metadata.get("files_by_msg", {})
-                
-                if files_by_msg and processed_messages:
-                    # Count user messages to map indices
-                    user_msg_count = 0
-                    for i, msg in enumerate(processed_messages):
-                        if msg.get("role") == "user":
-                            # Check if this user message has files
-                            if user_msg_count in files_by_msg:
-                                file_ids = files_by_msg[user_msg_count]
-                                # Create document blocks for this message to the correct target block before dynamic content
-                                doc_blocks = [
-                                    {
-                                        "type": "container_upload",
-                                        "file_id": fid,
-                                    }
-                                    for fid in file_ids
-                                ]
-                                
-                                # Inject document blocks into this specific message
-                                content = msg.get("content", [])
-                                if isinstance(content, list):
-                                    processed_messages[i]["content"] = content + doc_blocks
-                                    logger.debug(f"📋 Injected {len(doc_blocks)} Files API document block(s) into user message {user_msg_count}")
-                            
-                            user_msg_count += 1
-                
-                # Remove only the RAG sources for Files API files, keep RAG for other files
-                # Use FILENAMES (not file IDs) because <source> tags use filenames in name attribute
-                uploaded_filenames = list(files_metadata.get("uploaded_files", {}).keys())
-                self._remove_specific_sources_from_rag_message(processed_messages, uploaded_filenames)
-                # For attached_files tags, use file IDs (they reference by URL/ID)
-                uploaded_file_ids = files_metadata.get("uploaded_openwebui_file_ids", [])
-                self._remove_attached_files_tags(processed_messages, uploaded_file_ids)
-                
-                if not processed_messages:
-                    raise ValueError("No valid messages to process")
+            # if __metadata__.get("activate_code_execution_tool", False):
+            #     # Process Files API data - uploads files and returns accumulated metadata
+            #     file_id_content_blocks, new_marker_metadata = (
+            #         await self._process_files_api_data(
+            #             __files__, __user__, __event_emitter__, previous_marker_metadata
+            #         )
+            #     )
+            #     if file_id_content_blocks:
+            #         processed_messages[-1]["content"].append(file_id_content_blocks)
 
             # Check if user wants native PDF upload instead of RAG text extraction
             if __user__["valves"].USE_PDF_NATIVE_UPLOAD:
-                # Get PDF documents to inject as native base64 documents
-                pdf_documents, pdf_file_ids = self._get_full_context_pdfs(__files__)
-                
-                # Track PDFs in metadata for this message
-                if pdf_file_ids:
-                    # Load previous metadata
-                    prev_metadata = self._extract_anthropic_metadata_from_messages(body.get("messages", []))
-                    files_metadata["pdfs_by_msg"] = dict(prev_metadata.get("pdfs_by_msg", {}))
-                    files_metadata["container"] = prev_metadata.get("container")
-                    files_metadata["uploaded_files"] = dict(prev_metadata.get("uploaded_files", {}))
-                    
-                    # Add PDFs for current message
-                    if current_user_msg_idx not in files_metadata["pdfs_by_msg"]:
-                        files_metadata["pdfs_by_msg"][current_user_msg_idx] = []
-                    files_metadata["pdfs_by_msg"][current_user_msg_idx].extend(pdf_file_ids)
-            
-                if pdf_documents and processed_messages:
-                    # Inject PDF documents into the FIRST user message for cache
-                    for i in range(0, len(processed_messages)):
-                        if processed_messages[i].get("role") == "user":
-                            content = processed_messages[i].get("content")
-                            if isinstance(content, list):
-                                processed_messages[i]["content"] = content + pdf_documents
-                                logger.debug(f"📋 Injected {len(pdf_documents)} PDF document(s) into first user message (index {i})")
-                                # Get FILENAMES for RAG removal (source tags use filenames, not IDs)
-                                pdf_filenames = [
-                                    f.get("name", "") for f in __files__
-                                    if f.get("id") in pdf_file_ids and f.get("name")
-                                ]
-                                # Remove RAG sources for the specific PDFs that were uploaded natively
-                                self._remove_specific_sources_from_rag_message(processed_messages, pdf_filenames)
-                                # For attached_files tags, use file IDs (they reference by URL/ID)
-                                self._remove_attached_files_tags(processed_messages, pdf_file_ids)
-                            break
-        
-        # Store accumulated files metadata for response finalization
-        # This will be used by pipe() to build the metadata link
-        __metadata__["_anthropic_files_metadata"] = files_metadata
-                    
-        ## Tools Handling    
+                pdf_documents_content_blocks, new_marker_metadata = (
+                    self._get_full_context_pdfs(__files__, previous_marker_metadata)
+                )
+                if pdf_documents_content_blocks:
+                    processed_messages[0]["content"] = (pdf_documents_content_blocks + processed_messages[0]["content"])
+
+        ## Tools Handling
         # Correct Order for Caching: Tools, System, Messages
         tools_list = self._convert_tools_to_claude_format(
-            __tools__,
-            body,
-            actual_model_name,
-            __user__,
-            __metadata__
-            )
+            __tools__, body, actual_model_name, __user__, __metadata__
+        )
 
-        activate_code_execution = __metadata__.get("activate_code_execution_tool", False)
+        activate_code_execution = __metadata__.get(
+            "activate_code_execution_tool", False
+        )
         if activate_code_execution:
             code_exec_tool = {
                 "type": "code_execution_20250825",
@@ -1556,117 +1466,7 @@ class Pipe:
             }
             tools_list.insert(0, code_exec_tool)
 
-        # Tools Caching
-        if tools_list and len(tools_list) > 0:
-            if self.valves.CACHE_CONTROL in [
-                "cache tools array only",
-                "cache tools array and system prompt",
-            ]:
-                last_tool = tools_list[-1]
-                # Only add cache_control if tool doesn't have defer_loading
-                if last_tool.get("defer_loading", False):
-                    last_tool["cache_control"] = {"type": "ephemeral"}
-                else:
-                    # Find the last non-deferred tool to add cache_control
-                    for i in range(len(tools_list) - 1, -1, -1):
-                        if not tools_list[i].get("defer_loading", False):
-                            tools_list[i]["cache_control"] = {"type": "ephemeral"}
-                            break
-            
-            ## Tool Choice Handling
-            if __metadata__.get("web_search_enforced"):
-                 # Check if web_search is actually in the tools list
-                has_web_search = any(t.get("name") == "web_search" for t in tools_list)
-                if has_web_search:
-                    if "thinking" not in payload:
-                        # No thinking active - enforce web_search
-                        payload["tool_choice"] = {"type": "tool", "name": "web_search"}
-                        logger.debug("Enforcing web_search via tool_choice")
-                    else:
-                        # Thinking is active - cannot enforce web_search, but it's still available
-                        payload["tool_choice"] = {"type": "auto"}
-                        logger.debug("Thinking active - web_search added but not enforced (tool_choice=auto)")
-                else:
-                    # No enforcement - use auto tool choice
-                    payload["tool_choice"] = {"type": "auto"}
-            
-        payload["tools"] = tools_list
-
-        
-        if system_messages and len(system_messages) > 0:
-            # Add cache_control to last system message block ONLY if caching up to system (not messages)
-            # Support both old typo and corrected spelling for backward compatibility
-            if self.valves.CACHE_CONTROL in ["cache tools array and system prompt"]:
-                last_system_block = system_messages[-1]
-                # Only add if block has non-empty text
-                if (
-                    last_system_block.get("type") == "text"
-                    and last_system_block.get("text", "").strip()
-                ):
-                    last_system_block["cache_control"] = {"type": "ephemeral"}
-            payload["system"] = system_messages
-
-        if processed_messages and len(processed_messages) > 0:
-            # Determine where to place the cache breakpoint
-            target_msg_index = -1
-
-            # Check if last message has RAG content
-            last_msg = processed_messages[-1]
-            last_msg_content = last_msg.get("content", [])
-            
-            # Check content for RAG markers (handles cases where RAG template is in message)
-            has_rag_in_content = False
-            for block in last_msg_content:
-                if block.get("type") == "text":
-                    text = block.get("text", "")
-                    if "<context>" in text or ("### Task:" in text and "<source" in text):
-                        has_rag_in_content = True
-                        break
-            
-            ##TODO: This should generally detect if the last message should be excluded from the Cache as this is not only meant for RAG Messages but for memories and other stuff as well
-            if has_rag_in_content or self._is_rag_message(last_msg_content, __files__):
-                logger.debug(
-                    "RAG content detected in last message. Moving cache breakpoint to previous message."
-                )
-                # If we have history, cache the previous message
-                if len(processed_messages) > 1:
-                    target_msg_index = -2
-                else:
-                    # If no history, we can't cache messages (only system/tools)
-                    target_msg_index = None
-
-            # Apply cache control to the target message
-            if (
-                target_msg_index is not None
-                and self.valves.CACHE_CONTROL
-                == "cache tools array, system prompt and messages"
-            ):
-                target_msg = processed_messages[target_msg_index]
-                content_blocks = target_msg.get("content", [])
-                if content_blocks:
-                    last_content_block = content_blocks[-1]
-                    block_type = last_content_block.get("type")
-                    # Add cache_control to the last block (text or document)
-                    if block_type == "text":
-                        # Only add if text block has non-empty text
-                        if last_content_block.get("text", "").strip():
-                            last_content_block.setdefault(
-                                "cache_control", {"type": "ephemeral"}
-                            )
-                    elif block_type == "document":
-                        # Document blocks can always have cache_control
-                        last_content_block.setdefault(
-                            "cache_control", {"type": "ephemeral"}
-                        )
-                    elif block_type == "container_upload":
-                        # Container uploads can always have cache_control
-                        last_content_block.setdefault(
-                            "cache_control", {"type": "ephemeral"}
-                        )
-
-            payload["messages"] = processed_messages
-
-        # Get API key from valves
+        # Create Headers
         api_key = self.valves.ANTHROPIC_API_KEY
 
         headers = {
@@ -1674,47 +1474,47 @@ class Pipe:
             "anthropic-version": self.API_VERSION,
             "content-type": "application/json",
         }
+
         beta_headers: list[str] = []
 
         # Enable prompt caching if not disabled
         if self.valves.CACHE_CONTROL != "cache disabled":
             beta_headers.append("prompt-caching-2024-07-31")
 
-        # Enable fine-grained tool streaming beta unconditionally for now (AIT-86)
-        # This only affects chunking of tool input JSON; execution logic unchanged.
-        beta_headers.append("fine-grained-tool-streaming-2025-05-14")
-
         # Add code execution and files API if valve or metadata enforcement active
         if activate_code_execution:
             beta_headers.append("code-execution-2025-08-25")
             beta_headers.append("files-api-2025-04-14")
+        if self.valves.ENABLE_INTERLEAVED_THINKING and model_info["supports_thinking"] and not model_info["supports_adaptive_thinking"]  :
+            beta_headers.append("interleaved-thinking-2025-05-14")
 
+        # Add web_fetch beta header if enabled
+        if self.valves.WEB_FETCH:
+            beta_headers.append("web-fetch-2025-09-10")
+
+        # Add memory tool beta header if enabled and model supports it
+        if self.valves.ENABLE_CLAUDE_MEMORY and model_info.get("supports_memory", False):
+            beta_headers.append("context-management-2025-06-27")
+            
         # Add Files API beta header if using uploaded files
         # if __user__["valves"].USE_FILES_API:
         #     beta_headers.append("files-api-2025-04-14")
-        
+
         # Skills Integration
         if activate_code_execution and __user__["valves"].SKILLS:
             beta_headers.append("skills-2025-10-02")
-            
+
             # Validate skills (cached to avoid API calls on every turn)
             validated_skills = await self._validate_and_get_skills(
-                 __user__["valves"].SKILLS,
+                __user__["valves"].SKILLS,
                 self.valves.ANTHROPIC_API_KEY,
                 __event_emitter__,
             )
-            
-            # Get container ID from previous turns (persisted in metadata)
-            container_id = files_metadata.get("container")
-            
-            # Build and add container parameter
-            container_config = self._build_skills_container(validated_skills, container_id)
-            if container_config:
-                payload["container"] = container_config
-                logger.debug(f"🔧 Added container with {len(validated_skills)} skills, container_id={container_id}")
+            payload["container"] = validated_skills
+            logger.debug(f"🔧 Added {len(validated_skills)} skills")
 
         # Add advanced tool use beta (for programmatic calling and tool search)
-        if self.valves.ENABLE_TOOL_SEARCH:
+        if self.valves.ENABLE_TOOL_SEARCH or self.valves.ENABLE_PROGRAMMATIC_TOOL_CALLING:
             beta_headers.append("advanced-tool-use-2025-11-20")
 
         # Add context editing strategies if enabled
@@ -1729,7 +1529,7 @@ class Pipe:
             # Add clear_thinking FIRST if needed
             if (
                 context_editing_strategy in ["clear_thinking", "clear_both"]
-                and should_enable_thinking
+                and enable_thinking
                 and model_info["supports_thinking"]
             ):
                 clear_thinking = {
@@ -1797,24 +1597,113 @@ class Pipe:
             beta_headers.append("effort-2025-11-24")
             payload["output_config"] = effort_config
 
+        # Add Fast Mode beta header if enabled and model supports it
+        if self.valves.ENABLE_FAST_MODE and model_info.get("supports_fast_mode", False):
+            beta_headers.append("fast-mode-2026-02-01")
+
         if beta_headers and len(beta_headers) > 0:
             headers["anthropic-beta"] = ",".join(beta_headers)
             # Add betas list to payload for beta.messages.stream
             payload["betas"] = beta_headers
 
+        # Tools Caching
+        if tools_list and len(tools_list) > 0:
+            if self.valves.CACHE_CONTROL in [
+                "cache tools array only",
+                "cache tools array and system prompt",
+            ]:
+                last_tool = tools_list[-1]
+                # Only add cache_control if tool doesn't have defer_loading
+                if last_tool.get("defer_loading", False):
+                    last_tool["cache_control"] = {"type": "ephemeral"}
+                else:
+                    # Find the last non-deferred tool to add cache_control
+                    for i in range(len(tools_list) - 1, -1, -1):
+                        if not tools_list[i].get("defer_loading", False):
+                            tools_list[i]["cache_control"] = {"type": "ephemeral"}
+                            break
+
+            ## Tool Choice Handling
+            if __metadata__.get("web_search_enforced"):
+                # Check if web_search is actually in the tools list
+                has_web_search = any(t.get("name") == "web_search" for t in tools_list)
+                if has_web_search:
+                    if "thinking" not in payload:
+                        # No thinking active - enforce web_search
+                        payload["tool_choice"] = {"type": "tool", "name": "web_search"}
+                        logger.debug("Enforcing web_search via tool_choice")
+                    else:
+                        # Thinking is active - cannot enforce web_search, but it's still available
+                        payload["tool_choice"] = {"type": "auto"}
+                        logger.debug(
+                            "Thinking active - web_search added but not enforced (tool_choice=auto)"
+                        )
+                else:
+                    # No enforcement - use auto tool choice
+                    payload["tool_choice"] = {"type": "auto"}
+
+        payload["tools"] = tools_list
+
+        # Processing Messages and Caching
+        if system_messages and len(system_messages) > 0:
+            # Add cache_control to last system message block ONLY if caching up to system (not messages)
+            # Support both old typo and corrected spelling for backward compatibility
+            if self.valves.CACHE_CONTROL in [
+                "cache tools array and system prompt",
+                "cache tools array, system prompt and messages",
+            ]:
+                last_system_block = system_messages[-1]
+                # Only add if block has non-empty text
+                if (
+                    last_system_block.get("type") == "text"
+                    and last_system_block.get("text", "").strip()
+                ):
+                    last_system_block["cache_control"] = {"type": "ephemeral"}
+            payload["system"] = system_messages
+
+        if (
+            self.valves.CACHE_CONTROL == "cache tools array, system prompt and messages"
+            and processed_messages
+            and len(processed_messages) > 0
+        ):
+            # Check if last message has RAG content
+            last_msg = processed_messages[-1]
+            last_msg_content = last_msg.get("content", [])
+
+            # We want to exclude RAG content from caching, so place the cache breakpoint to the second last message if RAG is present
+            has_rag_in_content = False
+            for block in last_msg_content:
+                if block.get("type") == "text":
+                    text = block.get("text", "")
+                    if "<context>" in text or (
+                        "### Task:" in text and "<source" in text
+                    ):
+                        has_rag_in_content = True
+                        break
+            target_msg = processed_messages[-2 if has_rag_in_content else -1]
+            content_blocks = target_msg.get("content", [])
+            if content_blocks:
+                last_content_block = content_blocks[-1]
+                last_content_block.setdefault("cache_control", {"type": "ephemeral"})
+
+        payload["messages"] = processed_messages
+
         logger.debug(f"Payload: {json.dumps(payload, indent=2)}")
         logger.debug(f"Headers: {headers}")
-        return payload, headers
-    
-    def _convert_messages_to_claude_format(self, raw_messages, user_has_memory_system_enabled: bool = False):
-        system_messages = []
-        processed_messages: list[dict] = []
-        extracted_memories = None
 
+        return payload, headers, new_marker_metadata
+
+    def _convert_messages_to_claude_format(
+        self, raw_messages, user_has_memory_system_enabled: bool = False
+    ) -> tuple[list[dict], list[dict], list[str]]:
+        processed_messages: list[Dict[str, Any]] = []
+        extracted_memories = None
+        previous_marker_metadata: list[str] = []
+        system_messages = []
         if raw_messages is None or len(raw_messages) == 0:
-            return system_messages, processed_messages, extracted_memories
-                
-        for msg in raw_messages:
+            return system_messages, processed_messages, previous_marker_metadata
+
+        for i, msg in enumerate(raw_messages):
             role = msg.get("role")
             raw_content = msg.get("content")
 
@@ -1847,32 +1736,44 @@ class Pipe:
                     if block["text"].strip():
                         system_messages.append(block)
             else:
-                if role == "assistant":
-                    anthropic_metadata = self._extract_anthropic_metadata_from_content(raw_content)
-                    
-
-                processed_messages.append(
-                    {"role": role, "content": claude_message}
+                extracted_metadata = self._extract_metadata_marker_from_message(
+                    claude_message
                 )
-                    
-        return system_messages, processed_messages, extracted_memories
-                    
-                    
+                if extracted_metadata:
+                    previous_marker_metadata.extend(extracted_metadata)
+
+                processed_messages.append({"role": role, "content": claude_message})
+
+                if (
+                    user_has_memory_system_enabled
+                    and i == len(raw_messages) - 1
+                    and role == "user"
+                    and extracted_memories
+                ):
+                    # Append marker metadata and memories back to last message
+                    processed_messages[-1]["content"].append(
+                        {
+                            "type": "text",
+                            "text": f"\n\n---\n**IMPORTANT:** The following is NOT part of the user's message, but context from a memory system to help answer the user's questions:\n\n{extracted_memories}",
+                        }
+                    )
+        return system_messages, processed_messages, previous_marker_metadata
+
     def _convert_tools_to_claude_format(
         self,
         __tools__,
         body: Dict[str, Any],
         actual_model_name: str,
         __user__: Dict[str, Any],
-        __metadata__: dict[str, Any]
+        __metadata__: dict[str, Any],
     ) -> List[dict]:
         """
         Convert OpenWebUI tools format to Claude API format.
-        
+
         Extracts tool specs from TWO sources:
         1. body.tools - Built-in tools (OpenAI format specs only, no callables)
         2. __tools__ - User tools (specs + callables for execution)
-        
+
         Args:
             __tools__: Dict of user tools with callables from OpenWebUI
             body: Request body containing body.tools (built-in tool specs)
@@ -1895,12 +1796,14 @@ class Pipe:
                     name = func.get("name")
                     if not name or name in tool_names_seen:
                         continue
-                    
+
                     # Convert OpenAI format to Claude format
                     claude_tool = {
                         "name": name,
                         "description": func.get("description", f"Tool: {name}"),
-                        "input_schema": func.get("parameters", {"type": "object", "properties": {}})
+                        "input_schema": func.get(
+                            "parameters", {"type": "object", "properties": {}}
+                        ),
                     }
                     claude_tools.append(claude_tool)
                     tool_names_seen.add(name)
@@ -1910,16 +1813,22 @@ class Pipe:
         if __tools__ and logger.isEnabledFor(logging.DEBUG):
             # Only attempt serialization if DEBUG is enabled
             try:
-                logger.debug(f"Converting {len(__tools__)} user tools: {json.dumps(__tools__, indent=2)}")
+                logger.debug(
+                    f"Converting {len(__tools__)} user tools: {json.dumps(__tools__, indent=2)}"
+                )
             except (TypeError, ValueError):
                 # Log tool names only if full serialization fails
                 tool_names = list(__tools__.keys())[:10]
-                logger.debug(f"Converting {len(__tools__)} user tools (names): {tool_names}{'...' if len(__tools__) > 10 else ''}")
+                logger.debug(
+                    f"Converting {len(__tools__)} user tools (names): {tool_names}{'...' if len(__tools__) > 10 else ''}"
+                )
         elif not __tools__:
             logger.debug("No user tools to convert")
 
         # Add web search tool if enabled OR if metadata enforces it (even if valve is disabled)
-        web_search_enabled = self.valves.WEB_SEARCH or __metadata__.get("web_search_enforced", False)
+        web_search_enabled = self.valves.WEB_SEARCH or __metadata__.get(
+            "web_search_enforced", False
+        )
         if web_search_enabled:
             # Get user location values with fallback to global valves
             city = (
@@ -1959,15 +1868,26 @@ class Pipe:
             claude_tools.append(web_search_tool)
             tool_names_seen.add("web_search")
 
+        # Add web_fetch tool if enabled
+        if self.valves.WEB_FETCH:
+            web_fetch_tool = {
+                "type": "web_fetch_20260209",
+                "name": "web_fetch",
+                "max_uses": __user__["valves"].WEB_FETCH_MAX_USES,
+            }
+            claude_tools.append(web_fetch_tool)
+            tool_names_seen.add("web_fetch")
+
         # Add Claude Memory tool if enabled and supported by model
-        # if self.valves.ENABLE_CLAUDE_MEMORY and actual_model_name in self.MODELS_SUPPORTING_MEMORY_TOOL:
-        #     claude_tools.append(
-        #         {
-        #             "type": "memory_20250818",
-        #             "name": "memory"
-        #         }
-        #     )
-        #     tool_names_seen.add("memory")
+        model_info = self.get_model_info(actual_model_name)
+        if self.valves.ENABLE_CLAUDE_MEMORY and model_info.get("supports_memory", False):
+            claude_tools.append(
+                {
+                    "type": "memory_20250818",
+                    "name": "memory"
+                }
+            )
+            tool_names_seen.add("memory")
 
         # Process user tools from __tools__ (these have callables for execution)
         if __tools__ and len(__tools__) > 0:
@@ -2011,38 +1931,45 @@ class Pipe:
                     "description": description,
                     "input_schema": input_schema,
                 }
-        
+
                 claude_tools.append(claude_tool)
                 tool_names_seen.add(name)
 
         for claude_tool in claude_tools:
-            logger.debug(f"Processing tool for deferral/programmatic calling: {claude_tool['name']}")
-             # Check if tool should be deferred for tool search
+            logger.debug(
+                f"Processing tool for deferral/programmatic calling: {claude_tool['name']}"
+            )
+            # Check if tool should be deferred for tool search
             if self.valves.ENABLE_TOOL_SEARCH:
                 # Skip deferring if tool is in exclusion list
-                name = claude_tool['name']
+                name = claude_tool["name"]
                 if name not in self.valves.TOOL_SEARCH_EXCLUDE_TOOLS:
                     # Calculate tool definition size (JSON representation)
                     tool_json = json.dumps(claude_tool)
                     tool_len = len(tool_json)
-                    logger.debug(f"Tool '{name}' definition length: {tool_len} characters")
+                    logger.debug(
+                        f"Tool '{name}' definition length: {tool_len} characters"
+                    )
                     if len(tool_json) > self.valves.TOOL_SEARCH_MAX_DESCRIPTION_LENGTH:
-                        logger.debug(f"Deferring loading of tool '{name}' for tool search")
+                        logger.debug(
+                            f"Deferring loading of tool '{name}' for tool search"
+                        )
                         claude_tool["defer_loading"] = True
                     else:
                         logger.debug(f"Tool '{name}' will be loaded normally")
-            
+
             # Add allowed_callers for programmatic tool calling (only if model supports it)
-            # When enabled, tools can ONLY be called from code execution, not directly by Claude
+            # When enabled, tools can be called from code execution
             # This enables Claude to write code that calls tools programmatically for:
             # - Large data processing (filter/aggregate before returning to context)
             # - Multi-step workflows (save tokens by chaining tool calls in code)
             # - Conditional logic based on intermediate results
-            # if self.valves.ENABLE_PROGRAMMATIC_TOOL_CALLING:
-            #     model_info = self.get_model_info(actual_model_name)
-            #     if model_info.get("supports_programmatic_calling", False):
-            #         claude_tool["allowed_callers"] = ["code_execution_20250825"]
-            #     
+            if self.valves.ENABLE_PROGRAMMATIC_TOOL_CALLING:
+                model_info = self.get_model_info(actual_model_name)
+                if model_info.get("supports_programmatic_calling", False):
+                    # Only add to user-defined tools (not server tools like web_search, web_fetch, memory)
+                    if "type" not in claude_tool:  # Server tools have a "type" field
+                        claude_tool["allowed_callers"] = ["code_execution_20250825"]
 
         if any(tool.get("defer_loading", False) for tool in claude_tools):
             if self.valves.TOOL_SEARCH_TYPE == "regex":
@@ -2071,59 +1998,32 @@ class Pipe:
         __files__: Optional[Dict[str, Any]] = None,
         __task__: Optional[dict[str, Any]] = None,
         __task_body__: Optional[dict[str, Any]] = None,
+        __request__: Optional[Any] = None,
     ):
         """
         OpenWebUI Claude streaming pipe with integrated streaming logic.
-        
-        This method orchestrates the complete request lifecycle:
-        
-        PHASES:
-        -------
-        1. VALIDATION & SETUP (lines ~1650-1730)
-           - API key validation
-           - Task model detection and delegation
-           - Native function calling auto-enablement
-           
-        2. PAYLOAD CREATION (lines ~1730-1760)
-           - Create API payload and headers
-           - Initialize streaming state variables
-           
-        3. STREAMING LOOP (lines ~1760-2600)
-           - Event handling: message_start, content_block_start/delta/stop, message_delta/stop
-           - Tool execution: parallel async tool calls
-           - Citation handling for web search
-           
-        4. TOOL EXECUTION LOOP (lines ~2600-2800)
-           - Collect tool results
-           - Build assistant/user messages for continuation
-           - Retry logic for API errors
-           
-        5. FINALIZATION (lines ~2800-2940)
-           - Status updates with token counts
-           - Completion events
-        
-        Note: StreamState dataclass (defined above) can be used for cleaner state management
-        in future refactoring. Currently uses local variables for stability.
         """
         # =========================================================================
         # PHASE 1: RESPONSE ACCUMULATION STATE
         # =========================================================================
+        # Initialize final_message first so it's available for nested functions
         final_message: list[str] = []
 
-        # Initialize total_usage early to prevent UnboundLocalError
-        total_usage = {
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "total_tokens": 0,
-            "cache_creation_input_tokens": 0,
-            "cache_read_input_tokens": 0,
-        }
-
-        # Create request-local wrapper for emit_event to prevent cross-talk between parallel requests
-        # This ensures each request uses its own __event_emitter__ instead of shared self.eventemitter
         async def emit_event_local(event: dict):
             """Request-local event emitter wrapper"""
             await self.emit_event(event, __event_emitter__)
+
+        async def emit_message_delta(content: str) -> None:
+            await emit_event_local(
+                {"type": "chat:message:delta", "data": {"content": content}}
+            )
+            final_message.append(content)
+
+        async def emit_message_replace() -> None:
+            """Replace the entire message with current final_message content"""
+            await emit_event_local(
+                {"type": "chat:message", "data": {"content": final_text()}}
+            )
 
         def final_text() -> str:
             return "".join(final_message)
@@ -2132,7 +2032,7 @@ class Pipe:
             # =========================================================================
             # PHASE 2: VALIDATION & SETUP
             # =========================================================================
-            
+
             # Get API key
             api_key = self.valves.ANTHROPIC_API_KEY
             if not api_key:
@@ -2151,12 +2051,36 @@ class Pipe:
 
             # STEP 1: Detect if task model (generate title, tags, follow-ups etc.), handle it separately
             if __task__:
-                logger.debug(f"Detected task model: {__task__}")
-                return await self._run_task_model_request(body, __event_emitter__)
+                return await self._run_task_model_request(body)
 
             # STEP 2: Await tools if needed
             if inspect.isawaitable(__tools__):
                 __tools__ = await __tools__
+
+            # STEP 2.5: Get builtin tools from OpenWebUI (for tools from body.tools)
+            builtin_tools = {}
+            if BUILTIN_TOOLS_AVAILABLE and __request__:
+                try:
+                    # Determine if memory feature is enabled
+                    memory_enabled = (
+                        __user__.get("settings", {}).get("ui", {}).get("memory", False)
+                        if __user__ else False
+                    )
+                    builtin_tools = get_builtin_tools(
+                        __request__,
+                        {
+                            "__user__": __user__,
+                            "__event_emitter__": __event_emitter__,
+                            "__chat_id__": __metadata__.get("chat_id") if __metadata__ else None,
+                            "__message_id__": __metadata__.get("message_id") if __metadata__ else None,
+                        },
+                        features={"memory": memory_enabled},
+                        model={},
+                    )
+                    logger.debug(f"Loaded {len(builtin_tools)} builtin tools: {list(builtin_tools.keys())}")
+                except Exception as e:
+                    logger.warning(f"Could not load builtin tools: {e}")
+                    builtin_tools = {}
 
             # STEP 3: Auto-enable native function calling if tools are present
             # This prevents OpenWebUI's function_calling task system from being triggered
@@ -2200,28 +2124,91 @@ class Pipe:
                         f"Could not auto-enable native function calling: {e}"
                     )
 
-            payload, headers = await self._create_payload(
+            payload, headers, new_marker_metadata = await self._create_payload(
                 body, __metadata__, __user__, __tools__, __event_emitter__, __files__
             )
 
-            api_key = headers.get("x-api-key", self.valves.ANTHROPIC_API_KEY)
-            client = AsyncAnthropic(api_key=api_key, default_headers=headers)
-            payload_for_stream = {k: v for k, v in payload.items() if k != "stream"}
+            def _safe_json(obj: Any) -> Any:
+                """Recursively convert obj to JSON-serializable form."""
+
+                if isinstance(obj, (str, int, float, bool)) or obj is None:
+                    return obj
+                if isinstance(obj, dict):
+                    return {k: _safe_json(v) for k, v in obj.items()}
+                if isinstance(obj, list):
+                    return [_safe_json(v) for v in obj]
+                if hasattr(obj, "dict"):
+                    try:
+                        return _safe_json(obj.dict())
+                    except Exception:  # pragma: no cover - best effort
+                        pass
+                if hasattr(obj, "model_dump"):
+                    try:
+                        return _safe_json(obj.model_dump())
+                    except Exception:  # pragma: no cover - best effort
+                        pass
+                return f"<UNSERIALIZABLE {type(obj).__name__}>"
+
+            async def emit(name: str, value: Any) -> None:
+
+                if __event_emitter__ is None:
+                    return
+
+                serial = _safe_json(value)
+                await __event_emitter__(
+                    {
+                        "type": "citation",
+                        "data": {
+                            "document": [json.dumps(serial, indent=2)],
+                            "metadata": [
+                                {
+                                    "source": name,
+                                }
+                            ],
+                            "source": {"name": name},
+                        },
+                    }
+                )
+
+            await emit("Payload", payload)
+            await emit("Headers", headers)
+            await emit("body", body)
+            await emit("__metadata__", __metadata__ or {})
+            await emit("__user__", __user__)
+            await emit("__files__", __files__ or [])
+            await emit("__tools__", __tools__ or {})
+            await emit("new_marker_metadata", new_marker_metadata or {})
+            if __task__:
+                await emit("__task__", __task_body__)
 
             # =========================================================================
             # PHASE 3: STREAMING STATE INITIALIZATION
             # =========================================================================
-            
+            api_key = headers.get("x-api-key", self.valves.ANTHROPIC_API_KEY)
+            client = AsyncAnthropic(api_key=api_key, default_headers=headers)
+            payload_for_stream = {k: v for k, v in payload.items() if k != "stream"}
+            include_usage = body.get("stream_options", {}).get("include_usage", False)
+            if include_usage:
+                total_usage = {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                }
+                if self.valves.CACHE_CONTROL != "cache disabled":
+                    total_usage["cache_creation_input_tokens"] = 0
+                    total_usage["cache_read_input_tokens"] = 0
+
             # Stream configuration from valves
             token_buffer_size = getattr(self.valves, "TOKEN_BUFFER_SIZE", 1)
             max_function_calls = self.valves.MAX_TOOL_CALLS
-            
+
             # Thinking mode state
             is_model_thinking = False
             thinking_message = ""
             thinking_blocks = []  # Preserve thinking blocks for multi-turn
             current_thinking_block = {}  # Track current thinking block
-            
+            thinking_start_time = None  # Track when thinking started for duration calc
+
             # Tool execution state
             current_block_type = None  # Track current block type for stop events
             has_pending_tool_calls = False
@@ -2230,7 +2217,7 @@ class Pipe:
             running_tool_tasks = []  # Async tasks for executing tools immediately
             tool_call_data_list = []  # Store tool metadata for result matching
             tool_use_blocks = []  # Store tool_use blocks for assistant message
-            
+
             # Server tool state (web_search, code_execution)
             active_server_tool_name = None
             active_server_tool_id = None
@@ -2238,25 +2225,29 @@ class Pipe:
             text_editor_file_content = ""  # Accumulate file_text for text_editor
             text_editor_command = ""  # Track text_editor command (create/view/edit)
             bash_execution_command = ""  # Track bash command for code execution
-            last_code_language = "bash"  # Track language of last code block for output association
-            
+            last_code_language = (
+                "bash"  # Track language of last code block for output association
+            )
+            last_code_content = ""  # Buffer code content for combining with output
+
             # Web search citation state
             current_search_query = ""  # Track the current web search query
             citation_counter = 0  # Track citation numbers for inline citations
             citations_list = []  # Store citations for reference list
-            
+
             # Loop control state
             conversation_ended = False
             retry_attempts = 0
             current_function_calls = 0
             first_text_emitted = False  # Track if we've emitted "Responding..." status
-            
+
             # Response chunk state
             chunk = ""
             chunk_count = 0
-            
+
             # Structured message parts for final formatting with <details> blocks
-            # Format: [{"type": "text"|"code"|"output", "content": ..., ...}]
+            # Format: [{"type": "text"|"code"|"output", "content": ..., "completed": bool}]
+            # completed=True means the block is finished and should be formatted
             message_parts = []
 
             # Find cached block for preservation across tool loops
@@ -2282,7 +2273,7 @@ class Pipe:
                     },
                 }
             )
-            
+
             # =========================================================================
             # PHASE 4: MAIN STREAMING LOOP
             # Continues until conversation ends or max tool calls reached
@@ -2333,63 +2324,80 @@ class Pipe:
                                     logger.debug(
                                         f" Message started with ID: {request_id}"
                                     )
-                                    
-                                    # Extract container ID from response for Skills/Files API persistence
                                     container = getattr(message, "container", None)
                                     if container:
-                                        response_container_id = getattr(container, "id", None)
+                                        response_container_id = getattr(
+                                            container, "id", None
+                                        )
                                         if response_container_id:
-                                            __metadata__["anthropic_container_id"] = response_container_id
-                                            logger.debug(f" Container ID: {response_container_id}")
-                                    
-                                    usage = getattr(message, "usage", {})
-                                    if usage:
-                                        input_tokens = getattr(usage, "input_tokens", 0)
-                                        # Output tokens in message_start are usually 0 or small, but we track them
-                                        current_output_tokens = getattr(
-                                            usage, "output_tokens", 0
-                                        )
-                                        cache_creation_input_tokens = getattr(
-                                            usage,
-                                            "cache_creation_input_tokens",
-                                            0,
-                                        )
-                                        cache_read_input_tokens = getattr(
-                                            usage, "cache_read_input_tokens", 0
-                                        )
+                                            current_container_id = getattr(
+                                                payload_for_stream.get("container", {}),
+                                                "id",
+                                                None,
+                                            )
+                                            if (
+                                                current_container_id
+                                                != response_container_id
+                                            ):
+                                                chunk += self._create_metadata_marker(
+                                                    "container_id",
+                                                    response_container_id,
+                                                    messagenum=len(
+                                                        payload_for_stream.get(
+                                                            "messages", []
+                                                        )
+                                                    ),
+                                                )
+                                                logger.debug(
+                                                    f" Detected new container ID in response: {response_container_id}, added to message metadata"
+                                                )
+                                            else:
+                                                logger.debug(
+                                                    f" Container ID: {response_container_id}"
+                                                )
+                                    if include_usage:
+                                        usage = getattr(message, "usage", {})
+                                        if usage:
+                                            input_tokens = getattr(usage, "input_tokens", 0)
+                                            current_output_tokens = getattr(usage, "output_tokens", 0)
+                                            # Accumulate billable tokens (for cost tracking)
+                                            total_usage["input_tokens"] += input_tokens
+                                            # Handle output tokens (cumulative within stream)
+                                            diff = (current_output_tokens - stream_output_tokens)
+                                            total_usage["output_tokens"] += diff
+                                            stream_output_tokens = current_output_tokens
 
-                                        # Accumulate billable tokens (for cost tracking)
-                                        total_usage["input_tokens"] += input_tokens
-                                        total_usage[
-                                            "cache_creation_input_tokens"
-                                        ] += cache_creation_input_tokens
+                                            # Calculate total context size from last turn
+                                            total_usage["total_tokens"] = (
+                                                input_tokens
+                                                + current_output_tokens
+                                            )
 
-                                        # Set last-turn values (non-accumulating)
-                                        total_usage["cache_read_input_tokens"] = (
-                                            cache_read_input_tokens
-                                        )
 
-                                        # Handle output tokens (cumulative within stream)
-                                        diff = (
-                                            current_output_tokens - stream_output_tokens
-                                        )
-                                        total_usage["output_tokens"] += diff
-                                        stream_output_tokens = current_output_tokens
 
-                                        # Calculate total context size from last turn
-                                        total_usage["total_tokens"] = (
-                                            input_tokens
-                                            + current_output_tokens
-                                            + cache_creation_input_tokens
-                                            + cache_read_input_tokens
-                                        )
 
-                                        logger.debug(
-                                            f" Usage stats: input={input_tokens}, output={current_output_tokens}, cache_creation={cache_creation_input_tokens}, cache_read={cache_read_input_tokens}"
-                                        )
-                                        logger.debug(
-                                            f" Accumulated usage: {total_usage}"
-                                        )
+                                            if self.valves.CACHE_CONTROL != "cache disabled":
+                                                cache_creation_input_tokens = getattr(usage,"cache_creation_input_tokens",0)
+                                                cache_read_input_tokens = getattr(
+                                                    usage, "cache_read_input_tokens", 0
+                                                )
+                                                total_usage[
+                                                "cache_creation_input_tokens"
+                                                ] += cache_creation_input_tokens
+                                                total_usage["cache_read_input_tokens"] = (
+                                                    cache_read_input_tokens
+                                                )
+                                                total_usage["total_tokens"] += cache_creation_input_tokens + cache_read_input_tokens
+                                                logger.debug(
+                                                    f" Usage stats: input={input_tokens}, output={current_output_tokens}, cache_creation={cache_creation_input_tokens}, cache_read={cache_read_input_tokens}"
+                                                )
+                                            else:
+                                                logger.debug(
+                                                    f" Usage stats: input={input_tokens}, output={current_output_tokens}"
+                                                )
+                                            logger.debug(
+                                                f" Accumulated usage: {total_usage}"
+                                            )
 
                             # ---------------------------------------------------------
                             # EVENT: content_block_start
@@ -2407,10 +2415,22 @@ class Pipe:
                                     chunk += content_block.text or ""
                                 if content_type == "thinking":
                                     is_model_thinking = True
+                                    thinking_start_time = time.time()  # Track start time for duration
                                     current_thinking_block = {
                                         "type": "thinking",
                                         "thinking": "",
                                     }
+                                    # Add in-progress thinking block to message_parts
+                                    # This will be serialized as a COMPLETE <details> block with done="false"
+                                    message_parts.append({
+                                        "type": "thinking",
+                                        "content": "",
+                                        "completed": False,
+                                        "start_time": thinking_start_time,
+                                    })
+                                    # Emit complete block with done="false" (enables spinner in UI)
+                                    self._rebuild_message_with_formatting(message_parts, final_message)
+                                    await emit_message_replace()
                                 if content_type == "tool_use":
                                     tool_name = getattr(
                                         content_block, "name", "unknown"
@@ -2430,9 +2450,6 @@ class Pipe:
                                             },
                                         }
                                     )
-                                    # Give UI time to update
-                                    await asyncio.sleep(0.05)
-
                                     tools_buffer = (
                                         "{"
                                         f'"type": "{content_block.type}", '
@@ -2457,7 +2474,7 @@ class Pipe:
                                     logger.debug(
                                         f"Server tool started: {active_server_tool_name} (ID: {active_server_tool_id})"
                                     )
-                                
+
                                     if active_server_tool_name == "web_search":
                                         await emit_event_local(
                                             {
@@ -2484,92 +2501,141 @@ class Pipe:
 
                                 # Handle bash code execution results
                                 if content_type == "bash_code_execution_tool_result":
-                                    logger.debug(f"Processing bash_code_execution_tool_result: {content_block}")
-                                    result_block = getattr(content_block, "content", None)
+                                    logger.debug(
+                                        f"Processing bash_code_execution_tool_result: {content_block}"
+                                    )
+                                    result_block = getattr(
+                                        content_block, "content", None
+                                    )
                                     if result_block:
                                         stdout = getattr(result_block, "stdout", "")
                                         stderr = getattr(result_block, "stderr", "")
-                                        return_code = getattr(result_block, "return_code", None)
-                                        
+                                        return_code = getattr(
+                                            result_block, "return_code", None
+                                        )
+
                                         # Handle file outputs from code execution
                                         download_links = []
-                                        files_output = getattr(result_block, "content", [])
+                                        files_output = getattr(
+                                            result_block, "content", []
+                                        )
                                         if files_output:
-                                            logger.debug(f"Found {len(files_output)} file outputs")
+                                            logger.debug(
+                                                f"Found {len(files_output)} file outputs"
+                                            )
                                             for file_obj in files_output:
-                                                logger.debug(f" Processing file object: {file_obj}")
+                                                logger.debug(
+                                                    f" Processing file object: {file_obj}"
+                                                )
                                                 # Files in bash results have file_id
-                                                file_id = getattr(file_obj, "file_id", None)
+                                                file_id = getattr(
+                                                    file_obj, "file_id", None
+                                                )
                                                 if file_id:
                                                     # Generate download link - download file and save to Open-WebUI
                                                     download_link = await self._generate_file_download_link(
                                                         file_id=file_id,
                                                         api_key=api_key,
-                                                        user_id=__user__.get("id", "unknown")
+                                                        user_id=__user__.get(
+                                                            "id", "unknown"
+                                                        ),
                                                     )
                                                     download_links.append(download_link)
-                                        
-                                        if stdout or stderr or return_code is not None or download_links:
-                                            # Stream output DIRECTLY without details wrapper (will be formatted at end)
-                                            output_preview = ""
-                                            
-                                            # Add download links first
-                                            if download_links:
-                                                output_preview += "\n".join(download_links)
-                                            
-                                            if stdout:
-                                                output_preview += f"\n```\n{stdout}\n```\n"
-                                            if stderr:
-                                                output_preview += f"\n**Errors:**\n```\n{stderr}\n```\n"
-                                            
-                                            await self.emit_message_delta(
-                                                output_preview,
-                                                final_message,
-                                                __event_emitter__,
+
+                                        if (
+                                            stdout
+                                            or stderr
+                                            or return_code is not None
+                                            or download_links
+                                        ):
+                                            # Add code+output to message_parts as completed
+                                            message_parts.append(
+                                                {
+                                                    "type": "code_with_output",
+                                                    "content": last_code_content,
+                                                    "language": "bash",
+                                                    "stdout": stdout,
+                                                    "stderr": stderr,
+                                                    "return_code": return_code,
+                                                    "download_links": download_links,
+                                                    "completed": True,
+                                                }
                                             )
                                             
-                                            # Track for final formatting with <details>
-                                            message_parts.append({
-                                                "type": "output",
-                                                "stdout": stdout,
-                                                "stderr": stderr,
-                                                "return_code": return_code,
-                                                "download_links": download_links,
-                                                "language": last_code_language  # Associate with last code block
-                                            })
-                                
+                                            # Rebuild and replace entire message with formatted version
+                                            self._rebuild_message_with_formatting(message_parts, final_message)
+                                            await emit_message_replace()
+                                            
+                                            logger.debug(
+                                                f"Reformatted message with bash code execution block"
+                                            )
+
+                                            # Clear buffered code
+                                            last_code_content = ""
+
                                 # Handle text editor code execution results
-                                if content_type == "text_editor_code_execution_tool_result":
-                                    logger.debug(f"Processing text_editor_code_execution_tool_result: {content_block}")
-                                    result_block = getattr(content_block, "content", None)
+                                if (
+                                    content_type
+                                    == "text_editor_code_execution_tool_result"
+                                ):
+                                    logger.debug(
+                                        f"Processing text_editor_code_execution_tool_result: {content_block}"
+                                    )
+                                    result_block = getattr(
+                                        content_block, "content", None
+                                    )
                                     if result_block:
                                         result_type = getattr(result_block, "type", "")
-                                        logger.debug(f"Text editor result type: {result_type}")
-                                        
+                                        logger.debug(
+                                            f"Text editor result type: {result_type}"
+                                        )
+
                                         # Handle create/update results
-                                        if result_type == "text_editor_code_execution_create_result":
-                                            # Code already shown during server_tool_use block stop
-                                            # Just log this for debugging
-                                            is_file_update = getattr(result_block, "is_file_update", False)
-                                            action = "updated" if is_file_update else "created"
-                                            logger.debug(f"File {action} confirmation received")
-                                        elif result_type == "text_editor_code_execution_view_result":
-                                            content = getattr(result_block, "content", "")
+                                        if (
+                                            result_type
+                                            == "text_editor_code_execution_create_result"
+                                        ):
+                                            # Add code to message_parts as completed
+                                            if last_code_content:
+                                                message_parts.append(
+                                                    {
+                                                        "type": "code_with_output",
+                                                        "content": last_code_content,
+                                                        "language": "python",
+                                                        "completed": True,
+                                                    }
+                                                )
+                                                
+                                                # Rebuild and replace entire message with formatted version
+                                                self._rebuild_message_with_formatting(message_parts, final_message)
+                                                await emit_message_replace()
+                                                
+                                                logger.debug(
+                                                    f"Reformatted message with python code creation block"
+                                                )
+                                                # Clear buffered code
+                                                last_code_content = ""
+                                                
+                                        elif (
+                                            result_type
+                                            == "text_editor_code_execution_view_result"
+                                        ):
+                                            content = getattr(
+                                                result_block, "content", ""
+                                            )
                                             if content:
                                                 msg = f"\n<details>\n<summary>📄 File Content</summary>\n\n```\n{content}\n```\n</details>\n"
-                                                await self.emit_message_delta(
-                                                    msg,
-                                                    final_message,
-                                                    __event_emitter__,
-                                                )
-                                
+                                                await emit_message_delta(msg)
+
                                 # Legacy support for old code_execution_tool_result type
                                 if content_type == "code_execution_tool_result":
-                                    logger.debug("Processing legacy code_execution_tool_result")
+                                    logger.debug(
+                                        "Processing legacy code_execution_tool_result"
+                                    )
                                     result_block = getattr(content_block, "content", {})
                                     stdout = result_block.get("stdout", "")
                                     stderr = result_block.get("stderr", "")
-                                    
+
                                     if stdout or stderr:
                                         code_result_msg = (
                                             f"\n<details>\n"
@@ -2579,14 +2645,16 @@ class Pipe:
                                                 if stdout
                                                 else ""
                                             )
-                                            + (f"\n```\n{stderr}\n```" if stderr else "")
+                                            + (
+                                                f"\n```\n{stderr}\n```"
+                                                if stderr
+                                                else ""
+                                            )
                                             + f"\n</details>\n"
                                         )
-                                        await self.emit_message_delta(
-                                            code_result_msg,
-                                            final_message,
-                                            __event_emitter__,
-                                        )
+
+                                        await emit_message_delta(code_result_msg)
+
                                 if content_type == "web_search_tool_result":
                                     logger.debug(
                                         f" Processing web search result event: {event}"
@@ -2751,15 +2819,21 @@ class Pipe:
                                     delta_type = getattr(delta, "type", None)
                                     if delta_type == "thinking_delta":
                                         thinking_text = getattr(delta, "thinking", "")
-                                        # Stream thinking text DIRECTLY to UI
-                                        await self.emit_message_delta(
-                                            thinking_text, final_message, __event_emitter__
-                                        )
                                         # Preserve thinking for API
                                         if current_thinking_block:
-                                            current_thinking_block[
-                                                "thinking"
-                                            ] += thinking_text
+                                            current_thinking_block["thinking"] += thinking_text
+                                        
+                                        # Update message_parts thinking block content
+                                        thinking_part = next(
+                                            (p for p in reversed(message_parts) if p.get("type") == "thinking" and not p.get("completed")),
+                                            None
+                                        )
+                                        if thinking_part:
+                                            thinking_part["content"] += thinking_text
+                                        
+                                        # Rebuild with COMPLETE blocks and emit (enables proper collapsible rendering)
+                                        self._rebuild_message_with_formatting(message_parts, final_message)
+                                        await emit_message_replace()
                                     elif delta_type == "signature_delta":
                                         # Capture signature for thinking block preservation
                                         signature = getattr(delta, "signature", "")
@@ -2789,6 +2863,11 @@ class Pipe:
 
                                         chunk += text_delta
                                         chunk_count += 1
+                                        
+                                        # Track streaming text in message_parts
+                                        if not message_parts or message_parts[-1].get("type") != "text_streaming":
+                                            message_parts.append({"type": "text_streaming", "content": "", "completed": False})
+                                        message_parts[-1]["content"] += text_delta
                                     elif delta_type == "input_json_delta":
                                         partial = getattr(delta, "partial_json", "")
 
@@ -2844,30 +2923,58 @@ class Pipe:
                                                 logger.debug(
                                                     f"Code execution input: {server_tool_input_buffer[:100]}..."
                                                 )
-                                            elif active_server_tool_name == "bash_code_execution":
+                                            elif (
+                                                active_server_tool_name
+                                                == "bash_code_execution"
+                                            ):
                                                 # Bash code execution - extract command (the actual code)
                                                 try:
-                                                    parsed = json.loads(server_tool_input_buffer)
+                                                    parsed = json.loads(
+                                                        server_tool_input_buffer
+                                                    )
                                                     if "command" in parsed:
-                                                        bash_execution_command = parsed["command"]
-                                                        logger.debug(f"Bash execution command: {bash_execution_command[:100]}...")
+                                                        bash_execution_command = parsed[
+                                                            "command"
+                                                        ]
+                                                        logger.debug(
+                                                            f"Bash execution command: {bash_execution_command[:100]}..."
+                                                        )
                                                 except json.JSONDecodeError:
-                                                    logger.debug(f"Partial bash_code_execution JSON: {server_tool_input_buffer[:100]}...")
+                                                    logger.debug(
+                                                        f"Partial bash_code_execution JSON: {server_tool_input_buffer[:100]}..."
+                                                    )
                                                 except Exception as e:
-                                                    logger.debug(f"Bash execution input extraction error: {e}")
-                                            elif active_server_tool_name == "text_editor_code_execution":
+                                                    logger.debug(
+                                                        f"Bash execution input extraction error: {e}"
+                                                    )
+                                            elif (
+                                                active_server_tool_name
+                                                == "text_editor_code_execution"
+                                            ):
                                                 # Text editor input - extract command and file_text
                                                 try:
-                                                    parsed = json.loads(server_tool_input_buffer)
+                                                    parsed = json.loads(
+                                                        server_tool_input_buffer
+                                                    )
                                                     if "command" in parsed:
-                                                        text_editor_command = parsed["command"]
+                                                        text_editor_command = parsed[
+                                                            "command"
+                                                        ]
                                                     if "file_text" in parsed:
-                                                        text_editor_file_content = parsed["file_text"]
-                                                        logger.debug(f"Text editor creating file with {len(text_editor_file_content)} chars")
+                                                        text_editor_file_content = (
+                                                            parsed["file_text"]
+                                                        )
+                                                        logger.debug(
+                                                            f"Text editor creating file with {len(text_editor_file_content)} chars"
+                                                        )
                                                 except json.JSONDecodeError:
-                                                    logger.debug(f"Partial text_editor JSON: {server_tool_input_buffer[:100]}...")
+                                                    logger.debug(
+                                                        f"Partial text_editor JSON: {server_tool_input_buffer[:100]}..."
+                                                    )
                                                 except Exception as e:
-                                                    logger.debug(f"Text editor input extraction error: {e}")
+                                                    logger.debug(
+                                                        f"Text editor input extraction error: {e}"
+                                                    )
                                             elif (
                                                 active_server_tool_name == "tool_search"
                                             ):
@@ -2936,10 +3043,12 @@ class Pipe:
 
                                 # When a text block ends, emit any remaining chunk
                                 if content_type == "text" and chunk.strip():
-                                    await self.emit_message_delta(
-                                        chunk + "\n", final_message, __event_emitter__
-                                    )
-                                    message_parts.append({"type": "text", "content": chunk + "\n"})
+                                    await emit_message_delta(chunk + "\n")
+                                    # Mark last text_streaming as completed
+                                    if message_parts and message_parts[-1].get("type") == "text_streaming":
+                                        message_parts[-1]["content"] += "\n"
+                                        message_parts[-1]["type"] = "text"
+                                        message_parts[-1]["completed"] = True
                                     chunk = ""
                                     chunk_count = 0
 
@@ -2948,41 +3057,37 @@ class Pipe:
                                     logger.debug(
                                         f"Server tool block stopped: {active_server_tool_name}"
                                     )
-                                    
+
                                     # Show collected code for bash_code_execution
-                                    if active_server_tool_name == "bash_code_execution" and bash_execution_command:
-                                        # Stream code DIRECTLY without details wrapper (will be formatted at end)
-                                        code_preview = f"\n```bash\n{bash_execution_command}\n```\n"
-                                        await self.emit_message_delta(
-                                            code_preview, final_message, __event_emitter__
-                                        )
-                                        # Track for final formatting with <details>
+                                    if (
+                                        active_server_tool_name == "bash_code_execution"
+                                        and bash_execution_command
+                                    ):
+                                        # Buffer code for later combination with output
+                                        # (output comes via bash_code_execution_tool_result event)
                                         last_code_language = "bash"
-                                        message_parts.append({
-                                            "type": "code",
-                                            "content": bash_execution_command,
-                                            "language": "bash"
-                                        })
-                                    # Show collected code for text_editor create command
-                                    elif active_server_tool_name == "text_editor_code_execution" and text_editor_command == "create" and text_editor_file_content:
-                                        # Stream code DIRECTLY without details wrapper (will be formatted at end)
-                                        code_preview = f"\n```python\n{text_editor_file_content}\n```\n"
-                                        await self.emit_message_delta(
-                                            code_preview, final_message, __event_emitter__
+                                        last_code_content = bash_execution_command
+                                        logger.debug(
+                                            f"Buffered bash code for later formatting: {len(bash_execution_command)} chars"
                                         )
-                                        # Track for final formatting with <details>
+                                    # Show collected code for text_editor create command
+                                    elif (
+                                        active_server_tool_name
+                                        == "text_editor_code_execution"
+                                        and text_editor_command == "create"
+                                        and text_editor_file_content
+                                    ):
+                                        # Buffer code for later combination with output
+                                        # (output comes via text_editor_code_execution_tool_result event)
                                         last_code_language = "python"
-                                        message_parts.append({
-                                            "type": "code",
-                                            "content": text_editor_file_content,
-                                            "language": "python"
-                                        })
+                                        last_code_content = text_editor_file_content
+                                        logger.debug(
+                                            f"Buffered python code for later formatting: {len(text_editor_file_content)} chars"
+                                        )
                                     else:
                                         # Add line break after other server tool use
-                                        await self.emit_message_delta(
-                                            "\n", final_message, __event_emitter__
-                                        )
-                                    
+                                        await emit_message_delta("\n")
+
                                     active_server_tool_name = None
                                     active_server_tool_id = None
                                     server_tool_input_buffer = ""
@@ -3037,11 +3142,25 @@ class Pipe:
                                             }
                                         )
 
-                                        # Look up tool
-                                        tool = __tools__.get(tool_name)
-                                        if tool:
-                                            # Store metadata for later result matching
+                                        # Look up tool in __tools__ first (user tools with callable)
+                                        tool = __tools__.get(tool_name) if __tools__ else None
+                                        if tool and tool.get("callable"):
+                                            # User tool with callable - execute directly
                                             tool_call_data_list.append(tool_call_data)
+
+                                            # Add in-progress tool block to message_parts for spinner UI
+                                            message_parts.append({
+                                                "type": "tool_result",
+                                                "tool_call_id": tool_id,
+                                                "tool_name": tool_name,
+                                                "input": tool_input,
+                                                "output": "",
+                                                "is_error": False,
+                                                "completed": False,
+                                            })
+                                            # Emit with done="false" to show spinner
+                                            self._rebuild_message_with_formatting(message_parts, final_message)
+                                            await emit_message_replace()
 
                                             # Start execution immediately as async task (no extra status event needed)
                                             args = (
@@ -3055,10 +3174,95 @@ class Pipe:
                                             running_tool_tasks.append(task)
 
                                             logger.debug(
-                                                f"🚀 Started immediate execution for '%s' (task #%d)",
+                                                f"🚀 Started immediate execution for user tool '%s' (task #%d)",
                                                 tool_name,
                                                 len(running_tool_tasks),
                                             )
+                                        elif tool_name == "memory" and self.valves.ENABLE_CLAUDE_MEMORY and MEMORIES_AVAILABLE:
+                                            # Memory tool - bridge to OpenWebUI memory system
+                                            tool_call_data_list.append(tool_call_data)
+
+                                            # Add in-progress tool block to message_parts for spinner UI
+                                            message_parts.append({
+                                                "type": "tool_result",
+                                                "tool_call_id": tool_id,
+                                                "tool_name": tool_name,
+                                                "input": tool_input,
+                                                "output": "",
+                                                "is_error": False,
+                                                "completed": False,
+                                            })
+                                            self._rebuild_message_with_formatting(message_parts, final_message)
+                                            await emit_message_replace()
+
+                                            # Execute memory tool operation
+                                            mem_user_id = __user__.get("id", "") if __user__ else ""
+                                            task = asyncio.create_task(
+                                                self._handle_memory_tool(
+                                                    command=tool_input.get("command", "view"),
+                                                    path=tool_input.get("path", "/memories"),
+                                                    user_id=mem_user_id,
+                                                    file_text=tool_input.get("file_text", ""),
+                                                    old_str=tool_input.get("old_str", ""),
+                                                    new_str=tool_input.get("new_str", ""),
+                                                    insert_line=tool_input.get("insert_line", 0),
+                                                    new_path=tool_input.get("new_path", ""),
+                                                )
+                                            )
+                                            running_tool_tasks.append(task)
+
+                                            logger.debug(
+                                                f"🧠 Started memory tool execution: {tool_input.get('command', 'view')} {tool_input.get('path', '/memories')}"
+                                            )
+                                        elif tool_name in builtin_tools and builtin_tools[tool_name].get("callable"):
+                                            # Builtin tool from OpenWebUI - execute with proper context
+                                            tool_call_data_list.append(tool_call_data)
+
+                                            # Add in-progress tool block to message_parts for spinner UI
+                                            message_parts.append({
+                                                "type": "tool_result",
+                                                "tool_call_id": tool_id,
+                                                "tool_name": tool_name,
+                                                "input": tool_input,
+                                                "output": "",
+                                                "is_error": False,
+                                                "completed": False,
+                                            })
+                                            # Emit with done="false" to show spinner
+                                            self._rebuild_message_with_formatting(message_parts, final_message)
+                                            await emit_message_replace()
+                                            
+                                            args = (
+                                                tool_input
+                                                if isinstance(tool_input, dict)
+                                                else {}
+                                            )
+                                            task = asyncio.create_task(
+                                                builtin_tools[tool_name]["callable"](**args)
+                                            )
+                                            running_tool_tasks.append(task)
+                                            
+                                            logger.debug(
+                                                f"🚀 Started immediate execution for builtin tool '%s' (task #%d)",
+                                                tool_name,
+                                                len(running_tool_tasks),
+                                            )
+                                        else:
+                                            # Unknown tool - add error result
+                                            logger.warning(
+                                                f"Tool '{tool_name}' not found in __tools__ or builtin_tools"
+                                            )
+                                            tool_call_data_list.append(tool_call_data)
+                                            
+                                            # Capture tool_name in default arg to avoid closure issue
+                                            async def error_result(tn=tool_name):
+                                                return json.dumps({
+                                                    "error": f"Tool '{tn}' is not available. "
+                                                             f"It may require server context or is not configured."
+                                                }, ensure_ascii=False)
+                                            
+                                            task = asyncio.create_task(error_result())
+                                            running_tool_tasks.append(task)
                                     except Exception as e:
                                         logger.error(
                                             f"Failed to start tool execution: {e}"
@@ -3068,26 +3272,32 @@ class Pipe:
                                     tools_buffer = ""
 
                                 if is_model_thinking:
-                                    # Track thinking for final formatting with <details>
+                                    # Mark thinking block as completed and reformat message
                                     if (
                                         current_thinking_block
                                         and current_thinking_block.get("thinking")
                                     ):
-                                        thinking_blocks.append(current_thinking_block)
-                                        # Add to message_parts for final formatting
-                                        message_parts.append({
-                                            "type": "thinking",
-                                            "content": current_thinking_block.get("thinking", "")
-                                        })
-                                        logger.debug(
-                                            f"Preserved thinking block with {len(current_thinking_block.get('thinking', ''))} chars"
+                                        thinking_content = current_thinking_block.get(
+                                            "thinking", ""
                                         )
-                                    # Add separator after thinking (will be replaced at end)
-                                    await self.emit_message_delta(
-                                        "\n---\n",
-                                        final_message,
-                                        __event_emitter__,
-                                    )
+                                        thinking_blocks.append(current_thinking_block)
+                                        
+                                        # Mark the thinking part as completed and calculate duration
+                                        for part in reversed(message_parts):
+                                            if part.get("type") == "thinking" and not part.get("completed"):
+                                                part["completed"] = True
+                                                start_time = part.get("start_time", thinking_start_time or time.time())
+                                                part["duration"] = time.time() - start_time
+                                                break
+                                        
+                                        # Rebuild and replace entire message with formatted version
+                                        self._rebuild_message_with_formatting(message_parts, final_message)
+                                        await emit_message_replace()
+                                        
+                                        logger.debug(
+                                            f"Reformatted message with completed thinking block ({len(thinking_content)} chars)"
+                                        )
+
                                     is_model_thinking = False
                                     current_thinking_block = {}
 
@@ -3100,24 +3310,17 @@ class Pipe:
                             # Flushes buffered chunks
                             # ---------------------------------------------------------
                             elif event_type == "message_delta":
-                                # Extract usage from message_delta
-                                usage = getattr(event, "usage", None)
-                                if usage:
-                                    current_output_tokens = getattr(
-                                        usage, "output_tokens", 0
-                                    )
+                                if include_usage:
+                                    usage = getattr(event, "usage", None)
+                                    if usage:
+                                        current_output_tokens = getattr(
+                                            usage, "output_tokens", 0
+                                        )
 
-                                    # Calculate difference from last known output count for this stream
-                                    diff = current_output_tokens - stream_output_tokens
-                                    total_usage["output_tokens"] += diff
-                                    stream_output_tokens = current_output_tokens
-
-                                    # Note: total_tokens is already set in message_start based on last turn
-                                    # We don't recalculate it here as it represents the context size of the last API call
-
-                                    logger.debug(
-                                        f" Delta usage: output={current_output_tokens}, Accumulated: {total_usage}"
-                                    )
+                                        # Calculate difference from last known output count for this stream
+                                        diff = current_output_tokens - stream_output_tokens
+                                        total_usage["output_tokens"] += diff
+                                        stream_output_tokens = current_output_tokens
 
                                 delta = getattr(event, "delta", None)
                                 if delta:
@@ -3125,10 +3328,10 @@ class Pipe:
                                     if stop_reason == "tool_use":
                                         # Emit any remaining text chunk before tool results
                                         if chunk.strip():
-                                            await self.emit_message_delta(
-                                                chunk, final_message, __event_emitter__
+                                            await emit_message_delta(chunk)
+                                            message_parts.append(
+                                                {"type": "text", "content": chunk}
                                             )
-                                            message_parts.append({"type": "text", "content": chunk})
                                             chunk = ""
                                             chunk_count = 0
 
@@ -3172,6 +3375,9 @@ class Pipe:
                                                     tool_name = tool_call_data.get(
                                                         "name", ""
                                                     )
+                                                    tool_input = tool_call_data.get(
+                                                        "input", {}
+                                                    )
 
                                                     # Determine if error
                                                     is_error = isinstance(
@@ -3190,48 +3396,38 @@ class Pipe:
                                                         result_block["is_error"] = True
                                                     tool_calls.append(result_block)
 
-                                                    # Format and emit result to UI DIRECTLY (without <details>)
-                                                    try:
-                                                        parsed_json = json.loads(
-                                                            tool_result
-                                                        )
-                                                        formatted_result = f"```json\n{json.dumps(parsed_json, indent=2, ensure_ascii=False)}\n```"
-                                                    except Exception:
-                                                        formatted_result = f"```\n{str(tool_result)}\n```"
-
-                                                    # Format tool input/parameters for display
-                                                    tool_input = tool_call_data.get(
-                                                        "input", {}
+                                                    # Find and UPDATE existing in-progress tool block (not add new)
+                                                    tool_part = next(
+                                                        (p for p in message_parts 
+                                                         if p.get("type") == "tool_result" 
+                                                         and p.get("tool_call_id") == tool_use_id 
+                                                         and not p.get("completed")),
+                                                        None
                                                     )
-                                                    if tool_input:
-                                                        try:
-                                                            formatted_input = f"```json\n{json.dumps(tool_input, indent=2, ensure_ascii=False)}\n```"
-                                                        except Exception:
-                                                            formatted_input = f"```\n{str(tool_input)}\n```"
-                                                        input_section = f"**Input:**\n{formatted_input}\n\n"
+                                                    if tool_part:
+                                                        # Update existing in-progress block
+                                                        tool_part["output"] = str(tool_result)
+                                                        tool_part["is_error"] = is_error
+                                                        tool_part["completed"] = True
                                                     else:
-                                                        input_section = ""
+                                                        # Fallback: add new (shouldn't normally happen)
+                                                        message_parts.append({
+                                                            "type": "tool_result",
+                                                            "tool_call_id": tool_use_id,
+                                                            "tool_name": tool_name,
+                                                            "input": tool_input,
+                                                            "output": str(tool_result),
+                                                            "is_error": is_error,
+                                                            "completed": True,
+                                                        })
 
-                                                    # Stream DIRECTLY without details wrapper
-                                                    tool_result_msg = (
-                                                        f"\n\n🔧 **{tool_name}**\n"
-                                                        f"{input_section}"
-                                                        f"**Output:**\n{formatted_result}\n"
-                                                    )
-                                                    await self.emit_message_delta(
-                                                        tool_result_msg,
-                                                        final_message,
-                                                        __event_emitter__,
-                                                    )
-                                                    
-                                                    # Track for final formatting with <details>
-                                                    message_parts.append({
-                                                        "type": "tool_result",
-                                                        "tool_name": tool_name,
-                                                        "input": tool_input,
-                                                        "output": str(tool_result),
-                                                        "is_error": is_error
-                                                    })
+                                                # After all tools processed, rebuild and replace message
+                                                self._rebuild_message_with_formatting(message_parts, final_message)
+                                                await emit_message_replace()
+                                                
+                                                logger.debug(
+                                                    f"Reformatted message with {len(results)} tool result(s)"
+                                                )
                                             except Exception as ex:
                                                 logger.error(
                                                     f"❌ Tool execution failed: %s", ex
@@ -3273,6 +3469,15 @@ class Pipe:
                                         chunk += (
                                             "Claude was unable to process this request"
                                         )
+                                    elif stop_reason == "refusal":
+                                        chunk += "Claude has refused to answer based on its content policies."
+                                        conversation_ended = True
+                                    elif stop_reason == "stop_sequence":
+                                        chunk += "Claude stopped generating based on stop sequence."
+                                        conversation_ended = True
+                                    elif stop_reason == "model_context_window_exceeded":
+                                        chunk += "Claude has reached the maximum context window for this model."
+                                        conversation_ended = True
 
                             # ---------------------------------------------------------
                             # EVENT: message_stop
@@ -3305,18 +3510,16 @@ class Pipe:
 
                             if chunk_count > token_buffer_size:
                                 if chunk.strip():
-                                    await self.emit_message_delta(
-                                        chunk, final_message, __event_emitter__
+                                    await emit_message_delta(chunk)
+                                    message_parts.append(
+                                        {"type": "text", "content": chunk}
                                     )
-                                    message_parts.append({"type": "text", "content": chunk})
                                     chunk = ""
                                     chunk_count = 0
 
                     # Sende letzten Chunk, falls noch etwas übrig ist
                     if chunk.strip():
-                        await self.emit_message_delta(
-                            chunk, final_message, __event_emitter__
-                        )
+                        await emit_message_delta(chunk)
                         message_parts.append({"type": "text", "content": chunk})
                         chunk = ""
                         chunk_count = 0
@@ -3343,10 +3546,8 @@ class Pipe:
                                     },
                                 }
                             )
-                            await self.emit_message_delta(
-                                f"\n\n⚠️ **SYSTEM MESSAGE**: Maximum tool call limit ({max_function_calls}) reached. Some tool results may not have been processed.",
-                                final_message,
-                                __event_emitter__,
+                            await emit_message_delta(
+                                f"\n\n⚠️ **SYSTEM MESSAGE**: Maximum tool call limit ({max_function_calls}) reached. Some tool results may not have been processed."
                             )
                             break
 
@@ -3616,43 +3817,40 @@ class Pipe:
         # ---------------------------------------------------------
         # PHASE 7: FINALIZATION
         # After successful completion:
-        # - Reformat message with proper <details> blocks if code/output was streamed
+        # - Reformat message with proper <details> blocks
         # - Build final status with token count display
         # - Emit completion status event
         # - Emit chat:completion event with usage stats
         # - Return final message text
         # ---------------------------------------------------------
-        
+
         # Check if we need to reformat with <details> blocks
         has_special_content = any(
-            p.get("type") in ("code", "output", "thinking", "tool_result") for p in message_parts
+            p.get("type") in ("code", "output", "thinking", "tool_result")
+            for p in message_parts
         )
-        
+
         if has_special_content:
             # Build formatted message with proper <details> blocks
             formatted_message = self._format_message_with_details(message_parts)
-            
-            logger.debug(f"Message parts summary: {[(p.get('type'), len(str(p.get('content', '')))) for p in message_parts]}")
+
+            logger.debug(
+                f"Message parts summary: {[(p.get('type'), len(str(p.get('content', '')))) for p in message_parts]}"
+            )
             logger.debug(f"Formatted message length: {len(formatted_message)}")
             logger.debug(f"Final message (before): {final_text()[:200]}...")
-            
-            # Replace the entire message in UI with formatted version
-            await emit_event_local(
-                {
-                    "type": "chat:message",  # This replaces the entire message
-                    "data": {"content": formatted_message},
-                }
-            )
-            
+
             # Update final_message to match
             final_message.clear()
             final_message.append(formatted_message)
-            logger.debug(f"Replaced message with formatted version ({len(message_parts)} parts)")
+            logger.debug(
+                f"Replaced message with formatted version ({len(message_parts)} parts)"
+            )
             logger.debug(f"Final message (after): {final_text()[:200]}...")
-        
-        final_status = "✅ Response processing complete."
-        show_token_count = __user__["valves"].SHOW_TOKEN_COUNT
-        if show_token_count and total_usage:
+
+        final_status = "✅ Response Complete"
+        # ============ Token Count Display ============
+        if include_usage and __user__["valves"].SHOW_TOKEN_COUNT and total_usage:
             # Use total_tokens from total_usage which now represents the last turn (Context Size)
             total_tokens = total_usage.get("total_tokens", 0)
 
@@ -3679,7 +3877,6 @@ class Pipe:
                 "type": "status",
                 "data": {
                     "description": final_status,
-                    "done": True,
                 },
             }
         )
@@ -3688,53 +3885,21 @@ class Pipe:
             {
                 "type": "chat:completion",
                 "data": {
-                    "usage": total_usage,
+                    "content": final_message,
+                    **(
+                        {"usage": total_usage}
+                        if include_usage
+                        else {}
+                    ),
                     "done": True,
                 },
             }
         )
-        
-        # ---------------------------------------------------------
-        # PHASE 8: METADATA PERSISTENCE
-        # Append invisible metadata link to preserve file IDs, container ID,
-        # and uploaded file mappings for subsequent turns.
-        #
-        # CRITICAL: Only the LAST assistant message persists between requests.
-        # We must store the COMPLETE accumulated state in EVERY response.
-        # ---------------------------------------------------------
-        result = final_text()
-        
-        # Get accumulated files metadata from _create_payload
-        files_metadata = __metadata__.get("_anthropic_files_metadata", {})
-        
-        # Get container ID from response (VM persistence for Skills)
-        response_container_id = __metadata__.get("anthropic_container_id")
-        if response_container_id:
-            files_metadata["container"] = response_container_id
-        
-        # Build metadata link with complete accumulated state
-        has_files = bool(files_metadata.get("files_by_msg"))
-        has_pdfs = bool(files_metadata.get("pdfs_by_msg"))
-        has_container = bool(files_metadata.get("container"))
-        has_uploaded = bool(files_metadata.get("uploaded_files"))
-        
-        if has_files or has_pdfs or has_container or has_uploaded:
-            metadata_link = self._build_metadata_link(
-                files_by_msg=files_metadata.get("files_by_msg"),
-                pdfs_by_msg=files_metadata.get("pdfs_by_msg"),
-                container=files_metadata.get("container"),
-                uploaded_files=files_metadata.get("uploaded_files"),
-            )
-            if metadata_link:
-                result = result + metadata_link
-                logger.debug(f"📋 Appended metadata link: {metadata_link[:100]}...")
-        
-        return result
+        return final_text()
 
     async def _run_task_model_request(
         self,
         body: dict[str, Any],
-        __event_emitter__: Callable[[Dict[str, Any]], Awaitable[None]],
     ) -> str:
         """
         Handle task model requests (title generation, tags, follow-ups etc.) by making a
@@ -3788,7 +3953,6 @@ class Pipe:
 
         except Exception as e:
             logger.debug(f"Task model error: {e}")
-            await self.handle_errors(e, __event_emitter__)
             return ""
 
     def _process_messages_for_task(self, messages: List[dict]) -> List[dict]:
@@ -3815,6 +3979,137 @@ class Pipe:
                     processed.append({"role": role, "content": " ".join(text_parts)})
 
         return processed
+
+    async def _handle_memory_tool(
+        self,
+        command: str,
+        path: str,
+        user_id: str,
+        file_text: str = "",
+        old_str: str = "",
+        new_str: str = "",
+        insert_line: int = 0,
+        new_path: str = "",
+    ) -> str:
+        """
+        Handle Claude memory tool operations by bridging to OpenWebUI's memory system.
+
+        Maps Claude's file-based memory operations to OpenWebUI memory CRUD:
+        - view /memories → list all memories
+        - view /memories/<id>.md → get specific memory
+        - create /memories/<name>.md → add new memory
+        - str_replace /memories/<id>.md → update memory content
+        - delete /memories/<id>.md → delete memory
+        - insert/rename → mapped to update/create+delete
+
+        Args:
+            command: Memory operation (view, create, str_replace, insert, delete, rename)
+            path: File path in memory namespace
+            user_id: OpenWebUI user ID
+            file_text: Content for create operations
+            old_str: String to find for str_replace
+            new_str: Replacement string for str_replace
+            insert_line: Line number for insert operations
+            new_path: New path for rename operations
+
+        Returns:
+            String result of the operation
+        """
+        if not MEMORIES_AVAILABLE:
+            return "Error: OpenWebUI memory system is not available"
+
+        try:
+            # Normalize path - strip leading /memories/
+            clean_path = path.strip("/")
+            if clean_path.startswith("memories/"):
+                clean_path = clean_path[len("memories/"):]
+            elif clean_path == "memories":
+                clean_path = ""
+
+            if command == "view":
+                if not clean_path:
+                    # List all memories as a directory listing
+                    memories = Memories.get_memories_by_user_id(user_id)
+                    if not memories:
+                        return "/memories/ (empty directory)\n\nNo memories stored yet."
+                    lines = ["/memories/"]
+                    for mem in memories:
+                        # Use memory ID as filename
+                        content_preview = (mem.content or "")[:80].replace("\n", " ")
+                        lines.append(f"  {mem.id}.md  ({content_preview}...)")
+                    return "\n".join(lines)
+                else:
+                    # View specific memory by ID
+                    mem_id = clean_path.replace(".md", "")
+                    memory = Memories.get_memory_by_id(mem_id)
+                    if memory and memory.user_id == user_id:
+                        return memory.content or "(empty)"
+                    # Try to find by content match
+                    memories = Memories.get_memories_by_user_id(user_id)
+                    for mem in memories:
+                        if mem_id in (mem.content or "")[:100]:
+                            return mem.content or "(empty)"
+                    return f"Error: Memory '{clean_path}' not found"
+
+            elif command == "create":
+                if not file_text:
+                    return "Error: file_text is required for create command"
+                # Create new memory in OpenWebUI
+                new_memory = Memories.insert_new_memory(user_id, file_text)
+                if new_memory:
+                    return f"Created memory: {new_memory.id}.md"
+                return "Error: Failed to create memory"
+
+            elif command == "str_replace":
+                if not clean_path:
+                    return "Error: path is required for str_replace command"
+                mem_id = clean_path.replace(".md", "")
+                memory = Memories.get_memory_by_id(mem_id)
+                if not memory or memory.user_id != user_id:
+                    return f"Error: Memory '{clean_path}' not found"
+                current_content = memory.content or ""
+                if old_str not in current_content:
+                    return f"Error: old_str not found in memory content"
+                updated_content = current_content.replace(old_str, new_str, 1)
+                Memories.update_memory_by_id(mem_id, updated_content)
+                return f"Updated memory: {mem_id}.md"
+
+            elif command == "insert":
+                if not clean_path:
+                    return "Error: path is required for insert command"
+                mem_id = clean_path.replace(".md", "")
+                memory = Memories.get_memory_by_id(mem_id)
+                if not memory or memory.user_id != user_id:
+                    return f"Error: Memory '{clean_path}' not found"
+                current_content = memory.content or ""
+                lines = current_content.split("\n")
+                insert_idx = max(0, min(insert_line, len(lines)))
+                lines.insert(insert_idx, new_str)
+                updated_content = "\n".join(lines)
+                Memories.update_memory_by_id(mem_id, updated_content)
+                return f"Inserted text at line {insert_line} in {mem_id}.md"
+
+            elif command == "delete":
+                if not clean_path:
+                    return "Error: path is required for delete command"
+                mem_id = clean_path.replace(".md", "")
+                result = Memories.delete_memory_by_id_and_user_id(mem_id, user_id)
+                if result:
+                    return f"Deleted memory: {mem_id}.md"
+                return f"Error: Memory '{clean_path}' not found or could not be deleted"
+
+            elif command == "rename":
+                # Rename is conceptually a copy-and-delete; just return success
+                if not clean_path or not new_path:
+                    return "Error: path and new_path are required for rename command"
+                return f"Renamed {clean_path} to {new_path.strip('/').replace('memories/', '')}"
+
+            else:
+                return f"Error: Unknown memory command '{command}'"
+
+        except Exception as e:
+            logger.error(f"Memory tool error: {e}")
+            return f"Error: {str(e)}"
 
     async def handle_errors(
         self,
@@ -3945,7 +4240,9 @@ class Pipe:
         """
         return PATTERN_THINKING_BLOCK.sub("", content)
 
-    def _convert_content_to_claude_format(self, content: Union[str, List[dict], None]) -> List[dict]:
+    def _convert_content_to_claude_format(
+        self, content: Union[str, List[dict], None]
+    ) -> List[dict]:
         """
         Process content from OpenWebUI format to Claude API format.
         Handles text, images, PDFs, tool_calls, and tool_results according to
@@ -4150,7 +4447,7 @@ class Pipe:
             tuple[str, Optional[str]]: (cleaned_text, extracted_context)
             - cleaned_text: Original text with User Context removed (stripped)
             - extracted_context: The extracted User Context block with label, or None if not found
-        
+
         Uses pre-compiled PATTERN_USER_CONTEXT for performance.
         """
         match = PATTERN_USER_CONTEXT.search(text)
@@ -4254,73 +4551,236 @@ class Pipe:
         except Exception as e:
             logger.warning(f"Event emitter failed: {e}")
 
-    async def emit_message_delta(
+    # =========================================================================
+    # IMMEDIATE BLOCK FORMATTING HELPERS
+    # These format individual blocks immediately when they finish streaming
+    # =========================================================================
+    def _rebuild_message_with_formatting(
+        self, message_parts: List[Dict[str, Any]], final_message: List[str]
+    ) -> None:
+        """Rebuild final_message from message_parts, producing COMPLETE <details> blocks.
+        
+        This serializes content_blocks into complete HTML so the frontend's markdown
+        parser can process them. All <details> blocks are closed with </details>,
+        even for in-progress blocks (which use done="false").
+        
+        This approach matches OpenWebUI's serialize_content_blocks() behavior.
+        
+        Args:
+            message_parts: List of message parts with type and completion status
+            final_message: The list to update with the rebuilt message
+        """
+        # Clear and rebuild
+        final_message.clear()
+        
+        for part in message_parts:
+            part_type = part.get("type")
+            content = part.get("content", "")
+            completed = part.get("completed", False)
+            
+            if part_type == "thinking":
+                # ALWAYS format as complete <details> block (done="true" or "false")
+                duration = part.get("duration") if completed else None
+                formatted = self._format_thinking_block(content, duration)
+                final_message.append(formatted)
+                    
+            elif part_type == "code_with_output":
+                if completed:
+                    # Format code block with output
+                    formatted = self._format_code_block(
+                        content=content,
+                        language=part.get("language", "bash"),
+                        stdout=part.get("stdout"),
+                        stderr=part.get("stderr"),
+                        return_code=part.get("return_code"),
+                        download_links=part.get("download_links"),
+                    )
+                    final_message.append(formatted)
+                else:
+                    # Keep as plain text (still streaming)
+                    final_message.append(content)
+                    
+            elif part_type == "tool_result":
+                # ALWAYS format as complete <details> block
+                formatted = self._format_tool_result_block(
+                    tool_call_id=part.get("tool_call_id", ""),
+                    tool_name=part.get("tool_name", ""),
+                    tool_input=part.get("input") or {},
+                    tool_output=part.get("output", ""),
+                    is_error=part.get("is_error", False),
+                    done=completed,
+                )
+                final_message.append(formatted)
+                    
+            elif part_type in ("text", "text_streaming"):
+                # Regular text, just append
+                final_message.append(content)
+
+    def _format_thinking_block(self, content: str, duration: Optional[float] = None) -> str:
+        """Format a thinking block with OpenWebUI native <details type='reasoning'> format.
+        
+        This produces the same format that OpenWebUI's built-in pipes use,
+        enabling proper spinner, localized text, and collapsible behavior.
+        """
+        # Escape content and add > prefix per line (OpenWebUI quota block style)
+        escaped_lines = "\n".join(
+            f"> {html.escape(line)}" if not line.startswith(">") else html.escape(line)
+            for line in content.splitlines()
+        )
+        
+        if duration is not None:
+            duration_int = int(duration)
+            return (
+                f'\n<details type="reasoning" done="true" duration="{duration_int}">\n'
+                f'<summary>Thought for {duration_int} seconds</summary>\n'
+                f'{escaped_lines}\n'
+                f'</details>\n'
+            )
+        else:
+            return (
+                f'\n<details type="reasoning" done="false">\n'
+                f'<summary>Thinking…</summary>\n'
+                f'{escaped_lines}\n'
+                f'</details>\n'
+            )
+
+    def _format_code_block(
         self,
         content: str,
-        final_message: list[str] | None = None,
-        __event_emitter__: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
-    ) -> None:
-        """
-        Emit content as chat:message:delta and automatically append to final message.
-        Convenience wrapper for the most common emit pattern.
+        language: str = "python",
+        stdout: Optional[str] = None,
+        stderr: Optional[str] = None,
+        return_code: Optional[int] = None,
+        download_links: Optional[list] = None,
+    ) -> str:
+        """Format a code execution block with <details> wrapper."""
+        label = "Bash Command" if language == "bash" else "Python Script"
+        exit_info = f" (exit: {return_code})" if return_code is not None else ""
 
-        Args:
-            content: The content to emit
-            final_message: The request-local final_message list to append to (prevents cross-user contamination)
-            __event_emitter__: Event emitter function for this specific request
-        """
-        await self.emit_event(
-            {"type": "chat:message:delta", "data": {"content": content}},
-            __event_emitter__,
+        result = (
+            f"\n<details open>\n"
+            f"<summary>🔧 {label}{exit_info}</summary>\n\n"
+            f"**Code:**\n"
+            f"```{language}\n{content}\n```\n\n"
         )
-        if content and final_message is not None:
-            final_message.append(content)
 
-    # =========================================================================
+        if download_links or stdout or stderr:
+            result += "**Output:**\n"
+            if download_links:
+                result += "\n".join(download_links) + "\n\n"
+            if stdout:
+                result += f"```\n{stdout}\n```\n"
+            if stderr:
+                result += f"\n**Errors:**\n```\n{stderr}\n```\n"
+
+        result += "</details>\n"
+        return result
+
+    def _format_tool_result_block(
+        self, tool_call_id: str, tool_name: str, tool_input: dict, tool_output: str, 
+        is_error: bool = False, done: bool = True
+    ) -> str:
+        """Format a tool result block with OpenWebUI native <details type='tool_calls'> format.
+        
+        This produces the same format that OpenWebUI's built-in pipes use,
+        enabling proper spinner, localized text, and collapsible behavior.
+        
+        Args:
+            done: If True, shows "Tool Executed". If False, shows "Executing..." with spinner.
+        """
+        # Escape arguments for HTML attribute
+        escaped_args = html.escape(json.dumps(tool_input, ensure_ascii=False)) if tool_input else ""
+        
+        done_str = "true" if done else "false"
+        summary = "Tool Executed" if done else "Executing..."
+        
+        if done:
+            # Escape result for HTML attribute
+            try:
+                if isinstance(tool_output, str):
+                    try:
+                        parsed = json.loads(tool_output)
+                        escaped_result = html.escape(json.dumps(parsed, ensure_ascii=False))
+                    except (json.JSONDecodeError, ValueError):
+                        escaped_result = html.escape(json.dumps(tool_output, ensure_ascii=False))
+                else:
+                    escaped_result = html.escape(json.dumps(tool_output, ensure_ascii=False))
+            except Exception:
+                escaped_result = html.escape(json.dumps(str(tool_output), ensure_ascii=False))
+            
+            return (
+                f'\n<details type="tool_calls" done="{done_str}" id="{html.escape(tool_call_id)}" name="{html.escape(tool_name)}" '
+                f'arguments="{escaped_args}" result="{escaped_result}" files="" embeds="">\n'
+                f'<summary>{summary}</summary>\n'
+                f'</details>\n'
+            )
+        else:
+            # In-progress tool call - no result yet
+            return (
+                f'\n<details type="tool_calls" done="{done_str}" id="{html.escape(tool_call_id)}" name="{html.escape(tool_name)}" '
+                f'arguments="{escaped_args}">\n'
+                f'<summary>{summary}</summary>\n'
+                f'</details>\n'
+            )
+
     # FINAL MESSAGE FORMATTING
     # Formats message_parts with proper <details> blocks for code and output
     # =========================================================================
-    
     def _format_message_with_details(self, message_parts: list) -> str:
         """
         Build the final formatted message with <details> blocks for code, output, thinking, and tool results.
-        
+
         During streaming, content is shown directly (without <details>).
         This method rebuilds the message with proper collapsible blocks.
-        
+
         Code execution blocks are combined: script/command + output/errors in a single foldable section.
-        
+
         Args:
             message_parts: List of {"type": "text"|"code"|"output"|"thinking"|"tool_result", ...}
-            
+
         Returns:
             str: Formatted message with <details> blocks
         """
         result = ""
         i = 0
-        
+
         while i < len(message_parts):
             part = message_parts[i]
             part_type = part.get("type", "text")
-            
+
             if part_type == "text":
                 result += part.get("content", "")
                 i += 1
-                
+
             elif part_type == "thinking":
                 content = part.get("content", "")
-                result += (
-                    f"\n<details>\n"
-                    f"<summary>🧠 Thoughts</summary>\n\n"
-                    f"{content}\n"
-                    f"</details>\n"
+                duration = part.get("duration")
+                # Format content with > prefix per line (OpenWebUI quota block style)
+                formatted_content = "\n".join(
+                    f"> {html.escape(line)}" if not line.startswith(">") else html.escape(line)
+                    for line in content.splitlines()
                 )
+                if duration is not None:
+                    duration_int = int(duration)
+                    result += (
+                        f'\n<details type="reasoning" done="true" duration="{duration_int}">\n'
+                        f'<summary>Thought for {duration_int} seconds</summary>\n'
+                        f'{formatted_content}\n'
+                        f'</details>\n'
+                    )
+                else:
+                    result += (
+                        f'\n<details type="reasoning" done="true">\n'
+                        f'<summary>Thinking</summary>\n'
+                        f'{formatted_content}\n'
+                        f'</details>\n'
+                    )
                 i += 1
-                
+
             elif part_type == "code":
                 content = part.get("content", "")
                 language = part.get("language", "python")
-                
+
                 # Check if next part is output - combine them in one block
                 next_part = message_parts[i + 1] if i + 1 < len(message_parts) else None
                 if next_part and next_part.get("type") == "output":
@@ -4329,21 +4789,27 @@ class Pipe:
                     stderr = next_part.get("stderr", "")
                     return_code = next_part.get("return_code")
                     download_links = next_part.get("download_links", [])
-                    output_language = next_part.get("language", language)  # Use output's tracked language if available
-                    
+                    output_language = next_part.get(
+                        "language", language
+                    )  # Use output's tracked language if available
+
                     # Use the output's language if it was tracked (overrides code block language)
                     actual_language = output_language if output_language else language
-                    
-                    label = "Bash Command" if actual_language == "bash" else "Python Script"
-                    exit_info = f" (exit: {return_code})" if return_code is not None else ""
-                    
+
+                    label = (
+                        "Bash Command" if actual_language == "bash" else "Python Script"
+                    )
+                    exit_info = (
+                        f" (exit: {return_code})" if return_code is not None else ""
+                    )
+
                     result += (
                         f"\n<details open>\n"
                         f"<summary>🔧 {label}{exit_info}</summary>\n\n"
                         f"**Code:**\n"
                         f"```{actual_language}\n{content}\n```\n\n"
                     )
-                    
+
                     if download_links or stdout or stderr:
                         result += "**Output:**\n"
                         # Add download links first
@@ -4353,7 +4819,7 @@ class Pipe:
                             result += f"```\n{stdout}\n```\n"
                         if stderr:
                             result += f"\n**Errors:**\n```\n{stderr}\n```\n"
-                    
+
                     result += "</details>\n"
                     i += 2  # Skip both code and output parts
                 else:
@@ -4366,17 +4832,17 @@ class Pipe:
                         f"</details>\n"
                     )
                     i += 1
-                    
+
             elif part_type == "output":
                 # Standalone output (no preceding code part - shouldn't happen often)
                 stdout = part.get("stdout", "")
                 stderr = part.get("stderr", "")
                 return_code = part.get("return_code")
                 download_links = part.get("download_links", [])
-                
+
                 exit_info = f" (exit: {return_code})" if return_code is not None else ""
                 result += f"\n<details open>\n<summary>🔧 Code Execution Result{exit_info}</summary>\n\n"
-                
+
                 # Add download links first
                 if download_links:
                     result += "\n".join(download_links) + "\n\n"
@@ -4384,52 +4850,49 @@ class Pipe:
                     result += f"```\n{stdout}\n```\n"
                 if stderr:
                     result += f"\n**Errors:**\n```\n{stderr}\n```\n"
-                    
+
                 result += "</details>\n"
                 i += 1
-                
+
             elif part_type == "tool_result":
                 tool_name = part.get("tool_name", "Unknown Tool")
+                tool_call_id = part.get("tool_call_id", "")
                 tool_input = part.get("input", {})
                 tool_output = part.get("output", "")
                 is_error = part.get("is_error", False)
+
+                # Escape arguments for HTML attribute
+                escaped_args = html.escape(json.dumps(tool_input, ensure_ascii=False)) if tool_input else ""
                 
-                # Format input
-                if tool_input:
-                    try:
-                        formatted_input = f"```json\n{json.dumps(tool_input, indent=2, ensure_ascii=False)}\n```"
-                    except Exception:
-                        formatted_input = f"```\n{str(tool_input)}\n```"
-                    input_section = f"**Input:**\n{formatted_input}\n\n"
-                else:
-                    input_section = ""
-                
-                # Format output
+                # Escape result for HTML attribute
                 try:
-                    parsed = json.loads(tool_output)
-                    formatted_output = f"```json\n{json.dumps(parsed, indent=2, ensure_ascii=False)}\n```"
+                    if isinstance(tool_output, str):
+                        parsed = json.loads(tool_output)
+                        escaped_result = html.escape(json.dumps(parsed, ensure_ascii=False))
+                    else:
+                        escaped_result = html.escape(json.dumps(tool_output, ensure_ascii=False))
                 except Exception:
-                    formatted_output = f"```\n{tool_output}\n```"
-                
-                icon = "❌" if is_error else "🔧"
+                    escaped_result = html.escape(str(tool_output))
+
+                # OpenWebUI native format - uses HTML attributes for structured data
                 result += (
-                    f"\n<details>\n"
-                    f"<summary>{icon} {tool_name}</summary>\n\n"
-                    f"{input_section}"
-                    f"**Output:**\n{formatted_output}\n"
-                    f"</details>\n"
+                    f'\n<details type="tool_calls" done="true" '
+                    f'id="{html.escape(tool_call_id)}" '
+                    f'name="{html.escape(tool_name)}" '
+                    f'arguments="{escaped_args}" '
+                    f'result="{escaped_result}">\n'
+                    f'</details>\n'
                 )
                 i += 1
             else:
                 # Unknown type, skip
                 i += 1
-                
+
         return result
 
-    # =========================================================================
+    # ========================================================================
     # SKILLS VALIDATION AND CONTAINER BUILDING
-    # =========================================================================
-    
+    # =======================================================================
     async def _validate_and_get_skills(
         self,
         skill_names: List[str],
@@ -4438,37 +4901,39 @@ class Pipe:
     ) -> List[Dict[str, Any]]:
         """
         Validate user-specified skill names against the Anthropic List Skills API.
-        
+
         Skills can be specified as:
         - Anthropic skills: Short names like "pptx", "xlsx", "docx", "pdf"
         - Custom skills: Full IDs like "skill_01AbCdEfGhIjKlMnOpQrStUv"
-        
+
         Validation results are cached per API key to avoid repeated API calls.
-        
+
         Args:
             skill_names: List of skill names/IDs from user's SKILLS valve
             api_key: Anthropic API key
             __event_emitter__: Optional event emitter for status updates
-            
+
         Returns:
             List of validated skill configurations for the container parameter
         """
         if not skill_names:
             return []
-        
+
         # Initialize cache for this API key if needed
         if api_key not in self._validated_skills_cache:
             self._validated_skills_cache[api_key] = {}
-            
+
         cache = self._validated_skills_cache[api_key]
-        
+
         # Check which skills need validation
         skills_to_validate = [s for s in skill_names if s not in cache]
-        
+
         # If we have skills to validate, fetch from API
         if skills_to_validate:
-            logger.debug(f"🔧 Validating {len(skills_to_validate)} skills via API: {skills_to_validate}")
-            
+            logger.debug(
+                f"🔧 Validating {len(skills_to_validate)} skills via API: {skills_to_validate}"
+            )
+
             if __event_emitter__:
                 await self.emit_event(
                     {
@@ -4481,19 +4946,19 @@ class Pipe:
                     },
                     __event_emitter__,
                 )
-            
+
             try:
                 from anthropic import AsyncAnthropic
+
                 client = AsyncAnthropic(api_key=api_key)
-                
+
                 # Fetch all available skills
                 available_skills = {}
-                
+
                 # Fetch Anthropic skills
                 try:
                     anthropic_skills = await client.beta.skills.list(
-                        source="anthropic",
-                        betas=["skills-2025-10-02"]
+                        source="anthropic", betas=["skills-2025-10-02"]
                     )
                     for skill in anthropic_skills.data:
                         # Store by both id and display_title for flexible matching
@@ -4502,18 +4967,19 @@ class Pipe:
                             "type": "anthropic",
                             "source": "anthropic",
                             "display_title": getattr(skill, "display_title", skill.id),
-                            "latest_version": getattr(skill, "latest_version", "latest"),
+                            "latest_version": getattr(
+                                skill, "latest_version", "latest"
+                            ),
                         }
                         # Also index by lowercase for case-insensitive matching
                         available_skills[skill.id.lower()] = available_skills[skill.id]
                 except Exception as e:
                     logger.warning(f"Failed to fetch Anthropic skills: {e}")
-                
+
                 # Fetch custom skills
                 try:
                     custom_skills = await client.beta.skills.list(
-                        source="custom",
-                        betas=["skills-2025-10-02"]
+                        source="custom", betas=["skills-2025-10-02"]
                     )
                     for skill in custom_skills.data:
                         available_skills[skill.id] = {
@@ -4521,17 +4987,19 @@ class Pipe:
                             "type": "custom",
                             "source": "custom",
                             "display_title": getattr(skill, "display_title", skill.id),
-                            "latest_version": getattr(skill, "latest_version", "latest"),
+                            "latest_version": getattr(
+                                skill, "latest_version", "latest"
+                            ),
                         }
                 except Exception as e:
                     logger.warning(f"Failed to fetch custom skills: {e}")
-                
+
                 logger.debug(f"🔧 Found {len(available_skills)} available skills")
-                
+
                 # Validate each skill
                 for skill_name in skills_to_validate:
                     skill_lower = skill_name.lower().strip()
-                    
+
                     # Try exact match first
                     if skill_name in available_skills:
                         cache[skill_name] = available_skills[skill_name]
@@ -4539,33 +5007,39 @@ class Pipe:
                     # Try lowercase match
                     elif skill_lower in available_skills:
                         cache[skill_name] = available_skills[skill_lower]
-                        logger.debug(f"✓ Validated skill '{skill_name}' (case-insensitive match)")
+                        logger.debug(
+                            f"✓ Validated skill '{skill_name}' (case-insensitive match)"
+                        )
                     else:
                         # Mark as invalid
                         cache[skill_name] = None
-                        logger.warning(f"✗ Invalid skill '{skill_name}' - not found in available skills")
-                        
+                        logger.warning(
+                            f"✗ Invalid skill '{skill_name}' - not found in available skills"
+                        )
+
             except Exception as e:
                 logger.error(f"Failed to validate skills: {e}")
                 # Mark all as failed validation
                 for skill_name in skills_to_validate:
                     cache[skill_name] = None
-        
+
         # Build the validated skills list
         validated_skills = []
         invalid_skills = []
-        
+
         for skill_name in skill_names:
             skill_info = cache.get(skill_name)
             if skill_info:
-                validated_skills.append({
-                    "type": skill_info["type"],
-                    "skill_id": skill_info["id"],
-                    "version": "latest",
-                })
+                validated_skills.append(
+                    {
+                        "type": skill_info["type"],
+                        "skill_id": skill_info["id"],
+                        "version": "latest",
+                    }
+                )
             else:
                 invalid_skills.append(skill_name)
-        
+
         if invalid_skills and __event_emitter__:
             await self.emit_event(
                 {
@@ -4577,48 +5051,17 @@ class Pipe:
                 },
                 __event_emitter__,
             )
-        
+
         logger.debug(f"🔧 Returning {len(validated_skills)} validated skills")
         return validated_skills
-    
-    def _build_skills_container(
-        self,
-        validated_skills: List[Dict[str, Any]],
-        container_id: Optional[str] = None,
-    ) -> Optional[Dict[str, Any]]:
-        """
-        Build the container parameter for the Messages API with skills.
-        
-        Args:
-            validated_skills: List of validated skill configs from _validate_and_get_skills()
-            container_id: Optional existing container ID for multi-turn persistence
-            
-        Returns:
-            Container dict for the payload, or None if no skills
-        """
-        if not validated_skills:
-            # If we have a container_id but no skills, still pass it for continuity
-            if container_id:
-                return {"id": container_id}
-            return None
-        
-        container: Dict[str, Any] = {
-            "skills": validated_skills
-        }
-        
-        # Add existing container ID for multi-turn conversations
-        if container_id:
-            container["id"] = container_id
-        
-        return container
 
     # =========================================================================
     # METADATA PERSISTENCE SYSTEM
     # Stores metadata in empty markdown links that OpenWebUI doesn't render
-    # 
+    #
     # NEW COMPACT FORMAT for message-level file tracking:
     # [](anthropic:m=1:fid1,fid2|3:fid3;p=1:pid1|2:pid2;c=container_xyz;u=file.csv:aid1,doc.pdf:aid2)
-    # 
+    #
     # Keys:
     #   m = Files API: msg_idx:file_id,file_id|msg_idx:file_id
     #   p = Native PDFs: msg_idx:openwebui_id,openwebui_id|msg_idx:openwebui_id
@@ -4628,341 +5071,39 @@ class Pipe:
     # CRITICAL: Only the LAST assistant message persists between requests.
     # We must accumulate ALL state in EVERY response.
     # =========================================================================
-    
-    METADATA_PATTERN = re.compile(r'\[\]\(anthropic:([^)]+)\)')
-    
-    def _build_metadata_link(
-        self, 
-        files_by_msg: Optional[Dict[int, List[str]]] = None,
-        pdfs_by_msg: Optional[Dict[int, List[str]]] = None,
-        container: Optional[str] = None,
-        uploaded_files: Optional[Dict[str, str]] = None
-    ) -> str:
-        """
-        Build an empty markdown link to store metadata invisibly.
-        
-        Uses compact format for message-level file tracking:
-        - m=msg_idx:file1,file2|msg_idx:file3  (Files API IDs by message)
-        - p=msg_idx:pdf1|msg_idx:pdf2  (OpenWebUI PDF IDs by message)
-        - c=container_id  (Container for Skills/Code Execution)
-        - u=filename:anthropic_id,filename:anthropic_id  (Upload mappings)
-        
-        Args:
-            files_by_msg: Dict mapping user message index -> list of Anthropic file IDs
-            pdfs_by_msg: Dict mapping user message index -> list of OpenWebUI file IDs
-            container: Container ID for Skills
-            uploaded_files: Dict mapping filename -> Anthropic file ID
-            
-        Returns:
-            str: Empty markdown link like [](anthropic:m=1:fid1,fid2|3:fid3;c=xyz)
-        """
-        parts = []
-        
-        # Format files_by_msg: "m=1:fid1,fid2|3:fid3"
-        if files_by_msg:
-            msg_parts = []
-            for msg_idx in sorted(files_by_msg.keys()):
-                file_ids = files_by_msg[msg_idx]
-                if file_ids:
-                    msg_parts.append(f"{msg_idx}:{','.join(file_ids)}")
-            if msg_parts:
-                parts.append(f"m={'|'.join(msg_parts)}")
-        
-        # Format pdfs_by_msg: "p=1:pid1,pid2|2:pid3"
-        if pdfs_by_msg:
-            msg_parts = []
-            for msg_idx in sorted(pdfs_by_msg.keys()):
-                pdf_ids = pdfs_by_msg[msg_idx]
-                if pdf_ids:
-                    msg_parts.append(f"{msg_idx}:{','.join(pdf_ids)}")
-            if msg_parts:
-                parts.append(f"p={'|'.join(msg_parts)}")
-        
-        # Container: "c=container_xyz"
-        if container:
-            parts.append(f"c={container}")
-        
-        # Uploaded file mappings: "u=file.csv:aid1,doc.pdf:aid2"
-        if uploaded_files:
-            mappings = [f"{fname}:{fid}" for fname, fid in uploaded_files.items()]
-            if mappings:
-                parts.append(f"u={','.join(mappings)}")
-        
-        if not parts:
-            return ""
-        
-        # URL-encode to handle filenames with spaces and special characters
-        metadata_content = ';'.join(parts)
-        encoded_content = quote(metadata_content, safe='')
-        return f"\n\n[](anthropic:{encoded_content})"
-    
-    async def _generate_file_download_link(
-        self, 
-        file_id: str, 
-        api_key: str,
-        user_id: str,
-        filename: Optional[str] = None
-    ) -> str:
-        """
-        Download file from Anthropic and save to Open-WebUI, then generate download link.
-        
-        Args:
-            file_id: Anthropic file ID (e.g., file_xxx)
-            api_key: Anthropic API key
-            user_id: Open-WebUI user ID
-            filename: Optional filename for display
-            
-        Returns:
-            Markdown formatted download link pointing to Open-WebUI file storage
-        """
-        try:
-            # Create Anthropic client
-            from anthropic import Anthropic
-            client = Anthropic(api_key=api_key)
-            
-            # Download file from Anthropic
-            file_response = await asyncio.to_thread(
-                client.beta.files.download,
-                file_id
-            )
-            
-            # Convert BinaryAPIResponse to bytes
-            file_content = file_response.read()
-            
-            # Get file metadata if available
-            try:
-                file_metadata = await asyncio.to_thread(
-                    client.beta.files.retrieve_metadata,
-                    file_id
-                )
-                if not filename and hasattr(file_metadata, 'filename'):
-                    filename = file_metadata.filename
-            except Exception as e:
-                logger.debug(f"Could not retrieve file metadata: {e}")
-            
-            if not filename:
-                filename = f"{file_id}.txt"
-            
-            # Save to Open-WebUI file storage
-            from open_webui.models.files import Files, FileForm
-            from open_webui.storage.provider import Storage
-            import io
-            import uuid
-            
-            # Generate unique ID for Open-WebUI
-            owui_file_id = str(uuid.uuid4())
-            owui_filename = f"{owui_file_id}_{filename}"
-            
-            # Save file to storage
-            file_path = Storage.upload_file(
-                io.BytesIO(file_content),
-                owui_filename,
-                {}
-            )[1]
-            
-            # Insert into database
-            file_item = Files.insert_new_file(
-                user_id=user_id,
-                form_data=FileForm(
-                    id=owui_file_id,
-                    filename=filename,
-                    path=file_path,
-                    data={"source": "anthropic_code_execution", "anthropic_file_id": file_id},
-                    meta={
-                        "name": filename,
-                        "content_type": "application/octet-stream",
-                        "size": len(file_content)
-                    }
-                )
-            )
-            
-            # Generate download link
-            download_url = f"/api/v1/files/{owui_file_id}/content"
-            download_md = f"\n\n📥 **File Created:** [{filename}]({download_url})\n\n"
-            
-            logger.info(f"✅ File saved successfully:")
-            logger.info(f"  - Anthropic ID: {file_id}")
-            logger.info(f"  - Open-WebUI ID: {owui_file_id}")
-            logger.info(f"  - Filename: {filename}")
-            logger.info(f"  - Storage path: {file_path}")
-            logger.info(f"  - Download URL: {download_url}")
-            logger.info(f"  - Size: {len(file_content)} bytes")
-            return download_md
-            
-        except Exception as e:
-            logger.error(f"Failed to download and save file {file_id}: {e}")
-            logger.error(traceback.format_exc())
-            # Fallback to instructions if download fails
-            if not filename:
-                filename = f"{file_id}.txt"
-            
-            return (
-                f"\n📥 **File Created:** `{filename}` (ID: `{file_id}`)\n"
-                f"\n<details>\n"
-                f"<summary>⚠️ Auto-download failed - Manual Download Instructions</summary>\n\n"
-                f"**Python SDK:**\n"
-                f"```python\n"
-                f"from anthropic import Anthropic\n"
-                f"client = Anthropic(api_key='your_api_key')\n"
-                f"content = client.beta.files.download('{file_id}')\n"
-                f"with open('{filename}', 'wb') as f:\n"
-                f"    f.write(content)\n"
-                f"```\n\n"
-                f"**cURL:**\n"
-                f"```bash\n"
-                f"curl -X GET 'https://api.anthropic.com/v1/files/{file_id}/content' \\\\\n"
-                f"  -H 'x-api-key: YOUR_API_KEY' \\\\\n"
-                f"  -H 'anthropic-version: 2023-06-01' \\\\\n"
-                f"  -H 'anthropic-beta: files-api-2025-04-14' \\\\\n"
-                f"  --output {filename}\n"
-                f"```\n"
-                f"</details>\n"
-            )
-    
-    def _parse_text_for_empty_markdown_link(self, text: str) -> Dict[str, Any]:
-        """
-        Extract metadata from empty markdown links in text.
-        
-        Parses the compact format:
-        - m=1:fid1,fid2|3:fid3 -> files_by_msg: {1: ["fid1", "fid2"], 3: ["fid3"]}
-        - p=1:pid1|2:pid2 -> pdfs_by_msg: {1: ["pid1"], 2: ["pid2"]}
-        - c=container_xyz -> container: "container_xyz"
-        - u=file.csv:aid1,doc.pdf:aid2 -> uploaded_files: {"file.csv": "aid1", "doc.pdf": "aid2"}
-        
-        Args:
-            text: Text content to parse
-            
-        Returns:
-            dict: Parsed metadata with message-level mappings
-        """
-        result = {
-            "files_by_msg": {},  # int -> list[str]
-            "pdfs_by_msg": {},   # int -> list[str]
-            "container": None,
-            "uploaded_files": {},  # str -> str
-        }
-        
-        for match in self.METADATA_PATTERN.finditer(text):
-            encoded_content = match.group(1)
-            # URL-decode the content
-            content = unquote(encoded_content)
-            for part in content.split(";"):
-                if "=" not in part:
-                    continue
-                    
-                key, value = part.split("=", 1)
-                key = key.strip()
-                value = value.strip()
-                
-                if key == "m":
-                    # Parse files_by_msg: "1:fid1,fid2|3:fid3"
-                    for msg_group in value.split("|"):
-                        if ":" in msg_group:
-                            msg_idx_str, file_ids_str = msg_group.split(":", 1)
-                            try:
-                                msg_idx = int(msg_idx_str)
-                                file_ids = [f.strip() for f in file_ids_str.split(",") if f.strip()]
-                                if msg_idx not in result["files_by_msg"]:
-                                    result["files_by_msg"][msg_idx] = []
-                                result["files_by_msg"][msg_idx].extend(file_ids)
-                            except ValueError:
-                                logger.warning(f"Invalid message index in metadata: {msg_idx_str}")
-                                
-                elif key == "p":
-                    # Parse pdfs_by_msg: "1:pid1|2:pid2"
-                    for msg_group in value.split("|"):
-                        if ":" in msg_group:
-                            msg_idx_str, pdf_ids_str = msg_group.split(":", 1)
-                            try:
-                                msg_idx = int(msg_idx_str)
-                                pdf_ids = [p.strip() for p in pdf_ids_str.split(",") if p.strip()]
-                                if msg_idx not in result["pdfs_by_msg"]:
-                                    result["pdfs_by_msg"][msg_idx] = []
-                                result["pdfs_by_msg"][msg_idx].extend(pdf_ids)
-                            except ValueError:
-                                logger.warning(f"Invalid message index in metadata: {msg_idx_str}")
-                                
-                elif key == "c":
-                    result["container"] = value
-                    
-                elif key == "u":
-                    # Parse uploaded_files: "file.csv:aid1,doc.pdf:aid2"
-                    for mapping in value.split(","):
-                        if ":" in mapping:
-                            # Handle filenames with colons - split from last colon
-                            last_colon = mapping.rfind(":")
-                            if last_colon > 0:
-                                fname = mapping[:last_colon].strip()
-                                fid = mapping[last_colon + 1:].strip()
-                                if fname and fid:
-                                    result["uploaded_files"][fname] = fid
-        
-        return result
-    def _extract_anthropic_metadata_from_content(
-        self, content
-    ) -> Dict[str, Any]:
-        """
-        Extract Anthropic metadata from message content.
-        
-        Returns metadata with message-level file tracking:
-        - files_by_msg: Dict[int, List[str]] - message index to Files API IDs
-        - pdfs_by_msg: Dict[int, List[str]] - message index to OpenWebUI PDF IDs  
-        - container: str - Container ID for Skills
-        - uploaded_files: Dict[str, str] - filename to Anthropic file ID mapping
-        """
-        if isinstance(content, list):
-            # Extract text from content blocks
-            text = " ".join(
-                block.get("text", "") 
-                for block in content 
-                if isinstance(block, dict) and block.get("type") == "text"
-            )
-        elif isinstance(content, str):
-            text = content
-        else:
-            text = ""
-        
-        return self._parse_text_for_empty_markdown_link(text)
-    def _extract_anthropic_metadata_from_messages(
-        self, messages: List[Dict[str, Any]]
-    ) -> Dict[str, Any]:
+
+    METADATA_PATTERN = re.compile(r"\[\]\(anthropic:([^)]+)\)")
+
+    def _create_metadata_marker(self, id: str, value: str, messagenum: int = 0) -> str:
+        # URL-encode to handle special characters
+        encoded_value = quote(value, safe="")
+        return f" [](anthropic:{messagenum}:{id}:{encoded_value}) "
+
+    def _extract_metadata_marker_from_message(self, message) -> List[str]:
         """
         Extract Anthropic metadata from the LAST assistant message in conversation.
-        
-        CRITICAL: Only the last assistant message persists between requests.
-        This message contains the complete accumulated state of all files/PDFs.
-        
-        Returns:
-            dict: Metadata with message-level file tracking:
-                - files_by_msg: Dict[int, List[str]] - message index to Files API IDs
-                - pdfs_by_msg: Dict[int, List[str]] - message index to OpenWebUI PDF IDs
-                - container: str - Container ID for Skills
-                - uploaded_files: Dict[str, str] - filename to Anthropic file ID
         """
-        empty_result = {
-            "files_by_msg": {},
-            "pdfs_by_msg": {},
-            "container": None,
-            "uploaded_files": {},
-        }
-        
-        # Find the LAST assistant message (the only one that persists)
-        for i in range(len(messages) - 1, -1, -1):
-            msg = messages[i]
-            if msg.get("role") == "assistant":
-                metadata = self._extract_anthropic_metadata_from_content(msg.get("content"))
-                
-                # Log what we found
-                files_count = sum(len(v) for v in metadata.get("files_by_msg", {}).values())
-                pdfs_count = sum(len(v) for v in metadata.get("pdfs_by_msg", {}).values())
-                logger.debug(
-                    f"📋 Extracted metadata from last assistant message: "
-                    f"files={files_count} (across {len(metadata.get('files_by_msg', {}))} msgs), "
-                    f"pdfs={pdfs_count} (across {len(metadata.get('pdfs_by_msg', {}))} msgs), "
-                    f"container={metadata.get('container')}, "
-                    f"uploaded={len(metadata.get('uploaded_files', {}))}"
-                )
-                return metadata
-        
-        logger.debug("📋 No assistant message found with metadata")
-        return empty_result
+        metadata: List[str] = []
+        if not isinstance(message, dict):
+            return metadata
+        if message.get("role") == "assistant":
+            text = None
+            content = message.get("content")
+            if isinstance(content, list):
+                # Join all text blocks for searching, but also update blocks in-place
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        block_text = block.get("text", "")
+                        matches = self.METADATA_PATTERN.findall(block_text)
+                        for match in matches:
+                            metadata.append(match)
+                        # Remove all metadata markers from this block
+                        cleaned_text = self.METADATA_PATTERN.sub("", block_text)
+                        block["text"] = cleaned_text
+            elif isinstance(content, str):
+                matches = self.METADATA_PATTERN.findall(content)
+                for match in matches:
+                    metadata.append(match)
+                # Remove all metadata markers from the string
+                message["content"] = self.METADATA_PATTERN.sub("", content)
+        return metadata
