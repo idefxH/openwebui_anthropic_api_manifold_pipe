@@ -3,9 +3,9 @@ title: Anthropic API Integration
 author: Podden (https://github.com/Podden/)
 github: https://github.com/Podden/openwebui_anthropic_api_manifold_pipe
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.5.2
+version: 0.5.5
 license: MIT
-requirements: pydantic>=2.0.0, aiohttp>=3.8.0
+requirements: pydantic>=2.0.0, anthropic>=0.75.0
 environment_variables:
     - ANTHROPIC_API_KEY (required)
 
@@ -16,7 +16,7 @@ Supports:
 - web_search Tool
 - citations for web_search
 - Streaming responses
-- Prompt caching (server-side)
+- Prompt caching (server-side) compatible with Openwebui Memory and RAG System
 - Promt Caching of System Promts, Messages- and Tools Array (controllable via Valve)
 - Comprehensive error
 - Image processing
@@ -26,12 +26,22 @@ Supports:
 - Code Execution Tool
 - Vision
 
-Todo:
-- Correct Caching/Requests with RAG and Memories
-- Files API support so uploaded PDFs can be used with code_execution tool
-- Connect Anthropic Memory System with OpenWebUI Memory System
 
 Changelog:
+v0.5.5
+- Fixed effort parameter support by upgrading Anthropic SDK from 0.60.0 to 0.75.0
+- Re-enabled effort levels for Opus 4.5
+
+v0.5.4
+- Fixed Message Caching Problems when using RAG or Memories
+
+v0.5.3
+- Added Support for Anthropic Effort Levels (low, medium, high)
+- Added Support for Opus 4.5
+- Use correct logger for logging
+- Removed DEBUG Valve
+- Introduced UserValves for setting user-specific options like thinking, effort, web search limits and location
+
 v0.5.2
 - Fixed usage statistics accumulation for multi-step tool calls
 - Correctly sums input and output tokens across all turns in a request
@@ -216,6 +226,7 @@ class Pipe:
             "supports_1m_context": False,
             "supports_memory": False,
             "supports_vision": True,
+            "supports_effort": False,
         },
         "claude-3-sonnet-20240229": {
             "max_tokens": 4096,
@@ -224,6 +235,7 @@ class Pipe:
             "supports_1m_context": False,
             "supports_memory": False,
             "supports_vision": True,
+            "supports_effort": False,
         },
         "claude-3-haiku-20240307": {
             "max_tokens": 4096,
@@ -232,6 +244,7 @@ class Pipe:
             "supports_1m_context": False,
             "supports_memory": False,
             "supports_vision": True,
+            "supports_effort": False,
         },
         # Claude 3.5 family
         "claude-3-5-sonnet-20240620": {
@@ -241,6 +254,7 @@ class Pipe:
             "supports_1m_context": False,
             "supports_memory": False,
             "supports_vision": True,
+            "supports_effort": False,
         },
         "claude-3-5-sonnet-20241022": {
             "max_tokens": 8192,
@@ -249,6 +263,7 @@ class Pipe:
             "supports_1m_context": False,
             "supports_memory": False,
             "supports_vision": True,
+            "supports_effort": False,
         },
         "claude-3-5-haiku-20241022": {
             "max_tokens": 8192,
@@ -257,6 +272,7 @@ class Pipe:
             "supports_1m_context": False,
             "supports_memory": False,
             "supports_vision": True,
+            "supports_effort": False,
         },
         # Claude 3.7 family
         "claude-3-7-sonnet-20250219": {
@@ -266,6 +282,7 @@ class Pipe:
             "supports_1m_context": False,
             "supports_memory": False,
             "supports_vision": True,
+            "supports_effort": False,
         },
         # Claude 4 family
         "claude-sonnet-4-20250514": {
@@ -275,6 +292,7 @@ class Pipe:
             "supports_1m_context": True,
             "supports_memory": True,
             "supports_vision": True,
+            "supports_effort": False,
         },
         "claude-opus-4-20250514": {
             "max_tokens": 32000,
@@ -283,6 +301,7 @@ class Pipe:
             "supports_1m_context": False,
             "supports_memory": True,
             "supports_vision": True,
+            "supports_effort": False,
         },
         "claude-opus-4-1-20250805": {
             "max_tokens": 32000,
@@ -291,6 +310,7 @@ class Pipe:
             "supports_1m_context": False,
             "supports_memory": True,
             "supports_vision": True,
+            "supports_effort": False,
         },
         "claude-sonnet-4-5-20250929": {
             "max_tokens": 64000,
@@ -299,6 +319,7 @@ class Pipe:
             "supports_1m_context": True,
             "supports_memory": True,
             "supports_vision": True,
+            "supports_effort": False,
         },
         "claude-haiku-4-5-20251001": {
             "max_tokens": 64000,
@@ -307,7 +328,17 @@ class Pipe:
             "supports_1m_context": False,
             "supports_memory": True,
             "supports_vision": True,
+            "supports_effort": False,
         },
+        "claude-opus-4-5-20251101": {
+            "max_tokens": 64000,
+            "context_length": 200000,
+            "supports_thinking": True,
+            "supports_1m_context": False,
+            "supports_memory": True,
+            "supports_vision": True,
+            "supports_effort": True,
+        }
     }
     
     # Aliases map to dated model versions
@@ -323,6 +354,8 @@ class Pipe:
         "claude-opus-4-1": "claude-opus-4-1-20250805",
         "claude-sonnet-4-5": "claude-sonnet-4-5-20250929",
         "claude-haiku-4-5": "claude-haiku-4-5-20251001",
+        "claude-opus-4-5": "claude-opus-4-5-20251101",
+
     }
 
     REQUEST_TIMEOUT = 300  # Increased timeout for longer responses with extended thinking
@@ -342,21 +375,15 @@ class Pipe:
         return cls.MODEL_CAPABILITIES.get(resolved_name, {
             "max_tokens": 4096,
             "context_length": 200000,
-            "supports_thinking": False,
+            "supports_thinking": True,
             "supports_1m_context": False,
             "supports_memory": False,
             "supports_vision": True,
+            "supports_effort": False,
         })
 
     class Valves(BaseModel):
         ANTHROPIC_API_KEY: str = "Your API Key Here"
-        ENABLE_THINKING: bool = Field(
-            default=False,
-            description="Force Enable Extended Thinking. Use Anthropic Thinking Toggle Function for fine grained control",
-        )
-        THINKING_BUDGET_TOKENS: int = Field(
-            default=4096, ge=0, le=32000
-        )
         # ENABLE_CLAUDE_MEMORY: bool = Field(
         #     default=False,
         #     description="Enable Claude memory tool",
@@ -365,35 +392,9 @@ class Pipe:
             default=False,
             description="Enable 1M token context window for Claude Sonnet 4 (requires Tier 4 API access)",
         )
-        SHOW_TOKEN_COUNT: bool = Field(
-            default=False,
-            description="Show token count for the current conversation",
-        )
         WEB_SEARCH: bool = Field(
             default=True,
             description="Enable web search tool for Claude models. Use Anthropic Web Search Toggle Function for fine grained control",
-        )
-        WEB_SEARCH_MAX_USES: int = Field(
-            default=5,
-            ge=1,
-            le=20,
-            description="Maximum number of web searches allowed per conversation",
-        )
-        WEB_SEARCH_USER_CITY: str = Field(
-            default="Leipzig",
-            description="User's city for web search location context",
-        )
-        WEB_SEARCH_USER_REGION: str = Field(
-            default="Saxony",
-            description="User's region/state for web search location context",
-        )
-        WEB_SEARCH_USER_COUNTRY: str = Field(
-            default="DE",
-            description="User's country code for web search location context",
-        )
-        WEB_SEARCH_USER_TIMEZONE: str = Field(
-            default="Europe/Berlin",
-            description="User's timezone for web search location context",
         )
         MAX_TOOL_CALLS: int = Field(
             default=15,
@@ -411,9 +412,63 @@ class Pipe:
             default="cache disabled",
             description="Cache control scope for prompts",
         )
-        DEBUG: bool = Field(
+        WEB_SEARCH_USER_CITY: str = Field(
+            default="",
+            description="User's city for web search.",
+        )
+        WEB_SEARCH_USER_REGION: str = Field(
+            default="",
+            description="User's region/state for web search",
+        )
+        WEB_SEARCH_USER_COUNTRY: str = Field(
+            default="",
+            description="User's country code for web search",
+        )
+        WEB_SEARCH_USER_TIMEZONE: str = Field(
+            default="",
+            description="User's timezone for web search.",
+        )
+
+    class UserValves(BaseModel):
+        ENABLE_THINKING: bool = Field(
             default=False,
-            description="Enable debug logging to see requests and responses",
+            description="Enable Extended Thinking",
+        )
+        THINKING_BUDGET_TOKENS: int = Field(
+            default=4096,
+            ge=0,
+            le=32000,
+            description="Thinking budget tokens",
+        )
+        EFFORT: Literal["low", "medium", "high"] = Field(
+            default="high",
+            description="Effort level for this user. Also Controllable with OpenWebUI's reasoning_effort parameter.",
+        )
+        SHOW_TOKEN_COUNT: bool = Field(
+            default=False,
+            description="Show Context Window Progress",
+        )
+        WEB_SEARCH_MAX_USES: int = Field(
+            default=5,
+            ge=1,
+            le=20,
+            description="Maximum number of web searches",
+        )
+        WEB_SEARCH_USER_CITY: str = Field(
+            default="",
+            description="User's city for web search.",
+        )
+        WEB_SEARCH_USER_REGION: str = Field(
+            default="",
+            description="User's region/state for web search",
+        )
+        WEB_SEARCH_USER_COUNTRY: str = Field(
+            default="",
+            description="User's country code for web search",
+        )
+        WEB_SEARCH_USER_TIMEZONE: str = Field(
+            default="",
+            description="User's timezone for web search.",
         )
 
     def __init__(self):
@@ -421,7 +476,6 @@ class Pipe:
         self.id = "anthropic"
         self.valves = self.Valves()
         self.logger = logger
-
     async def get_anthropic_models(self) -> List[dict]:
         """
         Fetches the current list of Anthropic models using the official Anthropic Python SDK.
@@ -488,6 +542,34 @@ class Pipe:
     async def pipes(self) -> List[dict]:
         return await self.get_anthropic_models()
 
+    def _is_rag_message(self, content: List[dict], __files__: Optional[Any] = None) -> bool:
+        """
+        Detect if a message contains RAG context or transient data that shouldn't be cached.
+        Returns True if RAG (Retrieval) is detected.
+        Returns False if only Full Context files, Images, Audio, or no files are present.
+        """
+        if __files__:
+            for file in __files__:
+                # Check for RAG types
+                file_type = file.get("type", "file")
+                if file_type in ["collection", "web_search"]:
+                    return True
+                
+                # 'file' is RAG unless context is explicitly 'full'
+                if file_type == "file" and file.get("context") != "full":
+                    return True
+            
+            # If we get here, all files are safe (Full Context, Images, Audio)
+            return False
+
+        for block in content:
+            if block.get("type") == "text":
+                text = block.get("text", "")
+                # Check for common RAG markers
+                if "<context>" in text or ("### Task:" in text and "<source" in text):
+                    return True
+        return False
+
     async def _create_payload(
         self,
         body: Dict,
@@ -515,28 +597,28 @@ class Pipe:
         if body.get("top_p") is not None:
             payload["top_p"] = float(body.get("top_p", 0))
 
-        if self.valves.DEBUG:
-            try:
-                logger.debug(f" Thinking Filter: {__metadata__.get('anthropic_thinking')}")
-                logger.debug(f"Tools: {json.dumps(__tools__, indent=2)}")
-            except Exception as e:
-                logger.debug(f"JSON dump failed: {e}")
-                logger.debug(f"raw __metadata__: {__metadata__}")
+        try:
+            logger.debug(f" Thinking Filter: {__metadata__.get('anthropic_thinking')}")
+            logger.debug(f"Tools: {json.dumps(__tools__, indent=2)}")
+        except Exception as e:
+            logger.debug(f"JSON dump failed: {e}")
+            logger.debug(f"raw __metadata__: {__metadata__}")
 
+        enable_thinking = __user__["valves"].ENABLE_THINKING
+        thinking_budget_tokens = __user__["valves"].THINKING_BUDGET_TOKENS
+        
+        # Check for metadata overrides (highest priority)
         if "anthropic_thinking" in __metadata__:
             should_enable_thinking = __metadata__.get("anthropic_thinking", False)
         else:
-            should_enable_thinking = self.valves.ENABLE_THINKING
-
-        if self.valves.DEBUG:
-            logger.debug(f"Thinking Enabled?: {should_enable_thinking}")
+            should_enable_thinking = enable_thinking
 
         if (
             should_enable_thinking
             and model_info["supports_thinking"]
         ):
             # Ensure thinking.budget_tokens < max_tokens and at least 1024
-            requested_thinking_budget = self.valves.THINKING_BUDGET_TOKENS
+            requested_thinking_budget = thinking_budget_tokens
             # Clamp thinking budget to valid range
             max_valid_thinking_budget = max(max_tokens - 1, 1023)
             thinking_budget = max(
@@ -547,15 +629,33 @@ class Pipe:
                 thinking_budget = max_tokens - 1 if max_tokens > 1 else 1
             payload["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget}
 
-        if "response_format" in body:
-            payload["response_format"] = {"type": body["response_format"].get("type")}
+        
+        # Handle effort parameter (maps from OpenWebUI's reasoning_effort or user valves)
+        # Priority: reasoning_effort param > user valve
+        # Note: output_config is a beta feature and must be passed via extra_body
+        effort_config = None
+        if model_info["supports_effort"]:
+            effort_level = __user__["valves"].EFFORT
+            if body.get("reasoning_effort") in ["low", "medium", "high"]:
+                effective_effort = body.get("reasoning_effort")
+            else:
+                effective_effort = effort_level
+            effort_config = {"effort": effective_effort}
 
         raw_messages = body.get("messages", []) or []
         system_messages = []
         processed_messages: list[dict] = []
-        # Extract dynamic context from system messages for injection into user messages
-        dynamic_context_blocks = []
-
+        extracted_user_context = None
+        
+        # Check if user has memory system enabled
+        user_has_memory_system_enabled = False
+        try:
+            user_has_memory_system_enabled = __user__.get("settings", {}).get("ui", {}).get("memory", False)
+        except (AttributeError, TypeError):
+            pass
+        
+        logger.debug(f"Memory system enabled: {user_has_memory_system_enabled}")
+        
         for msg in raw_messages:
             role = msg.get("role")
             raw_content = msg.get("content")
@@ -567,35 +667,48 @@ class Pipe:
                 for block in processed_content:
                     text = block["text"]
                     
-                    # Extract and remove User Context in one pass (also strips whitespace)
-                    cleaned_text, user_context = self._extract_and_remove_memorys(text)
-                    
-                    if user_context:
-                        if self.valves.DEBUG:
-                            logger.debug(f"✓ Extracted User Context: {user_context[:100]}...")
+                    # Only extract memory if user has memory system enabled
+                    if user_has_memory_system_enabled and "\nUser Context:\n" in text:
+                        # Extract and remove User Context
+                        cleaned_text, extracted_user_context = self._extract_and_remove_memorys(text)
+                        
+                        if extracted_user_context:
+                            logger.debug(f"✓ Extracted User Context: {extracted_user_context[:100]}...")
                             logger.debug(f"✓ System prompt after removal (last 200 chars): ...{cleaned_text[-200:]}")
-                        dynamic_context_blocks.append(user_context)
-                    else:
-                        if self.valves.DEBUG:
-                            logger.debug(f"✗ No User Context found in this block")
-                    
-                    # Update block with cleaned text
-                    block["text"] = cleaned_text
+                             
+                        
+                        # Update block with cleaned text
+                        block["text"] = cleaned_text
                     
                     # Only add non-empty blocks to system (cache_control will be added later to last block only)
-                    system_messages.append(block)
+                    if block["text"].strip():
+                        system_messages.append(block)
             else:
                 # Only add messages with non-empty content (fixes Chat with Notes empty assistant messages)
                 if processed_content:
                     processed_messages.append({"role": role, "content": processed_content})
-                elif self.valves.DEBUG:
+                else:
                     logger.debug(f"Skipped message with empty content (role: {role})")
+        
+        # Append extracted user context to last user message
+        if extracted_user_context and processed_messages:
+            # Find last user message
+            for i in range(len(processed_messages) - 1, -1, -1):
+                if processed_messages[i]["role"] == "user":
+                    content = processed_messages[i]["content"]
+                    if isinstance(content, list):
+                        # Add context as new text block
+                        content.append({
+                            "type": "text",
+                            "text": f"\n\n---\n**IMPORTANT:** The following is NOT part of the user's message, but context from a memory system to help answer the user's questions:\n\n{extracted_user_context}"
+                        })
+                    break
 
         if not processed_messages:
             raise ValueError("No valid messages to process")
 
         # Correct Order for Caching: Tools, System, Messages
-        tools_list = self._convert_tools_to_claude_format(__tools__, actual_model_name)
+        tools_list = self._convert_tools_to_claude_format(__tools__, actual_model_name, __user__)
         # Decide on code execution inclusion early so we can set beta headers later
         activate_code_execution = __metadata__.get(
             "activate_code_execution_tool", False
@@ -627,8 +740,7 @@ class Pipe:
                 # Skip forced web search when thinking is enabled to avoid API error
                 if __metadata__.get("web_search_enforced") and "thinking" in payload:
                     __metadata__["web_search_enforced"] = False  # one-shot
-                    if self.valves.DEBUG:
-                        logger.debug(f"Skipped forced web_search due to active thinking")
+                    logger.debug(f"Skipped forced web_search due to active thinking")
                     # Notify user about the conflict
                     await self.emit_event( 
                         {
@@ -653,24 +765,30 @@ class Pipe:
             payload["system"] = system_messages
 
         if processed_messages and len(processed_messages) > 0:
+            # Determine where to place the cache breakpoint
+            target_msg_index = -1
+            
+            # Check if last message has RAG content
             last_msg = processed_messages[-1]
-            content_blocks = last_msg.get("content", [])
+            if self._is_rag_message(last_msg.get("content", []), __files__):
+                logger.debug("RAG content detected in last message. Moving cache breakpoint to previous message.")
+                # If we have history, cache the previous message
+                if len(processed_messages) > 1:
+                    target_msg_index = -2
+                else:
+                    # If no history, we can't cache messages (only system/tools)
+                    target_msg_index = None
             
-            if dynamic_context_blocks and last_msg.get("role") == "user":
-                # Add context blocks as text blocks with clear markers
-                for ctx in dynamic_context_blocks:
-                    context_block = {
-                        "type": "text",
-                        "text": f"\n\nTHE FOLLOWING IS CONTEXT FROM MEMORY SYSTEM, DONT MENTION TO USER, JUST USE AS NECESSARY AND RELEVANT!\n{ctx}\n"
-                    }
-                    content_blocks.append(context_block)
-            
-            # Apply cache control to last content block (only if it has text)
-            if content_blocks and self.valves.CACHE_CONTROL == "cache tools array, system prompt and messages":
-                last_content_block = content_blocks[-1]
-                # Only add cache_control if the block has non-empty text
-                if last_content_block.get("type") == "text" and last_content_block.get("text", "").strip():
-                    last_content_block.setdefault("cache_control", {"type": "ephemeral"})
+            # Apply cache control to the target message
+            if target_msg_index is not None and self.valves.CACHE_CONTROL == "cache tools array, system prompt and messages":
+                target_msg = processed_messages[target_msg_index]
+                content_blocks = target_msg.get("content", [])
+                if content_blocks:
+                    last_content_block = content_blocks[-1]
+                    # Only add cache_control if the block has non-empty text
+                    if last_content_block.get("type") == "text" and last_content_block.get("text", "").strip():
+                        last_content_block.setdefault("cache_control", {"type": "ephemeral"})
+
             payload["messages"] = processed_messages
 
         # Get API key from valves
@@ -699,53 +817,70 @@ class Pipe:
         if self.valves.ENABLE_1M_CONTEXT and model_info["supports_1m_context"]:
             beta_headers.append("context-1m-2025-08-07")
 
+        # Add effort beta header and output_config if effort is configured
+        if model_info["supports_effort"] and effort_config:
+            beta_headers.append("effort-2025-11-24")
+            payload["output_config"] = effort_config
+
         if beta_headers and len(beta_headers) > 0:
             headers["anthropic-beta"] = ",".join(beta_headers)
+            # Add betas list to payload for beta.messages.stream
+            payload["betas"] = beta_headers
 
-        if self.valves.DEBUG:
-            logger.debug(f"Payload: {json.dumps(payload, indent=2)}")
-            logger.debug(f"Headers: {headers}")
+        logger.debug(f"Payload: {json.dumps(payload, indent=2)}")
+        logger.debug(f"Headers: {headers}")
         
         return payload, headers
 
-    def _convert_tools_to_claude_format(self, __tools__, actual_model_name: str) -> List[dict]:
+    def _convert_tools_to_claude_format(self, __tools__, actual_model_name: str, __user__: Dict[str, Any]) -> List[dict]:
         """
         Convert OpenWebUI tools format to Claude API format.
         Args:
             __tools__: Dict of tools from OpenWebUI
+            actual_model_name: Model name for capability checking
+            __user__: User dict for valve overrides
         Returns:
             list: Tools in Claude API format
         """
         claude_tools = []
         tool_names_seen = set()  # Track unique tool names
 
-        if self.valves.DEBUG:
-            # Only log tool names and specs, not the callable functions
-            if __tools__:
-                try:
-                    logger.debug(f" Converting tools: {json.dumps(__tools__, indent=2)}")
-                except Exception as e:
-                    logger.debug(f" JSON dump failed, printing tools directly: {__tools__}")
-                    logger.debug(f"Error was: {e}")
-            else:
-                logger.debug("No tools to convert")
+        if __tools__:
+            try:
+                logger.debug(f" Converting tools: {json.dumps(__tools__, indent=2)}")
+            except Exception as e:
+                logger.debug(f" JSON dump failed, printing tools directly: {__tools__}")
+                logger.debug(f"Error was: {e}")
+        else:
+            logger.debug("No tools to convert")
 
-        # Add web search tool if enabled
-        if self.valves.WEB_SEARCH:
-            claude_tools.append(
-                {
-                    "type": "web_search_20250305",
-                    "name": "web_search",
-                    "max_uses": self.valves.WEB_SEARCH_MAX_USES,
-                    "user_location": {
-                        "type": "approximate",
-                        "city": self.valves.WEB_SEARCH_USER_CITY,
-                        "region": self.valves.WEB_SEARCH_USER_REGION,
-                        "country": self.valves.WEB_SEARCH_USER_COUNTRY,
-                        "timezone": self.valves.WEB_SEARCH_USER_TIMEZONE,
-                    },
+        # Add web search tool if enabled (check user valve override)
+        web_search_enabled = self.valves.WEB_SEARCH
+        if web_search_enabled:
+            # Get user location values with fallback to global valves
+            city = __user__["valves"].WEB_SEARCH_USER_CITY or self.valves.WEB_SEARCH_USER_CITY
+            region = __user__["valves"].WEB_SEARCH_USER_REGION or self.valves.WEB_SEARCH_USER_REGION
+            country = __user__["valves"].WEB_SEARCH_USER_COUNTRY or self.valves.WEB_SEARCH_USER_COUNTRY
+            timezone = __user__["valves"].WEB_SEARCH_USER_TIMEZONE or self.valves.WEB_SEARCH_USER_TIMEZONE
+            
+            # Build web search tool config
+            web_search_tool = {
+                "type": "web_search_20250305",
+                "name": "web_search",
+                "max_uses": __user__["valves"].WEB_SEARCH_MAX_USES,
+            }
+            
+            # Only add user_location if at least one field has a value
+            if city or region or country or timezone:
+                web_search_tool["user_location"] = {
+                    "type": "approximate",
+                    "city": city,
+                    "region": region,
+                    "country": country,
+                    "timezone": timezone,
                 }
-            )
+            
+            claude_tools.append(web_search_tool)
             tool_names_seen.add("web_search")
 
         # Add Claude Memory tool if enabled and supported by model
@@ -759,14 +894,12 @@ class Pipe:
         #     tool_names_seen.add("memory")
 
         if not __tools__ or len(__tools__) == 0:
-            if self.valves.DEBUG:
-                logger.debug(f"No tools provided, using default Claude tools")
+            logger.debug(f"No tools provided, using default Claude tools")
             return claude_tools
 
         for tool_name, tool_data in __tools__.items():
             if not isinstance(tool_data, dict) or "spec" not in tool_data:
-                if self.valves.DEBUG:
-                    logger.debug(f"Skipping invalid tool: {tool_name} - missing spec")
+                logger.debug(f"Skipping invalid tool: {tool_name} - missing spec")
                 continue
 
             spec = tool_data["spec"]
@@ -781,8 +914,7 @@ class Pipe:
 
             # Skip if toolname starts with _ or __
             if name.startswith("_"):
-                if self.valves.DEBUG:
-                    logger.debug(f"Skipping private tool: {name}")
+                logger.debug(f"Skipping private tool: {name}")
                 continue
             
             description = spec.get("description", f"Tool: {name}")
@@ -809,8 +941,7 @@ class Pipe:
             tool_names_seen.add(name)
 
 
-        if self.valves.DEBUG:
-            logger.debug(f"Total tools converted: {len(claude_tools)}")
+        logger.debug(f"Total tools converted: {len(claude_tools)}")
 
         return claude_tools
 
@@ -828,8 +959,6 @@ class Pipe:
         """
         OpenWebUI Claude streaming pipe with integrated streaming logic.
         """
-        # Local variable to store the final message for this request
-        # DO NOT use self.final_message as pipe instances are reused across users
         final_message: list[str] = []
 
         # Create request-local wrapper for emit_event to prevent cross-talk between parallel requests
@@ -845,23 +974,21 @@ class Pipe:
             api_key = self.valves.ANTHROPIC_API_KEY
             if not api_key:
                 error_msg = "Error: No API key configured"
-                if self.valves.DEBUG:
-                    logger.debug(f"{error_msg}")
-                    await emit_event_local( 
-                        {
-                            "type": "status",
-                            "data": {
-                                "description": "No API Key Set!",
-                                "done": False,
-                            },
-                        }
-                    )
+                logger.error(f"{error_msg}")
+                await emit_event_local( 
+                    {
+                        "type": "status",
+                        "data": {
+                            "description": "No API Key Set!",
+                            "done": False,
+                        },
+                    }
+                )
                 return error_msg
 
             # STEP 1: Detect if task model (generate title, tags, follow-ups etc.), handle it separately
             if __task__:
-                if self.valves.DEBUG:
-                    logger.debug(f"Detected task model: {__task__}")
+                logger.debug(f"Detected task model: {__task__}")
                 return await self._run_task_model_request(body, __event_emitter__)
             
             # STEP 2: Await tools if needed
@@ -882,8 +1009,7 @@ class Pipe:
                         if model:
                             params = dict(model.params or {})
                             if params.get("function_calling") != "native":
-                                if self.valves.DEBUG:
-                                    logger.debug(f"Auto-enabling native function calling for model: {openwebui_model_id}")
+                                logger.debug(f"Auto-enabling native function calling for model: {openwebui_model_id}")
                                 
                                 # Notify user
                                 await emit_event_local(
@@ -901,9 +1027,7 @@ class Pipe:
                                 form_data["params"] = params
                                 Models.update_model_by_id(openwebui_model_id, ModelForm(**form_data))
                 except Exception as e:
-                    if self.valves.DEBUG:
-                        logger.debug(f"Could not auto-enable native function calling: {e}")
-                    # Continue anyway - this is not critical
+                    logger.warning(f"Could not auto-enable native function calling: {e}")
 
             payload, headers = await self._create_payload(
                 body, __metadata__, __user__, __tools__, __event_emitter__, __files__
@@ -979,34 +1103,31 @@ class Pipe:
                 try:
                     # Ensure cache_control is preserved (some SDKs/APIs might strip it or we might lose it in loop)
                     if cached_block and "cache_control" not in cached_block:
-                        if self.valves.DEBUG:
-                            logger.debug("Restoring missing cache_control marker")
+                        logger.debug("Restoring missing cache_control marker")
                         cached_block["cache_control"] = {"type": "ephemeral"}
 
-                    async with client.messages.stream(**payload_for_stream) as stream:
+                    async with client.beta.messages.stream(**payload_for_stream) as stream:
                         async for event in stream:
                             event_type = getattr(event, "type", None)
-                            if self.valves.DEBUG:
-                                # Only log event_type and minimal event info, skip snapshot fields
-                                if hasattr(event, "__dict__"):
-                                    event_dict = {
-                                        k: v
-                                        for k, v in event.__dict__.items()
-                                        if k != "snapshot"
-                                    }
-                                    logger.debug(f"Received event: %s with %s", event_type, str(event_dict)[:200] + ('...' if len(str(event_dict)) > 200 else ''))
-                                else:
-                                    logger.debug(
-                                        f"Received event: %s with %s", event_type, str(event)[:200] + ('...' if len(str(event)) > 200 else '')
-                                    )
+                            # Only log event_type and minimal event info, skip snapshot fields
+                            if hasattr(event, "__dict__"):
+                                event_dict = {
+                                    k: v
+                                    for k, v in event.__dict__.items()
+                                    if k != "snapshot"
+                                }
+                                logger.debug(f"Received event: %s with %s", event_type, str(event_dict)[:200] + ('...' if len(str(event_dict)) > 200 else ''))
+                            else:
+                                logger.debug(
+                                    f"Received event: %s with %s", event_type, str(event)[:200] + ('...' if len(str(event)) > 200 else '')
+                                )
                             if event_type == "message_start":
                                 message = getattr(event, "message", None)
                                 if message:
                                     request_id = getattr(
                                         message, "id", None
                                     )
-                                    if self.valves.DEBUG:
-                                        logger.debug(f" Message started with ID: {request_id}")
+                                    logger.debug(f" Message started with ID: {request_id}")
                                     usage = getattr(message, "usage", {})
                                     if usage:
                                         input_tokens = getattr(
@@ -1025,37 +1146,28 @@ class Pipe:
                                             usage, "cache_read_input_tokens", 0
                                         )
                                         
-                                        # Accumulate input usage (always additive per stream)
+                                        # Accumulate billable tokens (for cost tracking)
                                         total_usage["input_tokens"] += input_tokens
                                         total_usage["cache_creation_input_tokens"] += cache_creation_input_tokens
-                                        total_usage["cache_read_input_tokens"] += cache_read_input_tokens
+                                        
+                                        # Set last-turn values (non-accumulating)
+                                        total_usage["cache_read_input_tokens"] = cache_read_input_tokens
                                         
                                         # Handle output tokens (cumulative within stream)
                                         diff = current_output_tokens - stream_output_tokens
                                         total_usage["output_tokens"] += diff
                                         stream_output_tokens = current_output_tokens
                                         
-                                        # Calculate total tokens including cache
+                                        # Calculate total context size from last turn
                                         total_usage["total_tokens"] = (
-                                            total_usage["input_tokens"] + 
-                                            total_usage["output_tokens"] + 
-                                            total_usage["cache_creation_input_tokens"] + 
-                                            total_usage["cache_read_input_tokens"]
+                                            input_tokens + 
+                                            current_output_tokens + 
+                                            cache_creation_input_tokens + 
+                                            cache_read_input_tokens
                                         )
 
-                                        if self.valves.DEBUG:
-                                            logger.debug(f" Usage stats: input={input_tokens}, output={current_output_tokens}, cache_creation={cache_creation_input_tokens}, cache_read={cache_read_input_tokens}")
-                                            logger.debug(f" Total usage: {total_usage}")
-                                        
-                                        await emit_event_local( 
-                                            {
-                                                "type": "chat:completion",
-                                                "data": {
-                                                    "usage": total_usage,
-                                                    "done": False,
-                                                },
-                                            }
-                                        )
+                                        logger.debug(f" Usage stats: input={input_tokens}, output={current_output_tokens}, cache_creation={cache_creation_input_tokens}, cache_read={cache_read_input_tokens}")
+                                        logger.debug(f" Accumulated usage: {total_usage}")
 
                             elif event_type == "content_block_start":
                                 content_block = getattr(
@@ -1086,8 +1198,7 @@ class Pipe:
                                 if content_type == "tool_use":
                                     tool_name = getattr(content_block, "name", "unknown")
                                     
-                                    if self.valves.DEBUG:
-                                        logger.debug(f"🔧 Tool use block started: {tool_name}")
+                                    logger.debug(f"🔧 Tool use block started: {tool_name}")
                                     
                                     # Emit status immediately when tool_use block starts (before input generation)
                                     await emit_event_local({
@@ -1115,8 +1226,7 @@ class Pipe:
                                     active_server_tool_id = getattr(content_block, "id", "")
                                     server_tool_input_buffer = ""  # Reset buffer for new tool
                                     
-                                    if self.valves.DEBUG:
-                                        logger.debug(f"Server tool started: {active_server_tool_name} (ID: {active_server_tool_id})")
+                                    logger.debug(f"Server tool started: {active_server_tool_name} (ID: {active_server_tool_id})")
                                     
                                     if active_server_tool_name == "code_execution":
                                         await emit_event_local(
@@ -1163,8 +1273,7 @@ class Pipe:
                                         )
                                         await self.emit_message_delta(code_result_msg, final_message, __event_emitter__)
                                 if content_type == "web_search_tool_result":
-                                    if self.valves.DEBUG:
-                                        logger.debug(f" Processing web search result event: {event}")
+                                    logger.debug(f" Processing web search result event: {event}")
                                     content_items = getattr(
                                         content_block, "content", []
                                     )
@@ -1248,8 +1357,7 @@ class Pipe:
                                                     parsed = json.loads(server_tool_input_buffer)
                                                     if 'query' in parsed:
                                                         new_query = parsed['query']
-                                                        if self.valves.DEBUG:
-                                                            logger.debug(f"Web search query complete: '{new_query}'")
+                                                        logger.debug(f"Web search query complete: '{new_query}'")
                                                         
                                                         # Emit status only once when we get the complete query
                                                         if new_query and new_query != current_search_query:
@@ -1265,20 +1373,16 @@ class Pipe:
                                                             )
                                                 except json.JSONDecodeError:
                                                     # Partial JSON not complete yet, will get more in next delta
-                                                    if self.valves.DEBUG:
-                                                        logger.debug(f"Partial web_search JSON: {server_tool_input_buffer}")
+                                                    logger.debug(f"Partial web_search JSON: {server_tool_input_buffer}")
                                                 except Exception as e:
-                                                    if self.valves.DEBUG:
-                                                        logger.debug(f"Web search query extraction error: {e}")
+                                                    logger.debug(f"Web search query extraction error: {e}")
                                             elif active_server_tool_name == "code_execution":
                                                 # Code execution input - just log it
-                                                if self.valves.DEBUG:
-                                                    logger.debug(f"Code execution input: {server_tool_input_buffer[:100]}...")
+                                                logger.debug(f"Code execution input: {server_tool_input_buffer[:100]}...")
                                         else:
                                             # Client-side tool - accumulate in tools_buffer
                                             tools_buffer += partial
-                                            if self.valves.DEBUG:
-                                                logger.debug(f"Client tool input accumulated: {len(tools_buffer)} chars")
+                                            logger.debug(f"Client tool input accumulated: {len(tools_buffer)} chars")
                                     elif delta_type == "citations_delta":
                                         # Handle citations within content_block_delta AND add inline citation number
                                         citation_counter += 1
@@ -1314,8 +1418,7 @@ class Pipe:
 
                                 # Reset server tool tracking when block stops
                                 if content_type == "server_tool_use":
-                                    if self.valves.DEBUG:
-                                        logger.debug(f"Server tool block stopped: {active_server_tool_name}")
+                                    logger.debug(f"Server tool block stopped: {active_server_tool_name}")
                                     # Add line break after server tool use
                                     await self.emit_message_delta("\n", final_message, __event_emitter__)
                                     active_server_tool_name = None
@@ -1328,23 +1431,19 @@ class Pipe:
                                     try:
                                         json.loads(tools_buffer)
                                         # Already valid JSON, no need to close
-                                        if self.valves.DEBUG:
-                                            logger.debug(f" tools_buffer already valid JSON: {tools_buffer}")
+                                        logger.debug(f" tools_buffer already valid JSON: {tools_buffer}")
                                     except json.JSONDecodeError:
                                         # Check if input is empty (ends with "input": )
                                         if tools_buffer.rstrip().endswith('"input":') or tools_buffer.rstrip().endswith('"input": '):
                                             # Add empty object for input
                                             tools_buffer += ' {}'
-                                            if self.valves.DEBUG:
-                                                logger.debug(f" Added empty input object: {tools_buffer}")
+                                            logger.debug(f" Added empty input object: {tools_buffer}")
                                         # Invalid JSON, need to close the main object
                                         tools_buffer += "}"
-                                        if self.valves.DEBUG:
-                                            logger.debug(f" Closed tools_buffer in content_block_stop: {tools_buffer}")
+                                        logger.debug(f" Closed tools_buffer in content_block_stop: {tools_buffer}")
                                     
                                     # Parse and store this tool_use block
-                                    if self.valves.DEBUG:
-                                        logger.debug(f"Parsed tool call: {tools_buffer}")
+                                    logger.debug(f"Parsed tool call: {tools_buffer}")
                                     
                                     # Parse and start tool execution immediately!
                                     try:
@@ -1372,11 +1471,9 @@ class Pipe:
                                             task = asyncio.create_task(tool["callable"](**args))
                                             running_tool_tasks.append(task)
                                             
-                                            if self.valves.DEBUG:
-                                                logger.debug(f"🚀 Started immediate execution for '%s' (task #%d)", tool_name, len(running_tool_tasks))
+                                            logger.debug(f"🚀 Started immediate execution for '%s' (task #%d)", tool_name, len(running_tool_tasks))
                                     except Exception as e:
-                                        if self.valves.DEBUG:
-                                            logger.debug(f"Failed to start tool execution: {e}")
+                                        logger.error(f"Failed to start tool execution: {e}")
                                     
                                     # Reset buffer for next tool
                                     tools_buffer = ""
@@ -1386,8 +1483,7 @@ class Pipe:
                                     # Preserve thinking block for multi-turn (API auto-filters)
                                     if current_thinking_block and current_thinking_block.get("thinking"):
                                         thinking_blocks.append(current_thinking_block)
-                                        if self.valves.DEBUG:
-                                            logger.debug(f"Preserved thinking block with {len(current_thinking_block.get('thinking', ''))} chars")
+                                        logger.debug(f"Preserved thinking block with {len(current_thinking_block.get('thinking', ''))} chars")
                                     # Send closing tag to complete the details block
                                     await self.emit_message_delta(thinking_message, final_message, __event_emitter__)
                                     is_model_thinking = False
@@ -1407,26 +1503,10 @@ class Pipe:
                                     total_usage["output_tokens"] += diff
                                     stream_output_tokens = current_output_tokens
                                     
-                                    # Update total tokens
-                                    total_usage["total_tokens"] = (
-                                        total_usage["input_tokens"] + 
-                                        total_usage["output_tokens"] + 
-                                        total_usage["cache_creation_input_tokens"] + 
-                                        total_usage["cache_read_input_tokens"]
-                                    )
+                                    # Note: total_tokens is already set in message_start based on last turn
+                                    # We don't recalculate it here as it represents the context size of the last API call
                                     
-                                    if self.valves.DEBUG:
-                                        logger.debug(f" Delta usage: output={current_output_tokens}, Total: {total_usage}")
-
-                                    await emit_event_local( 
-                                        {
-                                            "type": "chat:completion",
-                                            "data": {
-                                                "usage": total_usage,
-                                                "done": False,
-                                            },
-                                        }
-                                    )
+                                    logger.debug(f" Delta usage: output={current_output_tokens}, Accumulated: {total_usage}")
 
                                 delta = getattr(event, "delta", None)
                                 if delta:
@@ -1442,8 +1522,7 @@ class Pipe:
                                         
                                         # Wait for all running tool tasks to complete
                                         if running_tool_tasks:
-                                            if self.valves.DEBUG:
-                                                logger.debug(f"⏳ Waiting for %d tool tasks to complete...", len(running_tool_tasks))
+                                            logger.debug(f"⏳ Waiting for %d tool tasks to complete...", len(running_tool_tasks))
                                             
                                             # Emit status event only when multiple tools are executing
                                             if len(running_tool_tasks) > 1:
@@ -1459,8 +1538,7 @@ class Pipe:
                                             
                                             try:
                                                 results = await asyncio.gather(*running_tool_tasks)
-                                                if self.valves.DEBUG:
-                                                    logger.debug(f"✅ All %d tool tasks completed", len(results))
+                                                logger.debug(f"✅ All %d tool tasks completed", len(results))
                                                 
                                                 # Build tool_result messages and emit to UI
                                                 for tool_call_data, tool_result in zip(tool_call_data_list, results):
@@ -1507,8 +1585,7 @@ class Pipe:
                                                     )
                                                     await self.emit_message_delta(tool_result_msg, final_message, __event_emitter__)
                                             except Exception as ex:
-                                                if self.valves.DEBUG:
-                                                    logger.error(f"❌ Tool execution failed: %s", ex)
+                                                logger.error(f"❌ Tool execution failed: %s", ex)
                                                 # Create error results
                                                 for tool_call_data in tool_call_data_list:
                                                     tool_use_id = tool_call_data.get("id", "")
@@ -1521,8 +1598,7 @@ class Pipe:
                                                         "is_error": True
                                                     })
                                         
-                                        if self.valves.DEBUG:
-                                            logger.debug(f" Tool use detected, collected {len(tool_calls)} tool results:\nTool_Call JSON: {tool_calls}")
+                                        logger.debug(f" Tool use detected, collected {len(tool_calls)} tool results:\nTool_Call JSON: {tool_calls}")
 
                                         # Reset for next iteration
                                         running_tool_tasks = []
@@ -1592,8 +1668,7 @@ class Pipe:
                         # API will auto-filter & cache only relevant blocks
                         if thinking_blocks:
                             assistant_content.extend(thinking_blocks)
-                            if self.valves.DEBUG:
-                                logger.debug(f"Adding {len(thinking_blocks)} thinking block(s) to assistant message for API")
+                            logger.debug(f"Adding {len(thinking_blocks)} thinking block(s) to assistant message for API")
                         
                         # Add final text message if exists (important for context)
                         final_message_snapshot = final_text()
@@ -1615,13 +1690,11 @@ class Pipe:
                             
                             # Skip server-side tools - they're already handled in the stream
                             if tool_id.startswith("srvtoolu_") or tool_name in ["web_search", "code_execution"]:
-                                if self.valves.DEBUG:
-                                    logger.debug(f"🔧 Skipping server-side tool %s (ID: %s) in assistant message", tool_name, tool_id)
+                                logger.debug(f"🔧 Skipping server-side tool %s (ID: %s) in assistant message", tool_name, tool_id)
                                 continue
                             
                             assistant_content.append(tool_use_block)
-                            if self.valves.DEBUG:
-                                logger.debug(f"🔧 Added tool_use block for %s to assistant message", tool_name)
+                            logger.debug(f"🔧 Added tool_use block for %s to assistant message", tool_name)
 
                         # Add assistant message to conversation
                         if assistant_content:
@@ -1650,8 +1723,7 @@ class Pipe:
 
                         # Ensure we added at least one message, otherwise break the loop
                         if not assistant_content and not user_content:
-                            if self.valves.DEBUG:
-                                logger.debug(f"🔧 No valid content to add, ending conversation")
+                            logger.debug(f"🔧 No valid content to add, ending conversation")
                             break
 
                         # Reset state for next iteration
@@ -1743,8 +1815,7 @@ class Pipe:
                     retry_attempts += 1
                     if retry_attempts <= self.valves.MAX_RETRIES:
                         error_type = "overloaded" if status_code == 529 else "server error"
-                        if self.valves.DEBUG:
-                            logger.debug(f"{error_type} ({status_code}), retry {retry_attempts}/{self.valves.MAX_RETRIES}")
+                        logger.debug(f"{error_type} ({status_code}), retry {retry_attempts}/{self.valves.MAX_RETRIES}")
                         
                         await emit_event_local({
                             "type": "status",
@@ -1763,8 +1834,7 @@ class Pipe:
                     # Network/connection issues - potentially transient - retryable
                     retry_attempts += 1
                     if retry_attempts <= self.valves.MAX_RETRIES:
-                        if self.valves.DEBUG:
-                            logger.debug(f"Connection error, retry {retry_attempts}/{self.valves.MAX_RETRIES}")
+                        logger.debug(f"Connection error, retry {retry_attempts}/{self.valves.MAX_RETRIES}")
                         
                         await emit_event_local({
                             "type": "status",
@@ -1795,14 +1865,10 @@ class Pipe:
 
         # Preserve existing generated content; append completion marker
         final_status = "✅ Response processing complete."
-        if self.valves.SHOW_TOKEN_COUNT and total_usage:
-            # Safely extract tokens
-            input_tokens = total_usage.get("input_tokens", 0)
-            output_tokens = total_usage.get("output_tokens", 0)
-            cache_read_input_tokens = total_usage.get("cache_read_input_tokens", 0)
-            cache_creation_input_tokens = total_usage.get("cache_creation_input_tokens", 0)
-            total_tokens = input_tokens + output_tokens + cache_read_input_tokens + cache_creation_input_tokens
-            total_usage["total_tokens"] = total_tokens  # ensure consistency
+        show_token_count = __user__["valves"].SHOW_TOKEN_COUNT
+        if show_token_count and total_usage:
+            # Use total_tokens from total_usage which now represents the last turn (Context Size)
+            total_tokens = total_usage.get("total_tokens", 0)
 
             # Percentage of assumed 200k context window (Claude 3.5 Sonnet extended)
             percentage = min((total_tokens / 200000) * 100, 100)
@@ -1827,6 +1893,16 @@ class Pipe:
                                 "done": True,
                             }
                         })
+        
+        await emit_event_local( 
+            {
+                "type": "chat:completion",
+                "data": {
+                    "usage": total_usage,
+                    "done": True,
+                },
+            }
+        )
         return final_text()
 
     async def _run_task_model_request(
@@ -1862,8 +1938,7 @@ class Pipe:
                     for msg in system_messages
                 ]
             
-            if self.valves.DEBUG:
-                logger.debug(f"Task payload: {json.dumps(task_payload, indent=2)}")
+            logger.debug(f"Task payload: {json.dumps(task_payload, indent=2)}")
             
             # Make synchronous request to Anthropic API
             # For task requests, we don't have __user__ context, so use default key
@@ -1881,14 +1956,12 @@ class Pipe:
             # Join without adding line breaks - preserve original formatting
             result = "".join(text_parts).strip()
             
-            if self.valves.DEBUG:
-                logger.debug(f"Task response: {result}")
+            logger.debug(f"Task response: {result}")
             
             return result
             
         except Exception as e:
-            if self.valves.DEBUG:
-                logger.debug(f"Task model error: {e}")
+            logger.debug(f"Task model error: {e}")
             await self.handle_errors(e, __event_emitter__)
             return ""
     
@@ -2028,12 +2101,10 @@ class Pipe:
             message = (
                 f"Error: Tool '{tool_name}' timed out after {self.TOOL_CALL_TIMEOUT} seconds"
             )
-            if self.valves.DEBUG:
-                self.logger.debug(message)
+            self.logger.debug(message)
             return message
         except Exception as exc:
-            if self.valves.DEBUG:
-                self.logger.debug(f"Tool '%s' failed", tool_name, exc_info=exc)
+            self.logger.debug(f"Tool '%s' failed", tool_name, exc_info=exc)
             return f"Error executing tool '{tool_name}': {exc}"
 
     def _remove_thinking_blocks(self, content: str) -> str:
@@ -2097,8 +2168,7 @@ class Pipe:
                         ]
 
                         if mime_type not in supported_formats:
-                            if self.valves.DEBUG:
-                                logger.debug(f" Unsupported image mime type: {mime_type}")
+                            logger.debug(f" Unsupported image mime type: {mime_type}")
                             processed_content.append(
                                 {
                                     "type": "text",
@@ -2113,8 +2183,7 @@ class Pipe:
                         try:
                             decoded_bytes = base64.b64decode(encoded)
                             if len(decoded_bytes) > MAX_IMAGE_SIZE:
-                                if self.valves.DEBUG:
-                                    logger.debug(f" Image too large: {len(decoded_bytes)} bytes")
+                                logger.debug(f" Image too large: {len(decoded_bytes)} bytes")
                                 processed_content.append(
                                     {
                                         "type": "text",
@@ -2123,8 +2192,7 @@ class Pipe:
                                 )
                                 continue
                         except Exception as decode_ex:
-                            if self.valves.DEBUG:
-                                logger.debug(f" Image base64 decode failed: {decode_ex}")
+                            logger.debug(f" Image base64 decode failed: {decode_ex}")
                             processed_content.append(
                                 {
                                     "type": "text",
@@ -2145,8 +2213,7 @@ class Pipe:
                         )
 
                     except ValueError as e:
-                        if self.valves.DEBUG:
-                            logger.debug(f"Error parsing image data URL: {e}")
+                        logger.debug(f"Error parsing image data URL: {e}")
                         processed_content.append(
                             {
                                 "type": "text",
@@ -2154,8 +2221,7 @@ class Pipe:
                             }
                         )
                     except Exception as e:
-                        if self.valves.DEBUG:
-                            logger.debug(f"Unexpected error processing image: {e}")
+                        logger.debug(f"Unexpected error processing image: {e}")
                         processed_content.append(
                             {
                                 "type": "text",
@@ -2192,8 +2258,7 @@ class Pipe:
 
             # Handle any other content types by converting to text
             else:
-                if self.valves.DEBUG:
-                    logger.debug(f" Unknown content type: {item.get('type')}, converting to text")
+                logger.debug(f" Unknown content type: {item.get('type')}, converting to text")
                 # Convert unknown types to text representation
                 processed_content.append(
                     {
@@ -2252,24 +2317,26 @@ class Pipe:
 
     def _extract_and_remove_memorys(self, text: str) -> tuple[str, Optional[str]]:
         """
-        Extract User Context from Openwebui Memory System from system prompt and remove it in one pass.
-        Pattern (Hopefully stays that way): \nUser Context:\n ... \n\n (always followed by double newline)
+        Extract User Context from Openwebui Memory System from system prompt and remove it.
+        Takes everything after "\nUser Context:\n" until end of string.
         
         Returns:
             tuple[str, Optional[str]]: (cleaned_text, extracted_context)
             - cleaned_text: Original text with User Context removed (stripped)
             - extracted_context: The extracted User Context block with label, or None if not found
         """
-        pattern = r'\nUser Context:\n(.*?)\n\n'
+        # Simple: Everything after "\nUser Context:\n" is memory content
+        pattern = r'\nUser Context:\n(.*)$'
         match = re.search(pattern, text, re.DOTALL)
         
         if match:
             context_content = match.group(1).strip()
             extracted_context = f"User Context:\n{context_content}" if context_content else None
-            cleaned_text = re.sub(pattern, '', text, flags=re.DOTALL).strip()
+            # Remove "\nUser Context:\n" and everything after it
+            cleaned_text = text[:match.start()].strip()
             return cleaned_text, extracted_context
 
-        # No User Context found - still strip the text
+        # No User Context found
         return text.strip(), None
 
     async def handle_citation(self, event, __event_emitter__, citation_counter=None):
@@ -2282,8 +2349,7 @@ class Pipe:
             citation_counter: Optional citation number for inline citations
         """
         try:
-            if self.valves.DEBUG:
-                logger.debug(f" Processing citation event type: {getattr(event, 'type', 'unknown')}")
+            logger.debug(f" Processing citation event type: {getattr(event, 'type', 'unknown')}")
 
             # Extract citation from delta within content_block_delta event
             delta = getattr(event, "delta", None)
@@ -2297,8 +2363,7 @@ class Pipe:
 
 
             if not citation:
-                if self.valves.DEBUG:
-                    logger.debug(f"No citation data found in event")
+                logger.debug(f"No citation data found in event")
                 return
             
             logger.debug(f" Citation data found: {citation}")
@@ -2306,8 +2371,7 @@ class Pipe:
             # Only handle web search result citations
             citation_type = getattr(citation, "type", "")
             if citation_type != "web_search_result_location":
-                if self.valves.DEBUG:
-                    logger.debug(f" Skipping non-web-search citation type: {citation_type}")
+                logger.debug(f" Skipping non-web-search citation type: {citation_type}")
                 return
 
             # Extract web search citation information
@@ -2338,8 +2402,7 @@ class Pipe:
             await self.emit_event({"type": "source", "data": source_data}, __event_emitter__)
 
         except Exception as e:
-            if self.valves.DEBUG:
-                logger.debug(f"Error handling citation: {str(e)}")
+            logger.error(f"Error handling citation: {str(e)}")
             await self.handle_errors(e, __event_emitter__)
 
     async def emit_event(
