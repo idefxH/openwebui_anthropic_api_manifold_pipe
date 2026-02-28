@@ -4,7 +4,7 @@ id: anthropic_new
 author: Podden (https://github.com/Podden/)
 github: https://github.com/Podden/openwebui_anthropic_api_manifold_pipe
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.8.4
+version: 0.8.5
 license: MIT
 requirements: pydantic>=2.0.0, anthropic>=0.75.0
 environment_variables:
@@ -37,6 +37,14 @@ Supports:
 - Programmatic Tool Calling (tools callable from code execution)
 
 Changelog:
+v0.8.5
+- Refactored: Cache control logic consolidated into single `_apply_cache_control()` method
+  - All scattered cache_control placement removed from `_create_payload()` and tool loop
+  - Cache breakpoints now applied fresh right before every API call (initial + tool loop iterations)
+  - Bug fix: Tools now cached at all non-disabled levels (was missing at "messages" level)
+  - Tool loop: properly handles programmatic vs standard tool calling cache placement
+- Fixed: Effort level "max" now exclusively reserved for Opus 4.6 (was incorrectly allowed for Sonnet 4.6)
+
 v0.8.4
 - Fixed: Streaming overloaded_error (HTTP 200 + SSE error) now retries instead of failing immediately (GH #19)
 - Fixed: Non-streaming OverloadedError (529) was falling through to generic APIStatusError handler instead of retrying
@@ -518,7 +526,7 @@ class Pipe:
             "supports_memory": True,
             "supports_vision": True,
             "supports_effort": True,
-            "supports_effort_max": True,
+            "supports_effort_max": False,  # max effort is Opus 4.6 only
             "supports_programmatic_calling": True,
             "supports_dynamic_filtering": True,
             "supports_fast_mode": False,
@@ -1443,6 +1451,147 @@ class Pipe:
         return blocks_by_user_msg, processed_filenames
 
     # =========================================================================
+    # CACHE CONTROL
+    # =========================================================================
+
+    def _apply_cache_control(self, payload: dict, is_tool_loop: bool = False) -> None:
+        """Apply cache_control breakpoints to the payload right before sending to the API.
+
+        Called once before the initial request and once before each tool loop iteration.
+        Strips all existing cache_control markers first, then applies fresh ones
+        based on the current payload state and valve configuration.
+
+        Anthropic rules:
+        - Max 4 breakpoints, hierarchy: tools → system → messages
+        - Cache prefixes are cumulative (hash depends on all prior blocks)
+        - Never add cache_control to thinking/redacted_thinking blocks (API rejects extra fields)
+        - 20-block lookback window from each explicit breakpoint
+        - Minimum cacheable: 1024-4096 tokens depending on model
+        - Tool_result blocks CAN have cache_control (unless programmatic calling)
+        """
+        cache_level = self.valves.CACHE_CONTROL
+        if cache_level == "cache disabled":
+            return
+
+        # --- Step 1: Strip all existing cache_control from entire payload ---
+        for tool in payload.get("tools", []):
+            tool.pop("cache_control", None)
+        for block in payload.get("system", []):
+            block.pop("cache_control", None)
+        for msg in payload.get("messages", []):
+            content = msg.get("content", [])
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict):
+                        block.pop("cache_control", None)
+
+        # --- Step 2: Cache tools (breakpoint 1) ---
+        # Always cache tools at every non-disabled level — tools rarely change
+        # and having a separate breakpoint ensures cache hits even when system/messages change.
+        tools = payload.get("tools", [])
+        if tools:
+            # Find last non-deferred tool for the breakpoint
+            placed = False
+            for i in range(len(tools) - 1, -1, -1):
+                if not tools[i].get("defer_loading", False):
+                    tools[i]["cache_control"] = {"type": "ephemeral"}
+                    placed = True
+                    break
+            if not placed:
+                # All deferred — cache the last one anyway
+                tools[-1]["cache_control"] = {"type": "ephemeral"}
+
+        if cache_level == "cache tools array only":
+            return
+
+        # --- Step 3: Cache system prompt (breakpoint 2) ---
+        system = payload.get("system", [])
+        if system:
+            # Find last text block with content
+            for i in range(len(system) - 1, -1, -1):
+                block = system[i]
+                if block.get("type") == "text" and block.get("text", "").strip():
+                    block["cache_control"] = {"type": "ephemeral"}
+                    break
+
+        if cache_level == "cache tools array and system prompt":
+            return
+
+        # --- Step 4: Cache messages (breakpoint 3) ---
+        # "cache tools array, system prompt and messages"
+        messages = payload.get("messages", [])
+        if not messages:
+            return
+
+        if is_tool_loop:
+            # During tool loops: cache the last tool_result in the newest user message.
+            # This caches the entire conversation (tools + system + all messages up to here)
+            # so the next iteration gets a cache hit on everything.
+            # EXCEPTION: Programmatic tool calling — API rejects cache_control on
+            # tool_result blocks routed through code_execution.
+            if self.valves.ENABLE_PROGRAMMATIC_TOOL_CALLING:
+                # With programmatic calling, cache the last assistant message block instead
+                # (thinking blocks excluded — find last text or tool_use block)
+                for msg in reversed(messages):
+                    if msg.get("role") == "assistant":
+                        self._place_cache_on_last_cacheable_block(msg.get("content", []))
+                        break
+            else:
+                # Standard tool loop: cache the last user message block (tool_result)
+                for msg in reversed(messages):
+                    if msg.get("role") == "user":
+                        content = msg.get("content", [])
+                        if content:
+                            # tool_result blocks are cacheable
+                            content[-1]["cache_control"] = {"type": "ephemeral"}
+                        break
+        else:
+            # Initial request: cache the last stable user message
+            self._cache_last_stable_message(messages)
+
+    def _place_cache_on_last_cacheable_block(self, content_blocks: list) -> None:
+        """Add cache_control to the last block that isn't thinking/redacted_thinking."""
+        if not content_blocks:
+            return
+        for i in range(len(content_blocks) - 1, -1, -1):
+            block = content_blocks[i]
+            if isinstance(block, dict) and block.get("type") not in (
+                "thinking", "redacted_thinking"
+            ):
+                block["cache_control"] = {"type": "ephemeral"}
+                return
+
+    def _cache_last_stable_message(self, messages: list) -> None:
+        """Place cache breakpoint on the last stable message, avoiding RAG content
+        and thinking/redacted_thinking blocks.
+
+        RAG content changes per request (injected by OpenWebUI), so caching it
+        would create a new cache entry every time, wasting cache writes.
+        When RAG is detected in the last message, we cache the second-to-last instead.
+        """
+        if not messages:
+            return
+
+        last_msg = messages[-1]
+        last_content = last_msg.get("content", [])
+
+        # Detect RAG content in last message
+        has_rag = False
+        if isinstance(last_content, list):
+            for block in last_content:
+                if block.get("type") == "text":
+                    text = block.get("text", "")
+                    if "<context>" in text or ("### Task:" in text and "<source" in text):
+                        has_rag = True
+                        break
+
+        target_idx = -2 if (has_rag and len(messages) >= 2) else -1
+        target_msg = messages[target_idx]
+        target_content = target_msg.get("content", [])
+
+        self._place_cache_on_last_cacheable_block(target_content)
+
+    # =========================================================================
     # PAYLOAD BUILDING & MESSAGE/TOOL CONVERSION
     # =========================================================================
 
@@ -1493,13 +1642,22 @@ class Pipe:
             # Determine effective effort level
             body_effort = body.get("reasoning_effort")
             if body_effort in ["low", "medium", "high", "max"]:
-                effective_effort = body_effort
+                # "max" is Opus 4.6 only — clamp to "high" for other models
+                if body_effort == "max" and not model_info["supports_effort_max"]:
+                    effective_effort = "high"
+                else:
+                    effective_effort = body_effort
             elif (
                 model_info["supports_effort_max"] and __user__["valves"].EFFORT == "max"
             ):
                 effective_effort = "max"
             else:
-                effective_effort = __user__["valves"].EFFORT
+                # Clamp user valve "max" to "high" for non-Opus 4.6 models
+                valve_effort = __user__["valves"].EFFORT
+                if valve_effort == "max" and not model_info["supports_effort_max"]:
+                    effective_effort = "high"
+                else:
+                    effective_effort = valve_effort
 
             effort_config = {"effort": effective_effort}
             logger.debug(f"Effort level set to: {effective_effort}")
@@ -1844,23 +2002,6 @@ class Pipe:
             # Add betas list to payload for beta.messages.stream
             payload["betas"] = beta_headers
 
-        # Tools Caching
-        if tools_list and len(tools_list) > 0:
-            if self.valves.CACHE_CONTROL in [
-                "cache tools array only",
-                "cache tools array and system prompt",
-            ]:
-                last_tool = tools_list[-1]
-                # Only add cache_control if tool doesn't have defer_loading
-                if last_tool.get("defer_loading", False):
-                    last_tool["cache_control"] = {"type": "ephemeral"}
-                else:
-                    # Find the last non-deferred tool to add cache_control
-                    for i in range(len(tools_list) - 1, -1, -1):
-                        if not tools_list[i].get("defer_loading", False):
-                            tools_list[i]["cache_control"] = {"type": "ephemeral"}
-                            break
-
             ## Tool Choice Handling
             if __metadata__.get("web_search_enforced"):
                 # Check if web_search is actually in the tools list
@@ -1884,52 +2025,7 @@ class Pipe:
 
         # Processing Messages and Caching
         if system_messages and len(system_messages) > 0:
-            # Add cache_control to last system message block ONLY if caching up to system (not messages)
-            # Support both old typo and corrected spelling for backward compatibility
-            if self.valves.CACHE_CONTROL in [
-                "cache tools array and system prompt",
-                "cache tools array, system prompt and messages",
-            ]:
-                last_system_block = system_messages[-1]
-                # Only add if block has non-empty text
-                if (
-                    last_system_block.get("type") == "text"
-                    and last_system_block.get("text", "").strip()
-                ):
-                    last_system_block["cache_control"] = {"type": "ephemeral"}
             payload["system"] = system_messages
-
-        if (
-            self.valves.CACHE_CONTROL == "cache tools array, system prompt and messages"
-            and processed_messages
-            and len(processed_messages) > 0
-        ):
-            # Check if last message has RAG content
-            last_msg = processed_messages[-1]
-            last_msg_content = last_msg.get("content", [])
-
-            # We want to exclude RAG content from caching, so place the cache breakpoint to the second last message if RAG is present
-            has_rag_in_content = False
-            for block in last_msg_content:
-                if block.get("type") == "text":
-                    text = block.get("text", "")
-                    if "<context>" in text or (
-                        "### Task:" in text and "<source" in text
-                    ):
-                        has_rag_in_content = True
-                        break
-            # Only use -2 if we have at least 2 messages, otherwise use -1
-            target_index = (
-                -2 if (has_rag_in_content and len(processed_messages) >= 2) else -1
-            )
-            target_msg = processed_messages[target_index]
-            content_blocks = target_msg.get("content", [])
-            if content_blocks:
-                last_content_block = content_blocks[-1]
-                # GUARD: Never add cache_control to thinking/redacted_thinking blocks
-                # The API rejects any extra fields on thinking blocks
-                if last_content_block.get("type") not in ("thinking", "redacted_thinking"):
-                    last_content_block.setdefault("cache_control", {"type": "ephemeral"})
 
         payload["messages"] = processed_messages
 
@@ -2823,19 +2919,6 @@ class Pipe:
             chunk = ""
             chunk_count = 0
 
-            # Find cached block for preservation across tool loops
-            cached_block = None
-            if payload_for_stream.get("messages"):
-                for msg in reversed(payload_for_stream["messages"]):
-                    content = msg.get("content")
-                    if isinstance(content, list):
-                        for block in reversed(content):
-                            if isinstance(block, dict) and "cache_control" in block:
-                                cached_block = block
-                                break
-                    if cached_block:
-                        break
-
             await emit_event_local(
                 {
                     "type": "status",
@@ -2862,11 +2945,6 @@ class Pipe:
                 stream_output_tokens = 0
 
                 try:
-                    # Ensure cache_control is preserved (some SDKs/APIs might strip it or we might lose it in loop)
-                    if cached_block and "cache_control" not in cached_block:
-                        logger.debug("Restoring missing cache_control marker")
-                        cached_block["cache_control"] = {"type": "ephemeral"}
-
                     # Verbose tool loop logging
                     msg_summary = []
                     for msg in payload_for_stream.get("messages", []):
@@ -2930,6 +3008,8 @@ class Pipe:
                         )
 
                     stream_event_counts = {}  # Track event types for diagnostics
+                    # Apply cache breakpoints right before sending to API
+                    self._apply_cache_control(payload_for_stream, is_tool_loop=(tool_loop_iteration > 1))
                     async with client.beta.messages.stream(
                         **payload_for_stream
                     ) as stream:
@@ -4427,23 +4507,6 @@ class Pipe:
                             # Optimization: Move cache_control to the end for multi-step tool loops
                             # This ensures we cache the tool results for the next iteration
                             # IMPORTANT: Skip when programmatic tool calling is active - Anthropic rejects
-                            # cache_control on tool_result blocks called by code_execution
-                            if (
-                                self.valves.CACHE_CONTROL
-                                == "cache tools array, system prompt and messages"
-                                and not self.valves.ENABLE_PROGRAMMATIC_TOOL_CALLING
-                            ):
-                                # Remove from old block to avoid exceeding 4 blocks limit
-                                if cached_block and "cache_control" in cached_block:
-                                    del cached_block["cache_control"]
-
-                                # Add to new last block
-                                last_tool_result = user_content[-1]
-                                last_tool_result["cache_control"] = {
-                                    "type": "ephemeral"
-                                }
-                                cached_block = last_tool_result
-
                             payload_for_stream["messages"].append(
                                 {"role": "user", "content": user_content}
                             )
