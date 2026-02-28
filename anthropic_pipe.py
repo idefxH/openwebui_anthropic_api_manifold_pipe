@@ -3,7 +3,7 @@ title: Anthropic API Integration
 author: Podden (https://github.com/Podden/)
 github: https://github.com/Podden/openwebui_anthropic_api_manifold_pipe
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.4.1
+version: 0.4.3
 license: MIT
 requirements: pydantic>=2.0.0, aiohttp>=3.8.0
 environment_variables:
@@ -32,7 +32,18 @@ Todo:
 - Connect Anthropic Memory System with OpenWebUI Memory System
 
 Changelog:
+v0.4.3
+- Fixed compatibility with OpenWebUI "Chat with Notes" feature
+- Added filtering for empty text content blocks to prevent API errors
+- Messages with empty content arrays are now skipped (fixes empty assistant messages from Notes chat)
+
+v0.4.2
+- Fixed NoneType error in OpenWebUI Channels when models are mentioned (@model)
+- Added safe event emitter wrapper to handle missing __event_emitter__ in channel contexts
+- All status/notification/citation events now gracefully handle None event emitter
+
 v0.4.1
+- Added a Valve to Show Token Count in the final status message
 - Auto-enable native function calling when tools are present (prevents OpenWebUI's function_calling task system)
 
 v0.4.0
@@ -139,6 +150,24 @@ except ImportError:
 class Pipe:
     API_VERSION = "2023-06-01"  # Current API version as of May 2025
     MODEL_URL = "https://api.anthropic.com/v1/messages"
+    
+    @staticmethod
+    async def _safe_emit(
+        __event_emitter__: Optional[Callable[[Dict[str, Any]], Awaitable[None]]],
+        event: Dict[str, Any]
+    ) -> None:
+        """
+        Safely emit an event, handling None __event_emitter__ (e.g., in Channel contexts).
+        
+        In OpenWebUI Channels, when models are mentioned, __event_emitter__ is None
+        because the channel context doesn't provide a socket connection for status updates.
+        This helper prevents 'NoneType' object is not callable errors.
+        """
+        if __event_emitter__ is not None:
+            try:
+                await __event_emitter__(event)
+            except Exception as e:
+                print(f"[WARNING] Event emitter failed: {e}")
     
     # Centralized model capabilities database
     # Note: Anthropic's /v1/models API only returns id, display_name, created_at, and type.
@@ -300,6 +329,10 @@ class Pipe:
         ENABLE_1M_CONTEXT: bool = Field(
             default=False,
             description="Enable 1M token context window for Claude Sonnet 4 (requires Tier 4 API access)",
+        )
+        SHOW_TOKEN_COUNT: bool = Field(
+            default=False,
+            description="Show token count for the current conversation",
         )
         WEB_SEARCH: bool = Field(
             default=True,
@@ -497,8 +530,11 @@ class Pipe:
                         block["cache_control"] = {"type": "ephemeral"}
                     system_messages.append(block)
             else:
-                # Keep all historical messages as-is (they contain context from their time)
-                processed_messages.append({"role": role, "content": processed_content})
+                # Only add messages with non-empty content (fixes Chat with Notes empty assistant messages)
+                if processed_content:
+                    processed_messages.append({"role": role, "content": processed_content})
+                elif self.valves.DEBUG:
+                    print(f"[DEBUG] Skipped message with empty content (role: {role})")
 
         if not processed_messages:
             raise ValueError("No valid messages to process")
@@ -536,7 +572,7 @@ class Pipe:
                     if self.valves.DEBUG:
                         print("[DEBUG] Skipped forced web_search due to active thinking")
                     # Notify user about the conflict
-                    await __event_emitter__(
+                    await self._safe_emit(__event_emitter__, 
                         {
                             "type": "notification",
                             "data": {
@@ -563,10 +599,12 @@ class Pipe:
                     }
                     content_blocks.append(context_block)
             
-            # Apply cache control to last content block
+            # Apply cache control to last content block (only if it has text)
             if content_blocks and self.valves.CACHE_CONTROL == "cache tools array, system prompt and messages":
                 last_content_block = content_blocks[-1]
-                last_content_block.setdefault("cache_control", {"type": "ephemeral"})
+                # Only add cache_control if the block has non-empty text
+                if last_content_block.get("type") == "text" and last_content_block.get("text", "").strip():
+                    last_content_block.setdefault("cache_control", {"type": "ephemeral"})
             payload["messages"] = processed_messages
 
         headers = {
@@ -727,7 +765,7 @@ class Pipe:
             error_msg = "Error: ANTHROPIC_API_KEY is required"
             if self.valves.DEBUG:
                 print(f"[DEBUG] {error_msg}")
-                await __event_emitter__(
+                await self._safe_emit(__event_emitter__, 
                     {
                         "type": "status",
                         "data": {
@@ -767,7 +805,7 @@ class Pipe:
                                     print(f"[DEBUG] Auto-enabling native function calling for model: {openwebui_model_id}")
                                 
                                 # Notify user
-                                await __event_emitter__(
+                                await self._safe_emit(__event_emitter__, 
                                     {
                                         "type": "notification",
                                         "data": {
@@ -815,7 +853,8 @@ class Pipe:
             citation_counter = 0  # Track citation numbers for inline citations
             citations_list = []  # Store citations for reference list
             retry_attempts = 0
-            await __event_emitter__(
+            usage_data = {}
+            await self._safe_emit(__event_emitter__, 
             {
                 "type": "status",
                 "data": {
@@ -875,15 +914,16 @@ class Pipe:
                                                 f"[DEBUG] Usage stats: input={input_tokens}, output={output_tokens}, cache_creation={cache_creation_input_tokens}, cache_read={cache_read_input_tokens}"
                                             )
                                         
+                                        # Normalize usage keys to snake_case (avoid space variants)
                                         usage_data = {
-                                            "input tokens": input_tokens,
-                                            "output tokens": output_tokens,
+                                            "input_tokens": input_tokens,
+                                            "output_tokens": output_tokens,
                                             "total_tokens": input_tokens + output_tokens,
                                             "cache_creation_input_tokens": cache_creation_input_tokens,
                                             "cache_read_input_tokens": cache_read_input_tokens,
                                         }
                                         
-                                        await __event_emitter__(
+                                        await self._safe_emit(__event_emitter__, 
                                             {
                                                 "type": "chat:completion",
                                                 "data": {
@@ -906,7 +946,7 @@ class Pipe:
                                     is_model_thinking = True
                                     thinking_message = "\n<details>\n<summary>🧠 Thinking...</summary>\n\n"
                                     # Stream opening tag immediately so it renders as HTML
-                                    await __event_emitter__(
+                                    await self._safe_emit(__event_emitter__, 
                                         {
                                             "type": "chat:message:delta",
                                             "data": {"content": thinking_message},
@@ -937,7 +977,7 @@ class Pipe:
                                     )
                                     name = getattr(content_block, "name", "")
                                     if name == "code_execution":
-                                        await __event_emitter__(
+                                        await self._safe_emit(__event_emitter__, 
                                             {
                                                 "type": "status",
                                                 "data": {
@@ -969,7 +1009,7 @@ class Pipe:
                                             )
                                             + f"</details>\n"
                                         )
-                                        await __event_emitter__(
+                                        await self._safe_emit(__event_emitter__, 
                                             {
                                                 "type": "chat:message:delta",
                                                 "data": {"content": code_result_msg},
@@ -1009,7 +1049,7 @@ class Pipe:
                                             else:
                                                 status_desc = "Web Search Complete"
                                             
-                                            await __event_emitter__(
+                                            await self._safe_emit(__event_emitter__, 
                                                 {
                                                     "type": "status",
                                                     "data": {
@@ -1027,7 +1067,7 @@ class Pipe:
                                         thinking_text = getattr(delta, "thinking", "")
                                         thinking_message += thinking_text
                                         # Stream thinking text to UI in real-time
-                                        await __event_emitter__(
+                                        await self._safe_emit(__event_emitter__, 
                                             {
                                                 "type": "chat:message:delta",
                                                 "data": {"content": thinking_text},
@@ -1070,7 +1110,7 @@ class Pipe:
                                                         if self.valves.DEBUG:
                                                             print(f"[DEBUG] Emitting status for complete query: {current_search_query}")
                                                         
-                                                        await __event_emitter__(
+                                                        await self._safe_emit(__event_emitter__, 
                                                             {
                                                                 "type": "status",
                                                                 "data": {
@@ -1149,7 +1189,7 @@ class Pipe:
                                         if tool_name == "web_search":
                                             query = server_tool.get('input', {}).get('query', current_search_query)
                                             if query:
-                                                await __event_emitter__(
+                                                await self._safe_emit(__event_emitter__, 
                                                     {
                                                         "type": "status",
                                                         "data": {
@@ -1178,7 +1218,7 @@ class Pipe:
                                         if self.valves.DEBUG:
                                             print(f"[DEBUG] Preserved thinking block with {len(current_thinking_block.get('thinking', ''))} chars")
                                     # Send closing tag to complete the details block
-                                    await __event_emitter__(
+                                    await self._safe_emit(__event_emitter__, 
                                     {
                                         "type": "chat:message:delta",
                                         "data": {"content": "\n</details>"},
@@ -1244,7 +1284,7 @@ class Pipe:
                                     )
 
                             if chunk_count > token_buffer_size:
-                                await __event_emitter__(
+                                await self._safe_emit(__event_emitter__, 
                                     {
                                         "type": "chat:message:delta",
                                         "data": {"content": chunk},
@@ -1256,7 +1296,7 @@ class Pipe:
 
                     # Sende letzten Chunk, falls noch etwas übrig ist
                     if chunk.strip():
-                        await __event_emitter__(
+                        await self._safe_emit(__event_emitter__, 
                             {
                                 "type": "chat:message:delta",
                                 "data": {"content": chunk},
@@ -1416,7 +1456,7 @@ class Pipe:
                         if self.valves.DEBUG:
                             print(f"[DEBUG] {error_type} ({status_code}), retry {retry_attempts}/{self.valves.MAX_RETRIES}")
                         
-                        await __event_emitter__({
+                        await self._safe_emit(__event_emitter__, {
                             "type": "status",
                             "data": {
                                 "description": f"⏳ API {error_type}, retrying...)",
@@ -1439,7 +1479,7 @@ class Pipe:
                         if self.valves.DEBUG:
                             print(f"[DEBUG] Connection error, retry {retry_attempts}/{self.valves.MAX_RETRIES}")
                         
-                        await __event_emitter__({
+                        await self._safe_emit(__event_emitter__, {
                             "type": "status",
                             "data": {
                                 "description": f"🌐 Connection error, retrying... ({retry_attempts}/{self.valves.MAX_RETRIES})",
@@ -1470,10 +1510,37 @@ class Pipe:
                     )
         except Exception as e:
             await self.handle_errors(e, __event_emitter__)
-        await __event_emitter__({
+        # Preserve existing generated content; append completion marker
+        final_status = "✅ Response processing complete."
+        if self.valves.SHOW_TOKEN_COUNT and usage_data:
+            # Safely extract tokens
+            input_tokens = usage_data.get("input_tokens", 0)
+            output_tokens = usage_data.get("output_tokens", 0)
+            cache_read_input_tokens = usage_data.get("cache_read_input_tokens", 0)
+            cache_creation_input_tokens = usage_data.get("cache_creation_input_tokens", 0)
+            total_tokens = input_tokens + output_tokens + cache_read_input_tokens + cache_creation_input_tokens
+            usage_data["total_tokens"] = total_tokens  # ensure consistency
+
+            # Percentage of assumed 200k context window (Claude 3.5 Sonnet extended)
+            percentage = min((total_tokens / 200000) * 100, 100)
+
+            # Progress bar (10 segments)
+            filled = int(percentage / 10)
+            bar = "█" * filled + "░" * (10 - filled)
+
+            def format_num(n: int) -> str:
+                if n >= 1_000_000:
+                    return f"{n/1_000_000:.1f}M"
+                if n >= 1_000:
+                    return f"{n/1_000:.1f}K"
+                return str(n)
+
+            final_status += f" [{bar}] {format_num(total_tokens)}/200k ({percentage:.1f}%)"
+
+        await self._safe_emit(__event_emitter__, {
                             "type": "status",
                             "data": {
-                                "description": "✅ Response processing complete.",
+                                "description": final_status,
                                 "done": True,
                             }
                         })
@@ -1629,37 +1696,33 @@ class Pipe:
             except Exception:
                 pass  # Ignore if we can't get request ID
 
-        await __event_emitter__(
-            {
-                "type": "notification",
-                "data": {
-                    "type": "error",
-                    "content": user_msg,
-                },
-            }
-        )
+        await self._safe_emit(__event_emitter__, {
+            "type": "notification",
+            "data": {
+                "type": "error",
+                "content": user_msg,
+            },
+        })
         import traceback
 
         tb = traceback.format_exc()
         from datetime import datetime
 
-        await __event_emitter__(
-            {
-                "type": "source",
-                "data": {
-                    "source": {"name": "Anthropic Error", "url": None},
-                    "document": [tb],
-                    "metadata": [
-                        {
-                            "source": "anthropic api",
-                            "type": "error",
-                            "date_accessed": datetime.utcnow().isoformat(),
-                        }
-                    ],
-                },
-            }
-        )
-        await __event_emitter__({
+        await self._safe_emit(__event_emitter__, {
+            "type": "source",
+            "data": {
+                "source": {"name": "Anthropic Error", "url": None},
+                "document": [tb],
+                "metadata": [
+                    {
+                        "source": "anthropic api",
+                        "type": "error",
+                        "date_accessed": datetime.utcnow().isoformat(),
+                    }
+                ],
+            },
+        })
+        await self._safe_emit(__event_emitter__, {
             "type": "status",
             "data": {
                 "description": "❌ Response with Errors",
@@ -1793,7 +1856,7 @@ class Pipe:
                 f"{formatted_result}\n"
                 f"</details>\n"
             )
-            await __event_emitter__(
+            await self._safe_emit(__event_emitter__, 
                 {
                     "type": "chat:message:delta",
                     "data": {
@@ -1858,7 +1921,7 @@ class Pipe:
             tool_name = tool_data.get("name", "unknown")
             tool_input = tool_data.get("input", {})
 
-            await __event_emitter__(
+            await self._safe_emit(__event_emitter__, 
                 {
                     "type": "status",
                     "data": {
@@ -1879,16 +1942,24 @@ class Pipe:
         Process content from OpenWebUI format to Claude API format.
         Handles text, images, PDFs, tool_calls, and tool_results according to
         Anthropic API documentation.
+        Filters out empty text blocks to prevent API errors.
         """
         if isinstance(content, str):
             # Remove thinking blocks from historical messages
             content = self._remove_thinking_blocks(content)
-            return [{"type": "text", "text": content}]
+            # Only return non-empty text blocks
+            if content.strip():
+                return [{"type": "text", "text": content}]
+            else:
+                return []
 
         processed_content = []
         for item in content:
             if item.get("type") == "text":
-                processed_content.append({"type": "text", "text": item.get("text", "")})
+                text_content = item.get("text", "")
+                # Only add non-empty text blocks (Anthropic API requirement)
+                if text_content.strip():
+                    processed_content.append({"type": "text", "text": text_content})
 
             elif item.get("type") == "image_url":
                 image_url = item.get("image_url", {}).get("url", "")
@@ -2221,7 +2292,7 @@ class Pipe:
             }
 
             # Emit the source event
-            await __event_emitter__({"type": "source", "data": source_data})
+            await self._safe_emit(__event_emitter__, {"type": "source", "data": source_data})
 
         except Exception as e:
             if self.valves.DEBUG:
