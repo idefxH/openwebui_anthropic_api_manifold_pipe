@@ -3,7 +3,7 @@ title: Anthropic API Integration
 author: Podden (https://github.com/Podden/)
 github: https://github.com/Podden/openwebui_anthropic_api_manifold_pipe
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.4.5
+version: 0.4.6
 license: MIT
 requirements: pydantic>=2.0.0, aiohttp>=3.8.0
 environment_variables:
@@ -32,6 +32,11 @@ Todo:
 - Connect Anthropic Memory System with OpenWebUI Memory System
 
 Changelog:
+v0.4.6
+- Tool results now display input parameters at the top
+- Shows "Input:" section with tool parameters before "Output:" section
+- Improves visibility of what parameters were passed to each tool call
+
 v0.4.5
 - Added status events for local tool execution (AIT-102)
 - Tools now show "Executing tool: {tool_name}" when they start
@@ -1357,10 +1362,22 @@ class Pipe:
                                                     except Exception:
                                                         formatted_result = str(tool_result)
                                                     
+                                                    # Format tool input/parameters for display
+                                                    tool_input = tool_call_data.get("input", {})
+                                                    if tool_input:
+                                                        try:
+                                                            formatted_input = f"```json\n{json.dumps(tool_input, indent=2, ensure_ascii=False)}\n```"
+                                                        except Exception:
+                                                            formatted_input = f"```\n{str(tool_input)}\n```"
+                                                        input_section = f"**Input:**\n{formatted_input}\n\n"
+                                                    else:
+                                                        input_section = "**Input:** _(no parameters)_\n\n"
+                                                    
                                                     tool_result_msg = (
                                                         f"\n\n<details>\n"
-                                                        f"<summary>🔧 Results for {tool_name}</summary>\n\n\n"
-                                                        f"{formatted_result}\n"
+                                                        f"<summary>🔧 Results for {tool_name}</summary>\n\n"
+                                                        f"{input_section}"
+                                                        f"**Output:**\n{formatted_result}\n"
                                                         f"</details>\n"
                                                     )
                                                     await self.emit_message_delta(tool_result_msg)
@@ -1932,12 +1949,24 @@ class Pipe:
                 except Exception:
                     formatted_result = str(tool_result)
 
+            # Format tool input/parameters for display
+            tool_input = tool_call_data.get("input", {})
+            if tool_input:
+                try:
+                    formatted_input = f"```json\n{json.dumps(tool_input, indent=2, ensure_ascii=False)}\n```"
+                except Exception:
+                    formatted_input = f"```\n{str(tool_input)}\n```"
+                input_section = f"**Input:**\n{formatted_input}\n\n"
+            else:
+                input_section = "**Input:** _(no parameters)_\n\n"
+
             # Stream complete <details> block at once to ensure proper HTML rendering
             # Add double newline before tool output to ensure proper separation from previous text
             tool_result_msg = (
                 f"\n\n<details>\n"
                 f"<summary>🔧 Results for {tool_name}</summary>\n\n"
-                f"{formatted_result}\n"
+                f"{input_section}"
+                f"**Output:**\n{formatted_result}\n"
                 f"</details>\n"
             )
             await self.emit_message_delta(tool_result_msg)
