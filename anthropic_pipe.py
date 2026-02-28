@@ -4,7 +4,7 @@ id: anthropic_new
 author: Podden (https://github.com/Podden/)
 github: https://github.com/Podden/openwebui_anthropic_api_manifold_pipe
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.8.1
+version: 0.8.3
 license: MIT
 requirements: pydantic>=2.0.0, anthropic>=0.75.0
 environment_variables:
@@ -37,6 +37,16 @@ Supports:
 - Programmatic Tool Calling (tools callable from code execution)
 
 Changelog:
+v0.8.2
+- Streamlined code_execution UI for web search/fetch with dynamic filtering
+  - When dynamic filtering is active (without programmatic tool calling), code_execution UI is suppressed
+  - Only shows clean status: "🔍 Searching the web..." / "🌐 Fetching URL..."
+- Fixed max_uses not working with dynamic filtering web tools (20260209 versions don't support max_uses)
+- Added web_fetch status messages (start, URL being fetched, done/error)
+- Code execution output now emitted as source/citation event (visible in citation panel)
+- Consecutive code execution blocks are merged into one collapsible <details> block
+- Added web_fetch_tool_result handler with error detection
+
 v0.8.1
 - Added experimental Files API Support for uploading files to the Container. Feedback welcome!
 - Added a Valve to control wheter Opus/Sonnet 4.6 should use the new dynamic web_fetching and web_searching (At least I have issues with that)
@@ -71,6 +81,13 @@ v0.6.3
 - Added messages for stop_reason in case of refusal, stop_sequence or context window exceeded
 - Added ENABLE_INTERLEAVED_THINKING valve for enabling Thinking between Tool Calls
 - Homogenized Thinking and Tool Call/Results streaming to match build in OpenAI/Ollama system
+
+v0.8.3
+- Text files created via text_editor (md, txt, csv, json, etc.) now display inline as markdown instead of code blocks
+- Code files created via text_editor use proper syntax highlighting based on file extension
+- Dynamic filtering valve description updated with speed vs quality tradeoff info (~60s vs ~7s)
+- Added concise API payload logging at DEBUG level (model, tools, system size, container, max_tokens, thinking mode)
+- Added tool result content size logging for tool call loop debugging
 
 v0.6.2
 - Reordered Payload for better Caching
@@ -727,7 +744,7 @@ class Pipe:
         )
         ENABLE_DYNAMIC_FILTERING: bool = Field(
             default=True,
-            description="Use dynamic filtering for web search/fetch on supported models (4.6+). When disabled, falls back to standard web tools.",
+            description="Use dynamic filtering for web search/fetch on supported models (4.6+). Much slower (~60s vs ~7s) but produces higher quality results by orchestrating multiple searches/fetches and filtering content via code execution. Trades speed for context efficiency.",
         )
         # Files API and Skills Settings
         USE_FILES_API: bool = Field(
@@ -2088,8 +2105,11 @@ class Pipe:
             web_search_tool = {
                 "type": web_search_type,
                 "name": "web_search",
-                "max_uses": __user__["valves"].WEB_SEARCH_MAX_USES,
             }
+            # max_uses is only supported on web_search_20250305 (non-dynamic filtering)
+            # Dynamic filtering versions (20260209) don't document max_uses support
+            if web_search_type == "web_search_20250305":
+                web_search_tool["max_uses"] = __user__["valves"].WEB_SEARCH_MAX_USES
 
             # Only add user_location if at least one field has a value.
             # Only include non-empty fields to avoid Anthropic API validation errors
@@ -2123,8 +2143,11 @@ class Pipe:
             web_fetch_tool = {
                 "type": web_fetch_type,
                 "name": "web_fetch",
-                "max_uses": __user__["valves"].WEB_FETCH_MAX_USES,
             }
+            # max_uses is only supported on web_fetch_20250910 (non-dynamic filtering)
+            # Dynamic filtering versions (20260209) don't document max_uses support
+            if web_fetch_type == "web_fetch_20250910":
+                web_fetch_tool["max_uses"] = __user__["valves"].WEB_FETCH_MAX_USES
             claude_tools.append(web_fetch_tool)
             tool_names_seen.add("web_fetch")
             logger.debug(f"Added web_fetch tool: {web_fetch_type}")
@@ -2481,6 +2504,62 @@ class Pipe:
         def final_text() -> str:
             return "".join(final_message)
 
+        # Consecutive code execution merging state
+        # When multiple code_execution blocks happen back-to-back, merge into one <details>
+        pending_code_exec_parts: list[dict] = []  # [{code, language, stdout, stderr, return_code, download_links, tool_calls_info}]
+        pending_code_exec_start_idx: int = -1  # Position in final_message where first code exec block starts
+
+        def _build_merged_code_exec_block(parts: list[dict]) -> str:
+            """Build a single merged <details> block from multiple code execution parts."""
+            if not parts:
+                return ""
+            if len(parts) == 1:
+                # Single block — use normal format
+                p = parts[0]
+                return self._format_code_input_block(
+                    p["code"], p["language"],
+                    return_code=p.get("return_code"),
+                    download_links=p.get("download_links"),
+                    tool_calls_info=p.get("tool_calls_info"),
+                )
+            # Multiple blocks — merge into one <details>
+            count = len(parts)
+            result_parts = []
+            result_parts.append(f"\n<details>\n<summary>💻 Code Execution — {count} steps</summary>\n")
+            for i, p in enumerate(parts, 1):
+                lang = p.get("language", "python")
+                code = p.get("code", "")
+                rc = p.get("return_code")
+                dl = p.get("download_links", [])
+                tc = p.get("tool_calls_info", [])
+                exit_info = f" ❌ exit {rc}" if rc is not None and rc != 0 else ""
+                result_parts.append(f"\n**Step {i}** ({lang}){exit_info}\n")
+                if code:
+                    result_parts.append(f"```{lang}\n{code}\n```\n")
+                if tc:
+                    result_parts.append("🔧 Tool Calls: ")
+                    result_parts.append(", ".join(t.get("name", "?") for t in tc))
+                    result_parts.append("\n")
+                if dl:
+                    for link in dl:
+                        result_parts.append(f"- {link}\n")
+            result_parts.append("\n</details>\n")
+            return "".join(result_parts)
+
+        async def flush_pending_code_exec():
+            """Flush accumulated consecutive code execution blocks as one merged block."""
+            nonlocal pending_code_exec_parts, pending_code_exec_start_idx
+            if not pending_code_exec_parts:
+                return
+            merged_block = _build_merged_code_exec_block(pending_code_exec_parts)
+            if pending_code_exec_start_idx >= 0:
+                prefix = "".join(final_message[:pending_code_exec_start_idx])
+                await emit_message_replace(prefix + merged_block)
+            else:
+                await emit_message_delta(merged_block)
+            pending_code_exec_parts = []
+            pending_code_exec_start_idx = -1
+
         try:
             # =========================================================================
             # PHASE 2: VALIDATION & SETUP
@@ -2694,16 +2773,32 @@ class Pipe:
             active_server_tool_id = None
             server_tool_input_buffer = ""  # Accumulate server tool input JSON
             text_editor_file_content = ""  # Accumulate file_text for text_editor
+            text_editor_file_path = ""  # Track file path for text_editor
             text_editor_command = ""  # Track text_editor command (create/view/edit)
             bash_execution_command = ""  # Track bash command for code execution
             code_execution_code = ""  # Track code from programmatic code_execution
             in_code_execution = False  # Whether we're currently in a code_execution flow
+            code_exec_is_web_filtering = False  # True when code_execution is just dynamic filtering for web tools
             code_exec_tool_calls_info = []  # Accumulate tool call info for unified display
             code_exec_stream_start_idx = -1  # Position in final_message where code exec content starts
+            consecutive_code_exec_count = 0  # Track consecutive code_execution blocks for merging
+            consecutive_code_exec_parts = []  # Accumulate parts for merged code_execution blocks
             last_code_language = (
                 "bash"  # Track language of last code block for output association
             )
             last_code_content = ""  # Buffer code content for combining with output
+
+            # Dynamic filtering detection:
+            # If code_execution was NOT explicitly added to tools (no code_execution_20250825 or
+            # code_execution_20260120 in payload), then any code_execution in the stream is from
+            # dynamic filtering auto-injection → suppress UI.
+            # If code_execution WAS explicitly added, code_exec blocks could be real code → show UI.
+            payload_tools = payload.get("tools", [])
+            has_explicit_code_execution = any(
+                t.get("name") == "code_execution" for t in payload_tools
+            )
+            code_exec_has_user_tools = False  # Tracks if user tools were called in current code_exec
+            code_exec_had_web_tools = False  # Tracks if web_search/web_fetch happened inside code_exec
 
             # Web search citation state
             current_search_query = ""  # Track the current web search query
@@ -2797,10 +2892,35 @@ class Pipe:
                         f"msg_flow: {' → '.join(msg_summary[-6:]) if msg_summary else 'empty'}"
                     )
 
-                    # Debug: log container state before API call
-                    logger.debug(
-                        f"📦 Container in payload before stream: {payload_for_stream.get('container', 'NOT SET')}"
-                    )
+                    # Debug: comprehensive payload summary before API call
+                    if logger.isEnabledFor(logging.DEBUG):
+                        _tools = payload_for_stream.get("tools", [])
+                        _tool_names = [t.get("name", t.get("type", "?")) for t in _tools]
+                        _sys = payload_for_stream.get("system", [])
+                        _sys_len = sum(len(s.get("text", "")) for s in _sys) if isinstance(_sys, list) else len(str(_sys))
+                        _msgs = payload_for_stream.get("messages", [])
+                        # Last message detail
+                        _last_msg = _msgs[-1] if _msgs else {}
+                        _last_role = _last_msg.get("role", "?")
+                        _last_content = _last_msg.get("content", "")
+                        if isinstance(_last_content, list):
+                            _last_detail = [b.get("type", "?") for b in _last_content]
+                            # For tool_result, show tool IDs
+                            _tool_result_ids = [b.get("tool_use_id", "")[:20] for b in _last_content if b.get("type") == "tool_result"]
+                            _last_summary = f"[{','.join(_last_detail)}]" + (f" tool_ids={_tool_result_ids}" if _tool_result_ids else "")
+                        elif isinstance(_last_content, str):
+                            _last_summary = f"text({len(_last_content)}c)"
+                        else:
+                            _last_summary = "?"
+                        logger.debug(
+                            f"📤 API payload: model={payload_for_stream.get('model', '?')} | "
+                            f"tools={len(_tools)}:{_tool_names} | "
+                            f"system={_sys_len}c | "
+                            f"container={payload_for_stream.get('container', 'NONE')} | "
+                            f"max_tokens={payload_for_stream.get('max_tokens', '?')} | "
+                            f"thinking={payload_for_stream.get('thinking', {}).get('type', 'off')} | "
+                            f"last_msg={_last_role}:{_last_summary}"
+                        )
 
                     stream_event_counts = {}  # Track event types for diagnostics
                     async with client.beta.messages.stream(
@@ -2887,6 +3007,11 @@ class Pipe:
                                 current_block_type = content_type
                                 if not content_block:
                                     continue
+
+                                # Flush pending consecutive code execution blocks when a non-code block starts
+                                if content_type in ("text", "thinking", "redacted_thinking") and pending_code_exec_parts:
+                                    await flush_pending_code_exec()
+
                                 if content_type == "text":
                                     chunk += content_block.text or ""
                                 if content_type == "thinking":
@@ -2912,7 +3037,21 @@ class Pipe:
                                     )
 
                                     # Emit status immediately when tool_use block starts
-                                    if in_code_execution:
+                                    if in_code_execution and code_exec_is_web_filtering:
+                                        # User tool called from within code_execution → NOT just web filtering
+                                        code_exec_is_web_filtering = False
+                                        code_exec_has_user_tools = True
+                                        # Emit the deferred "Running code" status
+                                        await emit_event_local(
+                                            {
+                                                "type": "status",
+                                                "data": {
+                                                    "description": "⚡ Running code...",
+                                                    "done": False,
+                                                },
+                                            }
+                                        )
+                                    if in_code_execution and not code_exec_is_web_filtering:
                                         # Programmatic tool call - show as sub-step of code execution
                                         await emit_event_local(
                                             {
@@ -2974,29 +3113,42 @@ class Pipe:
                                         f"Server tool started: {active_server_tool_name} (ID: {active_server_tool_id})"
                                     )
 
+                                    if active_server_tool_name in ("web_search", "web_fetch"):
+                                        # Track that web tools were used inside code_execution
+                                        # (confirms it's dynamic filtering, not programmatic code)
+                                        if in_code_execution:
+                                            code_exec_had_web_tools = True
+
                                     if active_server_tool_name == "web_search":
                                         await emit_event_local(
                                             {
                                                 "type": "status",
                                                 "data": {
-                                                    "description": "Starting Web Search...",
-                                                    "done": False,
-                                                },
-                                            }
-                                        )    
-                                    elif active_server_tool_name == "code_execution":
-                                        in_code_execution = True
-                                        code_exec_tool_calls_info = []
-                                        code_exec_stream_start_idx = len(final_message)
-                                        await emit_event_local(
-                                            {
-                                                "type": "status",
-                                                "data": {
-                                                    "description": "⚡ Running code...",
+                                                    "description": "🔍 Searching the web...",
                                                     "done": False,
                                                 },
                                             }
                                         )
+                                    elif active_server_tool_name == "web_fetch":
+                                        await emit_event_local(
+                                            {
+                                                "type": "status",
+                                                "data": {
+                                                    "description": "🌐 Fetching URL...",
+                                                    "done": False,
+                                                },
+                                            }
+                                        )
+                                    elif active_server_tool_name == "code_execution":
+                                        in_code_execution = True
+                                        # Start assuming web filtering — confirmed when web_search/web_fetch appears inside
+                                        # Flipped to False if user tools (tool_use blocks) are called
+                                        code_exec_is_web_filtering = True
+                                        code_exec_has_user_tools = False
+                                        code_exec_had_web_tools = False
+                                        code_exec_tool_calls_info = []
+                                        code_exec_stream_start_idx = len(final_message)
+                                        # Don't emit "Running code" yet — defer until we know it's not web filtering
 
                                 # Handle bash code execution results
                                 if content_type == "bash_code_execution_tool_result":
@@ -3047,16 +3199,24 @@ class Pipe:
                                             or return_code is not None
                                             or download_links
                                         ):
-                                            # Emit code execution result directly
-                                            code_result_msg = self._format_code_execution_block(
-                                                last_code_content, "bash", stdout, stderr,
-                                                return_code, download_links
-                                            )
-                                            await emit_message_delta(code_result_msg)
-
-                                            logger.debug(
-                                                f"Emitted bash code execution block"
-                                            )
+                                            if code_exec_is_web_filtering and code_exec_had_web_tools:
+                                                # Dynamic filtering confirmed: suppress code execution UI
+                                                logger.debug("Suppressed bash code execution block (web filtering)")
+                                            else:
+                                                # Accumulate for consecutive merging
+                                                if pending_code_exec_start_idx < 0:
+                                                    pending_code_exec_start_idx = len(final_message)
+                                                pending_code_exec_parts.append({
+                                                    "code": last_code_content, "language": "bash",
+                                                    "stdout": stdout, "stderr": stderr,
+                                                    "return_code": return_code, "download_links": download_links,
+                                                })
+                                                # Emit output as source/citation event
+                                                await self._emit_code_execution_source(
+                                                    emit_event_local, last_code_content, "bash",
+                                                    stdout, stderr, return_code, download_links
+                                                )
+                                                logger.debug("Accumulated bash code execution block for merging")
 
                                             # Clear buffered code
                                             last_code_content = ""
@@ -3078,34 +3238,43 @@ class Pipe:
                                             f"Text editor result type: {result_type}"
                                         )
 
-                                        # Handle create/update results
-                                        if (
-                                            result_type
-                                            == "text_editor_code_execution_create_result"
-                                        ):
-                                            # Emit code creation result directly
-                                            if last_code_content:
-                                                code_result_msg = self._format_code_execution_block(
-                                                    last_code_content, "python"
-                                                )
-                                                await emit_message_delta(code_result_msg)
+                                        if code_exec_is_web_filtering and code_exec_had_web_tools:
+                                            # Dynamic filtering confirmed: suppress text editor UI
+                                            logger.debug("Suppressed text editor block (web filtering)")
+                                            last_code_content = ""
+                                        else:
+                                            # Handle create/update results
+                                            if (
+                                                result_type
+                                                == "text_editor_code_execution_create_result"
+                                            ):
+                                                if last_code_content and last_code_language == "__inline_text__":
+                                                    # Text file → display content inline as markdown
+                                                    msg = f"\n\n{last_code_content}\n\n"
+                                                    await emit_message_delta(msg)
+                                                    logger.debug("Displayed text file content inline")
+                                                    last_code_content = ""
+                                                    last_code_language = ""
+                                                elif last_code_content:
+                                                    # Code file → accumulate for consecutive merging
+                                                    if pending_code_exec_start_idx < 0:
+                                                        pending_code_exec_start_idx = len(final_message)
+                                                    pending_code_exec_parts.append({
+                                                        "code": last_code_content, "language": last_code_language or "python",
+                                                    })
+                                                    logger.debug("Accumulated text editor create block for merging")
+                                                    last_code_content = ""
 
-                                                logger.debug(
-                                                    f"Emitted python code creation block"
+                                            elif (
+                                                result_type
+                                                == "text_editor_code_execution_view_result"
+                                            ):
+                                                content = getattr(
+                                                    result_block, "content", ""
                                                 )
-                                                # Clear buffered code
-                                                last_code_content = ""
-
-                                        elif (
-                                            result_type
-                                            == "text_editor_code_execution_view_result"
-                                        ):
-                                            content = getattr(
-                                                result_block, "content", ""
-                                            )
-                                            if content:
-                                                msg = f"\n<details>\n<summary>📄 File Content</summary>\n\n```\n{content}\n```\n</details>\n"
-                                                await emit_message_delta(msg)
+                                                if content:
+                                                    msg = f"\n<details>\n<summary>📄 File Content</summary>\n\n```\n{content}\n```\n</details>\n"
+                                                    await emit_message_delta(msg)
 
                                 # Programmatic code_execution result (tool calling via code)
                                 if content_type == "code_execution_tool_result":
@@ -3127,45 +3296,53 @@ class Pipe:
                                             stderr = getattr(result_block, "stderr", "")
                                             return_code = getattr(result_block, "return_code", None)
 
-                                    if stdout or stderr or return_code is not None or code_exec_tool_calls_info:
-                                        # Build the unified formatted block
-                                        code_result_msg = self._format_code_execution_block(
-                                            last_code_content, "python", stdout, stderr,
-                                            return_code, [],
+                                    if code_exec_is_web_filtering and code_exec_had_web_tools:
+                                        # Dynamic filtering confirmed: web tools ran inside code_execution → suppress UI
+                                        logger.debug("Suppressed code_execution_tool_result (web filtering)")
+                                        last_code_content = ""
+                                    elif stdout or stderr or return_code is not None or code_exec_tool_calls_info:
+                                        # Accumulate for consecutive merging
+                                        if pending_code_exec_start_idx < 0:
+                                            # Use code_exec_stream_start_idx if available (for replace strategy)
+                                            pending_code_exec_start_idx = (
+                                                code_exec_stream_start_idx if code_exec_stream_start_idx >= 0
+                                                else len(final_message)
+                                            )
+                                        pending_code_exec_parts.append({
+                                            "code": last_code_content, "language": "python",
+                                            "stdout": stdout, "stderr": stderr,
+                                            "return_code": return_code,
+                                            "tool_calls_info": code_exec_tool_calls_info,
+                                        })
+                                        # Emit output as source/citation event immediately
+                                        await self._emit_code_execution_source(
+                                            emit_event_local, last_code_content, "python",
+                                            stdout, stderr, return_code, [],
                                             tool_calls_info=code_exec_tool_calls_info
                                         )
-
-                                        # Use replace to swap the raw streamed code with the formatted block
-                                        if code_exec_stream_start_idx >= 0:
-                                            # Get everything BEFORE the code execution stream
-                                            prefix = "".join(final_message[:code_exec_stream_start_idx])
-                                            # Replace entire message: prefix + formatted block
-                                            new_content = prefix + code_result_msg
-                                            await emit_message_replace(new_content)
-                                            logger.debug(
-                                                f"Replaced code execution block via message:replace "
-                                                f"(prefix={len(prefix)} chars, block={len(code_result_msg)} chars)"
-                                            )
-                                        else:
-                                            # Fallback: just append as delta
-                                            await emit_message_delta(code_result_msg)
-
                                         last_code_content = ""
+
+                                    # Emit "complete" status only if it wasn't web filtering
+                                    was_web_filtering = code_exec_is_web_filtering and code_exec_had_web_tools
 
                                     # Reset code execution state
                                     in_code_execution = False
+                                    code_exec_is_web_filtering = False
+                                    code_exec_has_user_tools = False
+                                    code_exec_had_web_tools = False
                                     code_exec_tool_calls_info = []
                                     code_exec_stream_start_idx = -1
 
-                                    await emit_event_local(
-                                        {
-                                            "type": "status",
-                                            "data": {
-                                                "description": "✅ Code execution complete",
-                                                "done": True,
-                                            },
-                                        }
-                                    )
+                                    if not was_web_filtering:
+                                        await emit_event_local(
+                                            {
+                                                "type": "status",
+                                                "data": {
+                                                    "description": "✅ Code execution complete",
+                                                    "done": True,
+                                                },
+                                            }
+                                        )
 
                                 if content_type == "web_search_tool_result":
                                     logger.debug(
@@ -3216,6 +3393,37 @@ class Pipe:
                                                     },
                                                 }
                                             )
+
+                                # Handle web fetch results
+                                if content_type == "web_fetch_tool_result":
+                                    logger.debug("Processing web_fetch_tool_result")
+                                    # Check for errors (error is in content.error_code)
+                                    result_content = getattr(content_block, "content", None)
+                                    error_code = None
+                                    if result_content:
+                                        content_type_inner = getattr(result_content, "type", "")
+                                        if content_type_inner == "web_fetch_tool_error":
+                                            error_code = getattr(result_content, "error_code", "unknown")
+                                    if error_code:
+                                        await emit_event_local(
+                                            {
+                                                "type": "status",
+                                                "data": {
+                                                    "description": f"🌐 Fetch failed: {error_code}",
+                                                    "done": True,
+                                                },
+                                            }
+                                        )
+                                    else:
+                                        await emit_event_local(
+                                            {
+                                                "type": "status",
+                                                "data": {
+                                                    "description": "🌐 URL fetched",
+                                                    "done": True,
+                                                },
+                                            }
+                                        )
 
                                 # Handle tool search results (only if tool search is enabled)
                                 if content_type == "tool_search_tool_result":
@@ -3426,6 +3634,24 @@ class Pipe:
                                                     logger.debug(
                                                         f"Web search query extraction error: {e}"
                                                     )
+                                            elif active_server_tool_name == "web_fetch":
+                                                try:
+                                                    parsed = json.loads(server_tool_input_buffer)
+                                                    if "url" in parsed:
+                                                        fetch_url = parsed["url"]
+                                                        # Show truncated URL in status
+                                                        display_url = fetch_url[:60] + "..." if len(fetch_url) > 60 else fetch_url
+                                                        await emit_event_local(
+                                                            {
+                                                                "type": "status",
+                                                                "data": {
+                                                                    "description": f"🌐 Fetching: {display_url}",
+                                                                    "done": False,
+                                                                },
+                                                            }
+                                                        )
+                                                except Exception:
+                                                    pass
                                             elif (
                                                 active_server_tool_name
                                                 == "code_execution"
@@ -3470,12 +3696,16 @@ class Pipe:
                                                         text_editor_command = parsed[
                                                             "command"
                                                         ]
+                                                    if "path" in parsed:
+                                                        text_editor_file_path = parsed[
+                                                            "path"
+                                                        ]
                                                     if "file_text" in parsed:
                                                         text_editor_file_content = (
                                                             parsed["file_text"]
                                                         )
                                                         logger.debug(
-                                                            f"Text editor creating file with {len(text_editor_file_content)} chars"
+                                                            f"Text editor creating file '{text_editor_file_path}' with {len(text_editor_file_content)} chars"
                                                         )
                                                 except Exception as e:
                                                     logger.debug(
@@ -3579,13 +3809,25 @@ class Pipe:
                                         and text_editor_command == "create"
                                         and text_editor_file_content
                                     ):
-                                        # Buffer code for later combination with output
-                                        # (output comes via text_editor_code_execution_tool_result event)
-                                        last_code_language = "python"
-                                        last_code_content = text_editor_file_content
-                                        logger.debug(
-                                            f"Buffered python code for later formatting: {len(text_editor_file_content)} chars"
-                                        )
+                                        # Detect text-based files to display inline instead of as code
+                                        TEXT_EXTENSIONS = {".md", ".txt", ".csv", ".json", ".xml", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".log", ".rst", ".html", ".htm", ".css"}
+                                        file_ext = os.path.splitext(text_editor_file_path)[1].lower() if text_editor_file_path else ""
+                                        if file_ext in TEXT_EXTENSIONS:
+                                            # Text file → display inline, not as code block
+                                            last_code_content = text_editor_file_content
+                                            last_code_language = "__inline_text__"
+                                            logger.debug(
+                                                f"Buffered text file '{text_editor_file_path}' ({file_ext}) for inline display: {len(text_editor_file_content)} chars"
+                                            )
+                                        else:
+                                            # Code/binary file → show as code block
+                                            # Detect language from extension
+                                            EXT_TO_LANG = {".py": "python", ".js": "javascript", ".ts": "typescript", ".sh": "bash", ".sql": "sql", ".r": "r", ".rb": "ruby", ".java": "java", ".c": "c", ".cpp": "cpp", ".go": "go", ".rs": "rust"}
+                                            last_code_language = EXT_TO_LANG.get(file_ext, "python")
+                                            last_code_content = text_editor_file_content
+                                            logger.debug(
+                                                f"Buffered code file '{text_editor_file_path}' as {last_code_language}: {len(text_editor_file_content)} chars"
+                                            )
                                     elif (
                                         active_server_tool_name == "code_execution"
                                         and code_execution_code
@@ -3597,6 +3839,9 @@ class Pipe:
                                         logger.debug(
                                             f"Buffered code_execution code: {len(code_execution_code)} chars"
                                         )
+                                    elif active_server_tool_name == "web_fetch":
+                                        # web_fetch stop — status will be updated when result arrives
+                                        pass
                                     else:
                                         # Add line break after other server tool use
                                         await emit_message_delta("\n")
@@ -3605,6 +3850,7 @@ class Pipe:
                                     active_server_tool_id = None
                                     server_tool_input_buffer = ""
                                     text_editor_file_content = ""
+                                    text_editor_file_path = ""
                                     text_editor_command = ""
                                     bash_execution_command = ""
                                     code_execution_code = ""
@@ -3981,7 +4227,9 @@ class Pipe:
                             # Stream complete for this turn
                             # ---------------------------------------------------------
                             elif event_type == "message_stop":
-                                pass
+                                # Flush any pending consecutive code execution blocks
+                                if pending_code_exec_parts:
+                                    await flush_pending_code_exec()
 
                             # ---------------------------------------------------------
                             # EVENT: message_error
@@ -4010,6 +4258,10 @@ class Pipe:
                                     await emit_message_delta(chunk)
                                     chunk = ""
                                     chunk_count = 0
+
+                        # Flush any remaining pending code execution blocks
+                        if pending_code_exec_parts:
+                            await flush_pending_code_exec()
 
                         # Capture SDK accumulated message after stream is fully consumed
                         # This replaces manual api_assistant_blocks/thinking_blocks accumulation
@@ -4188,9 +4440,17 @@ class Pipe:
                             payload_for_stream["messages"].append(
                                 {"role": "user", "content": user_content}
                             )
-                            # Debug log user message content types
-                            user_block_types = [b.get("type", "?") for b in user_content]
-                            logger.debug(f"📤 User message blocks: {user_block_types}")
+                            # Debug log tool results with content sizes
+                            if logger.isEnabledFor(logging.DEBUG):
+                                for b in user_content:
+                                    if b.get("type") == "tool_result":
+                                        _content = b.get("content", "")
+                                        _clen = len(_content) if isinstance(_content, str) else len(json.dumps(_content, default=str))
+                                        logger.debug(
+                                            f"📤 tool_result: id={b.get('tool_use_id', '?')[:25]} | "
+                                            f"is_error={b.get('is_error', False)} | "
+                                            f"content_size={_clen}c"
+                                        )
 
                         # Ensure we added at least one message, otherwise break the loop
                         if not assistant_content and not user_content:
@@ -5178,6 +5438,93 @@ class Pipe:
                 parts.append(f"- {link}\n")
         parts.append("</details>\n")
         return "".join(parts)
+
+    def _format_code_input_block(
+        self,
+        code: str,
+        language: str = "bash",
+        return_code: int = None,
+        download_links: list = None,
+        tool_calls_info: list = None,
+    ) -> str:
+        """Format code execution INPUT only as a collapsible <details> block.
+        Output is emitted separately as a source/citation event."""
+        tool_count = len(tool_calls_info) if tool_calls_info else 0
+        summary_suffix = f" — {tool_count} tool call{'s' if tool_count != 1 else ''}" if tool_count else ""
+        exit_info = f" ❌ exit {return_code}" if return_code is not None and return_code != 0 else ""
+
+        parts = []
+        parts.append(f"\n<details>\n<summary>💻 Code Execution ({language}){summary_suffix}{exit_info}</summary>\n")
+        if code:
+            parts.append(f"\n```{language}\n{code}\n```\n")
+        if tool_calls_info:
+            parts.append("\n🔧 **Tool Calls:**\n")
+            parts.append("| Tool | Arguments | Result |\n")
+            parts.append("|------|-----------|--------|\n")
+            for tc in tool_calls_info:
+                name = tc.get("name", "?")
+                inp = tc.get("input", {})
+                inp_str = ", ".join(f"{k}={v}" for k, v in inp.items()) if isinstance(inp, dict) else str(inp)
+                result = tc.get("result", "")
+                try:
+                    parsed_result = json.loads(result) if isinstance(result, str) else result
+                    result_str = str(parsed_result.get("result", parsed_result)) if isinstance(parsed_result, dict) else str(parsed_result)
+                except (json.JSONDecodeError, ValueError):
+                    result_str = str(result)
+                if len(result_str) > 100:
+                    result_str = result_str[:97] + "..."
+                error_marker = " ❌" if tc.get("is_error") else ""
+                parts.append(f"| {name} | {inp_str} | {result_str}{error_marker} |\n")
+            parts.append("\n")
+        if download_links:
+            parts.append("\n**Files:**\n")
+            for link in download_links:
+                parts.append(f"- {link}\n")
+        parts.append("</details>\n")
+        return "".join(parts)
+
+    async def _emit_code_execution_source(
+        self,
+        emit_event_local: Callable,
+        code: str,
+        language: str,
+        stdout: str = "",
+        stderr: str = "",
+        return_code: int = None,
+        download_links: list = None,
+        tool_calls_info: list = None,
+    ) -> None:
+        """Emit code execution output as a source/citation event for the citation panel."""
+        output_parts = []
+        if stdout:
+            output_parts.append(f"stdout:\n{stdout}")
+        if stderr:
+            output_parts.append(f"stderr:\n{stderr}")
+        if return_code is not None and return_code != 0:
+            output_parts.append(f"Return code: {return_code}")
+        if download_links:
+            output_parts.append("Files:\n" + "\n".join(download_links))
+
+        output_text = "\n\n".join(output_parts) if output_parts else "(no output)"
+
+        # Build a concise code summary for the source name
+        code_preview = code[:80].replace("\n", " ").strip() + "..." if code and len(code) > 80 else (code or "").replace("\n", " ").strip()
+        source_name = f"💻 {language}: {code_preview}" if code_preview else f"💻 Code Execution ({language})"
+
+        source_data = {
+            "source": {
+                "name": source_name,
+            },
+            "document": [output_text],
+            "metadata": [
+                {
+                    "source": f"code_execution_{language}_{id(code)}",
+                    "name": source_name,
+                }
+            ],
+        }
+
+        await emit_event_local({"type": "source", "data": source_data})
 
     # =========================================================================
     # SKILLS VALIDATION AND CONTAINER BUILDING
