@@ -2,7 +2,7 @@
 title: Anthropic API Integration
 author: Podden (https://github.com/Podden/)
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.3.1
+version: 0.3.3
 license: MIT
 requirements: pydantic>=2.0.0, aiohttp>=3.8.0
 environment_variables:
@@ -32,10 +32,16 @@ Todo:
 - MCP Connector (mcpo is enought for me atm)
 
 Changelog:
-v0.3.1 (September 2025)
+v0.3.3
+- Fixed Tool Call error
+
+v0.3.2
+- Fixed type and added changelog
+
+v0.3.1
 - Fixed a bug where message would disappear after Error occurs
 
-v0.3 (September 2025)
+v0.3
 - Added Vision support (__files__ handling & image processing improvements)
 - Added Extended Thinking filter & metadata override with clamped budget logic (default 10K, safe min/max enforcement)
 - Added Web Search Enforcement toggle (one‑shot metadata flag forces web_search tool_choice)
@@ -48,7 +54,7 @@ v0.3 (September 2025)
 - Improved malformed tool_use JSON salvage (_finalize_tool_buffer) & robust final chunk flush
 - Misc debug output refinements & system prompt cleanup
 
-v0.2 (August 2025)
+v0.2
 - Fixed caching by moving Memories to Messages instead of system prompt
 - You can show Cache Usage Statistics with a Valve as Source Event
 - Fixed error where last chunk is not shown in frontend
@@ -361,9 +367,15 @@ class Pipe:
             payload["top_p"] = float(body.get("top_p"))
 
         if self.valves.DEBUG:
-            print(f"[DEBUG] Thinking Filter: {__metadata__.get('anthropic_thinking')}")
-            print(f"__metadata__: {json.dumps(__metadata__, indent=2)}")
-       
+            try:
+                print(
+                    f"[DEBUG] Thinking Filter: {__metadata__.get('anthropic_thinking')}"
+                )
+                print(f"[DEBUG] Tools: {json.dumps(__tools__, indent=2)}")
+            except Exception as e:
+                print(f"[DEBUG] JSON dump failed: {e}")
+                print(f"[DEBUG] raw __metadata__: {__metadata__}")
+
         if "anthropic_thinking" in __metadata__:
             should_enable_thinking = __metadata__.get("anthropic_thinking", False)
         elif actual_model_name in self.THINKING_SUPPORTED_MODELS:
@@ -371,17 +383,21 @@ class Pipe:
             should_enable_thinking = is_thinking_variant
         else:
             should_enable_thinking = self.valves.ENABLE_THINKING
-            
+
         if self.valves.DEBUG:
             print(f"[DEBUG] Thinking Enabled?: {should_enable_thinking}")
-            
 
-        if should_enable_thinking and actual_model_name in self.THINKING_SUPPORTED_MODELS:
+        if (
+            should_enable_thinking
+            and actual_model_name in self.THINKING_SUPPORTED_MODELS
+        ):
             # Ensure thinking.budget_tokens < max_tokens and at least 1024
             requested_thinking_budget = self.valves.THINKING_BUDGET_TOKENS
             # Clamp thinking budget to valid range
             max_valid_thinking_budget = max(max_tokens - 1, 1023)
-            thinking_budget = max(1024, min(requested_thinking_budget, max_valid_thinking_budget))
+            thinking_budget = max(
+                1024, min(requested_thinking_budget, max_valid_thinking_budget)
+            )
             # If max_tokens is too low, set thinking_budget to max_tokens - 1
             if max_tokens <= 1024:
                 thinking_budget = max_tokens - 1 if max_tokens > 1 else 1
@@ -414,8 +430,10 @@ class Pipe:
                             # Reconstruct without the "User Context:\n\n" prefix
                             text = parts[0] + parts[1]
                             block["text"] = text
-                    #Disable Caching if Memory System or RAG is used as this always changes the system promt and invalidates the cache
-                    if "User Context:\n" in text or ("### Task:" in text and "</user_query>" in text):
+                    # Disable Caching if Memory System or RAG is used as this always changes the system promt and invalidates the cache
+                    if "User Context:\n" in text or (
+                        "### Task:" in text and "</user_query>" in text
+                    ):
                         disable_cache = True
                     # if "User Context:" in text:
                     #     before, after = text.split("User Context:", 1)
@@ -441,24 +459,30 @@ class Pipe:
         if not processed_messages:
             raise ValueError("No valid messages to process")
         if self.valves.DEBUG:
-            print(f"[DEBUG] Processed Messages: {json.dumps(processed_messages, indent=2)}")
+            print(
+                f"[DEBUG] Processed Messages: {json.dumps(processed_messages, indent=2)}"
+            )
             print(f"[DEBUG] System Messages: {json.dumps(system_messages, indent=2)}")
             print(f"[DEBUG] Disable Cache: {disable_cache}")
         # Correct Order for Caching: Tools, System, Messages
         tools_list = self._convert_tools_to_claude_format(__tools__)
         # Decide on code execution inclusion early so we can set beta headers later
-        activate_code_execution = __metadata__.get("activate_code_execution_tool", False)
+        activate_code_execution = __metadata__.get(
+            "activate_code_execution_tool", False
+        )
         # Append code execution tool (no parameters) if enabled
         if activate_code_execution:
-            code_exec_tool = {"type": "code_execution_20250522", "name": "code_execution"}
+            code_exec_tool = {
+                "type": "code_execution_20250522",
+                "name": "code_execution",
+            }
             # Avoid duplicates if already added
             if not any(t.get("name") == "code_execution" for t in tools_list):
                 tools_list.append(code_exec_tool)
-        
+
         if tools_list and len(tools_list) > 0:
             if not disable_cache and tools_list:
                 tools_list[-1]["cache_control"] = {"type": "ephemeral"}
-
 
         if tools_list:
             # Check for enforced web search or code execution in metadata (precedence: specific enforcement first)
@@ -522,8 +546,7 @@ class Pipe:
             print(f"[DEBUG] Headers: {headers}")
         return payload, headers
 
-    def _convert_tools_to_claude_format(
-        self, __tools__) -> List[dict]:
+    def _convert_tools_to_claude_format(self, __tools__) -> List[dict]:
         """
         Convert OpenWebUI tools format to Claude API format.
         Args:
@@ -534,7 +557,19 @@ class Pipe:
         claude_tools = []
 
         if self.valves.DEBUG:
-            print(f"[DEBUG] Converting tools: {json.dumps(__tools__, indent=2)}")
+            # Only log tool names and specs, not the callable functions
+            if __tools__:
+                try:
+                    print(
+                        f"[DEBUG] Converting tools: {json.dumps(__tools__, indent=2)}"
+                    )
+                except Exception as e:
+                    print(
+                        f"[DEBUG] JSON dump failed, printing tools directly: {__tools__}"
+                    )
+                    print(f"[DEBUG] Error was: {e}")
+            else:
+                print(f"[DEBUG] No tools to convert")
 
         # Add web search tool if enabled
         if self.valves.WEB_SEARCH:
@@ -626,7 +661,7 @@ class Pipe:
                         },
                     }
                 )
-            return
+            return error_msg
 
         try:
             if inspect.isawaitable(__tools__):
@@ -634,12 +669,12 @@ class Pipe:
 
             try:
                 payload, headers = self._create_payload(
-                    body,__metadata__, __user__, __tools__, __files__
+                    body, __metadata__, __user__, __tools__, __files__
                 )
             except Exception as e:
                 # Handle payload creation errors
                 await self.handle_errors(e, __event_emitter__)
-                return
+                return f"\n\nException of type {type(e).__name__} occurred. Reason: {e}"
 
             if payload.get("stream"):
                 try:
@@ -651,7 +686,7 @@ class Pipe:
                 except Exception as e:
                     # Handle client creation errors
                     await self.handle_errors(e, __event_emitter__)
-                    return
+                    return f"\n\nException of type {type(e).__name__} occurred. Reason: {e}"
 
                 # Stream loop variables
                 token_buffer_size = getattr(self.valves, "TOKEN_BUFFER_SIZE", 1)
@@ -773,8 +808,7 @@ class Pipe:
                                                         "done": False,
                                                     },
                                                 }
-                                            
-                                        )
+                                            )
                                         if name == "code_execution":
                                             await __event_emitter__(
                                                 {
@@ -785,25 +819,36 @@ class Pipe:
                                                     },
                                                 }
                                             )
-                                            
+
                                     if content_type == "code_execution_tool_result":
-                                        result_block = getattr(content_block, "content", {})
+                                        result_block = getattr(
+                                            content_block, "content", {}
+                                        )
                                         stdout = result_block.get("stdout", "")
                                         stderr = result_block.get("stderr", "")
                                         if stdout or stderr:
                                             await __event_emitter__(
-                                            {
-                                                "type": "chat:message:delta",
-                                                "data": {
-                                                    "content": (
-                                                        f"\n<details>\n"
-                                                        f"<summary>Code Execution Result</summary>\n\n" +
-                                                        (f"```\n{stdout}\n```\n" if stdout else "") +
-                                                        (f"```\n{stderr}\n```" if stderr else "") +
-                                                        f"</details>\n"
-                                                    )
-                                                },
-                                            })
+                                                {
+                                                    "type": "chat:message:delta",
+                                                    "data": {
+                                                        "content": (
+                                                            f"\n<details>\n"
+                                                            f"<summary>Code Execution Result</summary>\n\n"
+                                                            + (
+                                                                f"```\n{stdout}\n```\n"
+                                                                if stdout
+                                                                else ""
+                                                            )
+                                                            + (
+                                                                f"```\n{stderr}\n```"
+                                                                if stderr
+                                                                else ""
+                                                            )
+                                                            + f"</details>\n"
+                                                        )
+                                                    },
+                                                }
+                                            )
                                     if content_type == "web_search_tool_result":
                                         if self.valves.DEBUG:
                                             print(
@@ -854,11 +899,40 @@ class Pipe:
                                             )
 
                                 elif event_type == "content_block_stop":
+                                    content_block = getattr(
+                                        event, "content_block", None
+                                    )
+                                    content_type = (
+                                        getattr(content_block, "type", None)
+                                        if content_block
+                                        else None
+                                    )
                                     event_name = getattr(event, "name", "")
+
+                                    # Close tools_buffer for normal tool_use content blocks
+                                    if content_type == "tool_use" and tools_buffer:
+                                        # Check if it's valid JSON already, if not close it
+                                        try:
+                                            json.loads(tools_buffer)
+                                            # Already valid JSON, no need to close
+                                            if self.valves.DEBUG:
+                                                print(
+                                                    f"[DEBUG] tools_buffer already valid JSON: {tools_buffer}"
+                                                )
+                                        except json.JSONDecodeError:
+                                            # Invalid JSON, need to close the main object
+                                            tools_buffer += "}"
+                                            if self.valves.DEBUG:
+                                                print(
+                                                    f"[DEBUG] Closed tools_buffer in content_block_stop: {tools_buffer}"
+                                                )
+
                                     if event_name == "web_search":
                                         # Finalize tools_buffer into valid JSON (may wrap invalid JSON)
                                         try:
-                                            finalized = self._finalize_tool_buffer(tools_buffer)
+                                            finalized = self._finalize_tool_buffer(
+                                                tools_buffer
+                                            )
                                             message = ""
                                             server_tool = json.loads(finalized)
                                             tool_name = server_tool.get("name", "")
@@ -900,11 +974,18 @@ class Pipe:
                                                     tools_buffer
                                                 )
                                                 tool_calls.append(finalized)
+                                                if self.valves.DEBUG:
+                                                    print(
+                                                        f"[DEBUG] Tool use detected, finalizing tools_buffer: {tools_buffer}\nTool_Call JSON: {tool_calls}"
+                                                    )
                                             except Exception:
                                                 # If finalization fails, still append a wrapped payload
                                                 tool_calls.append(
-                                                    self._finalize_tool_buffer(tools_buffer)
+                                                    self._finalize_tool_buffer(
+                                                        tools_buffer
+                                                    )
                                                 )
+
                                             tools_buffer = ""
                                             has_pending_tool_calls = True
                                         elif stop_reason == "max_tokens":
@@ -931,7 +1012,10 @@ class Pipe:
                                         await self.handle_errors(
                                             stream_error, __event_emitter__
                                         )
-                                        return
+                                        return (
+                                            final_message
+                                            + f"\n\nAn error occurred: {error_details}"
+                                        )
 
                                 if chunk_count > token_buffer_size:
                                     await __event_emitter__(
@@ -965,7 +1049,10 @@ class Pipe:
                             except Exception as e:
                                 # Handle tool execution errors
                                 await self.handle_errors(e, __event_emitter__)
-                                return
+                                return (
+                                    final_message
+                                    + f"\n\nException of type {type(e).__name__} occurred during tool execution. Reason: {e}"
+                                )
 
                             # Build assistant message with tool_use blocks
                             assistant_content = []
@@ -977,7 +1064,9 @@ class Pipe:
                             # Add tool_use blocks to assistant message
                             for tool_call_json in tool_calls:
                                 try:
-                                    tool_call_data = json.loads(self._finalize_tool_buffer(tool_call_json))
+                                    tool_call_data = json.loads(
+                                        self._finalize_tool_buffer(tool_call_json)
+                                    )
                                     tool_use_block = {
                                         "type": "tool_use",
                                         "id": tool_call_data.get("id", ""),
@@ -1013,7 +1102,6 @@ class Pipe:
                                 break
 
                             # Reset state for next iteration
-
                             current_function_calls += len(tool_calls)
                             has_pending_tool_calls = False
                             tool_calls = []
@@ -1023,43 +1111,74 @@ class Pipe:
                 except RateLimitError as e:
                     # Rate limit error (429)
                     await self.handle_errors(e, __event_emitter__)
-                    return
+                    return (
+                        final_message
+                        + f"\n\nError: Rate limit exceeded. Please wait before making more requests. {e.message}"
+                    )
                 except AuthenticationError as e:
                     # API key issues (401)
                     await self.handle_errors(e, __event_emitter__)
-                    return
+                    return (
+                        final_message
+                        + f"\n\nError: API key issues. Reason: {e.message}"
+                    )
                 except PermissionDeniedError as e:
                     # Permission issues (403)
                     await self.handle_errors(e, __event_emitter__)
-                    return
+                    return (
+                        final_message
+                        + f"\n\nError: Permission denied. Reason: {e.message}"
+                    )
                 except NotFoundError as e:
                     # Resource not found (404)
                     await self.handle_errors(e, __event_emitter__)
-                    return
+                    return (
+                        final_message
+                        + f"\n\nError: Resource not found. Reason: {e.message}"
+                    )
                 except BadRequestError as e:
                     # Invalid request format (400)
                     await self.handle_errors(e, __event_emitter__)
-                    return
+                    return (
+                        final_message
+                        + f"\n\nError: Invalid request format. Reason: {e.message}"
+                    )
+
                 except UnprocessableEntityError as e:
                     # Unprocessable entity (422)
                     await self.handle_errors(e, __event_emitter__)
-                    return
+                    return (
+                        final_message
+                        + f"\n\nError: Unprocessable entity. Reason: {e.message}"
+                    )
                 except InternalServerError as e:
                     # Server errors (500, 529)
                     await self.handle_errors(e, __event_emitter__)
-                    return
+                    return (
+                        final_message
+                        + f"\n\nError: Internal server error. Reason: {e.message}"
+                    )
                 except APIConnectionError as e:
                     # Network/connection issues
                     await self.handle_errors(e, __event_emitter__)
-                    return
+                    return (
+                        final_message
+                        + f"\n\nError: Network/connection issues. Reason: {e.message}"
+                    )
                 except APIStatusError as e:
                     # Catch any other Anthropic API errors
                     await self.handle_errors(e, __event_emitter__)
-                    return
+                    return (
+                        final_message
+                        + f"\n\nError: Anthropic API error. Reason: {e.message}"
+                    )
                 except Exception as e:
                     # Catch all other exceptions
                     await self.handle_errors(e, __event_emitter__)
-                    return
+                    return (
+                        final_message
+                        + f"\n\nError: {type(e).__name__} occurred. Reason: {e}"
+                    )
                 finally:
                     await __event_emitter__(
                         {
@@ -1120,16 +1239,15 @@ class Pipe:
             error_msg = f"Unexpected error: {str(exception)}"
             user_msg = "💥 An unexpected error occurred. Please try again."
 
-        if self.valves.DEBUG:
-            print(f"[DEBUG] Exception: {error_msg}")
-            # Add request ID if available for debugging
-            if isinstance(exception, APIStatusError) and hasattr(exception, "response"):
-                try:
-                    request_id = exception.response.headers.get("request-id")
-                    if request_id:
-                        print(f"[DEBUG] Request ID: {request_id}")
-                except Exception:
-                    pass  # Ignore if we can't get request ID
+        print(f"Exception: {error_msg}")
+        # Add request ID if available for debugging
+        if isinstance(exception, APIStatusError) and hasattr(exception, "response"):
+            try:
+                request_id = exception.response.headers.get("request-id")
+                if request_id:
+                    print(f"Request ID: {request_id}")
+            except Exception:
+                pass  # Ignore if we can't get request ID
 
         await __event_emitter__(
             {
@@ -1558,14 +1676,14 @@ class Pipe:
                 safe_input_json = json.dumps(safe_input, ensure_ascii=False)
 
                 # If prefix ends with '{', just append the field
-                if prefix.endswith('{'):
-                    candidate = prefix + '"input": ' + safe_input_json + '}'
+                if prefix.endswith("{"):
+                    candidate = prefix + '"input": ' + safe_input_json + "}"
                 else:
                     # Ensure there's a separating comma if needed
-                    if not prefix.endswith(','):
-                        candidate = prefix + ', "input": ' + safe_input_json + '}'
+                    if not prefix.endswith(","):
+                        candidate = prefix + ', "input": ' + safe_input_json + "}"
                     else:
-                        candidate = prefix + ' "input": ' + safe_input_json + '}'
+                        candidate = prefix + ' "input": ' + safe_input_json + "}"
 
                 # Validate candidate JSON
                 try:
