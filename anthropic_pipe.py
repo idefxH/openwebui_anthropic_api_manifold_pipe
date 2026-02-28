@@ -4,7 +4,7 @@ id: anthropic_new
 author: Podden (https://github.com/Podden/)
 github: https://github.com/Podden/openwebui_anthropic_api_manifold_pipe
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.8.3
+version: 0.8.4
 license: MIT
 requirements: pydantic>=2.0.0, anthropic>=0.75.0
 environment_variables:
@@ -37,6 +37,12 @@ Supports:
 - Programmatic Tool Calling (tools callable from code execution)
 
 Changelog:
+v0.8.4
+- Fixed: Streaming overloaded_error (HTTP 200 + SSE error) now retries instead of failing immediately (GH #19)
+- Fixed: Non-streaming OverloadedError (529) was falling through to generic APIStatusError handler instead of retrying
+- Added dedicated OverloadedError exception handler with proper retry logic
+- APIStatusError handler now checks e.body for overloaded_error type and retries if applicable
+
 v0.8.2
 - Streamlined code_execution UI for web search/fetch with dynamic filtering
   - When dynamic filtering is active (without programmatic tool calling), code_execution UI is suppressed
@@ -304,6 +310,7 @@ from anthropic import (
     AuthenticationError,
     BadRequestError,
     InternalServerError,
+    OverloadedError,
     PermissionDeniedError,
     NotFoundError,
     UnprocessableEntityError,
@@ -4575,36 +4582,49 @@ class Pipe:
                     return final_text() + (
                         f"\n\nError: Unprocessable entity. Reason: {e.message}"
                     )
-                except InternalServerError as e:
-                    # Server errors (500, 529) - 529 is overloaded_error - retryable
-                    status_code = getattr(e, "status_code", 500)
+                except OverloadedError as e:
+                    # OverloadedError: SDK raises this for non-streaming 529 responses
                     retry_attempts += 1
                     if retry_attempts <= self.valves.MAX_RETRIES:
-                        error_type = (
-                            "overloaded" if status_code == 529 else "server error"
-                        )
                         logger.debug(
-                            f"{error_type} ({status_code}), retry {retry_attempts}/{self.valves.MAX_RETRIES}"
+                            f"API overloaded (529), retry {retry_attempts}/{self.valves.MAX_RETRIES}"
                         )
-
                         await emit_event_local(
                             {
                                 "type": "status",
                                 "data": {
-                                    "description": f"⏳ API {error_type}, retrying...)",
+                                    "description": f"⏳ API overloaded, retrying... ({retry_attempts}/{self.valves.MAX_RETRIES})",
                                     "done": False,
                                 },
                             }
                         )
-                        continue  # Retry the request
+                        continue
                     else:
-                        # Max retries exceeded
                         await self.handle_errors(e, __event_emitter__)
-                        error_type = (
-                            "overloaded" if status_code == 529 else "server error"
-                        )
                         return final_text() + (
-                            f"\n\n🔧 API {error_type} - maximum retries ({self.valves.MAX_RETRIES}) reached. Please try again later."
+                            f"\n\n🔧 API overloaded - maximum retries ({self.valves.MAX_RETRIES}) reached. Please try again later."
+                        )
+                except InternalServerError as e:
+                    # Server errors (500, 503, etc.) - retryable
+                    retry_attempts += 1
+                    if retry_attempts <= self.valves.MAX_RETRIES:
+                        logger.debug(
+                            f"Server error ({getattr(e, 'status_code', 500)}), retry {retry_attempts}/{self.valves.MAX_RETRIES}"
+                        )
+                        await emit_event_local(
+                            {
+                                "type": "status",
+                                "data": {
+                                    "description": f"⏳ Server error, retrying... ({retry_attempts}/{self.valves.MAX_RETRIES})",
+                                    "done": False,
+                                },
+                            }
+                        )
+                        continue
+                    else:
+                        await self.handle_errors(e, __event_emitter__)
+                        return final_text() + (
+                            f"\n\n🔧 Server error - maximum retries ({self.valves.MAX_RETRIES}) reached. Please try again later."
                         )
                 except APIConnectionError as e:
                     # Network/connection issues - potentially transient - retryable
@@ -4631,8 +4651,38 @@ class Pipe:
                             f"\n\n🌐 Network connection failed after {self.valves.MAX_RETRIES} attempts. Please check your connection."
                         )
                 except APIStatusError as e:
-                    # Catch any other Anthropic API errors
+                    # Check for streaming overloaded_error (arrives as APIStatusError
+                    # with HTTP 200, not OverloadedError with 529)
+                    error_body = getattr(e, "body", None) or {}
+                    error_info = (
+                        error_body.get("error", {})
+                        if isinstance(error_body, dict)
+                        else {}
+                    )
+                    is_overloaded = error_info.get("type") == "overloaded_error"
+
+                    if is_overloaded and retry_attempts < self.valves.MAX_RETRIES:
+                        retry_attempts += 1
+                        logger.debug(
+                            f"Streaming overloaded error, retry {retry_attempts}/{self.valves.MAX_RETRIES}"
+                        )
+                        await emit_event_local(
+                            {
+                                "type": "status",
+                                "data": {
+                                    "description": f"⏳ API overloaded (streaming), retrying... ({retry_attempts}/{self.valves.MAX_RETRIES})",
+                                    "done": False,
+                                },
+                            }
+                        )
+                        continue  # Retry the request
+
+                    # Non-retryable or max retries exceeded
                     await self.handle_errors(e, __event_emitter__)
+                    if is_overloaded:
+                        return final_text() + (
+                            f"\n\n🔧 API overloaded (streaming) - maximum retries ({self.valves.MAX_RETRIES}) reached. Please try again later."
+                        )
                     return final_text() + (
                         f"\n\nError: Anthropic API error. Reason: {e.message}"
                     )
