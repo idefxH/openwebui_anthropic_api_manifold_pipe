@@ -318,11 +318,15 @@ from anthropic import (
     AuthenticationError,
     BadRequestError,
     InternalServerError,
-    OverloadedError,
     PermissionDeniedError,
     NotFoundError,
     UnprocessableEntityError,
 )
+try:
+    from anthropic import OverloadedError
+except ImportError:
+    # anthropic < 0.75.0 — fall back to APIStatusError for 529 handling
+    OverloadedError = APIStatusError
 from typing import Literal
 from fastapi import Request
 
@@ -1789,7 +1793,7 @@ class Pipe:
 
         ## Tools Handling
         # Correct Order for Caching: Tools, System, Messages
-        tools_list = self._convert_tools_to_claude_format(
+        tools_list, api_tool_names = self._convert_tools_to_claude_format(
             __tools__, body, actual_model_name, __user__, __metadata__
         )
 
@@ -2021,6 +2025,25 @@ class Pipe:
                     # No enforcement - use auto tool choice
                     payload["tool_choice"] = {"type": "auto"}
 
+        # API tool_choice passthrough (outside beta_headers block)
+        # If no tool_choice was set by web_search enforcement, pass through from body
+        if "tool_choice" not in payload and body.get("tool_choice"):
+            api_tc = body["tool_choice"]
+            if isinstance(api_tc, dict) and "function" in api_tc:
+                # OpenAI format: {"type": "function", "function": {"name": "X"}}
+                payload["tool_choice"] = {
+                    "type": "tool",
+                    "name": api_tc["function"]["name"],
+                }
+            elif isinstance(api_tc, str):
+                # OpenAI string format: "auto", "none", "required"
+                mapping = {"auto": "auto", "none": "none", "required": "any"}
+                payload["tool_choice"] = {"type": mapping.get(api_tc, api_tc)}
+            else:
+                # Already in Anthropic format or other dict format
+                payload["tool_choice"] = api_tc
+            logger.debug(f"API tool_choice passthrough: {payload['tool_choice']}")
+
         payload["tools"] = tools_list
 
         # Processing Messages and Caching
@@ -2029,7 +2052,7 @@ class Pipe:
 
         payload["messages"] = processed_messages
 
-        return payload, headers, new_marker_metadata
+        return payload, headers, new_marker_metadata, api_tool_names
 
     def _convert_messages_to_claude_format(
         self, raw_messages, user_has_memory_system_enabled: bool = False
@@ -2107,7 +2130,7 @@ class Pipe:
         actual_model_name: str,
         __user__: Dict[str, Any],
         __metadata__: dict[str, Any],
-    ) -> List[dict]:
+    ) -> tuple[List[dict], set]:
         """
         Convert OpenWebUI tools format to Claude API format.
 
@@ -2122,10 +2145,11 @@ class Pipe:
             __user__: User dict for valve overrides
             __metadata__: Metadata dict for checking enforcement flags
         Returns:
-            list: Tools in Claude API format
+            tuple: (Tools in Claude API format, set of API-provided tool names without callables)
         """
         claude_tools = []
         tool_names_seen = set()  # Track unique tool names
+        api_tool_names = set()  # Track tools from body.tools (no callable, API passthrough)
 
         # Names reserved for Anthropic server-side tools (skip if found in body.tools)
         anthropic_server_tool_names = {"web_search", "web_fetch", "memory"}
@@ -2156,6 +2180,9 @@ class Pipe:
                     }
                     claude_tools.append(claude_tool)
                     tool_names_seen.add(name)
+                    # Track as API-provided tool (no callable — for passthrough)
+                    if not (__tools__ and name in __tools__ and __tools__[name].get("callable")):
+                        api_tool_names.add(name)
 
         # Log user tools from __tools__
         if __tools__ and logger.isEnabledFor(logging.DEBUG):
@@ -2377,7 +2404,7 @@ class Pipe:
                 flags.append("eager_stream")
             logger.info(f"  🔧 Tool: {t.get('name')} [{', '.join(flags) or 'normal'}]")
 
-        return claude_tools
+        return claude_tools, api_tool_names
 
     def _remove_thinking_blocks(self, content: str) -> str:
         """Remove thinking blocks from assistant message content to prevent re-send to API."""
@@ -2775,7 +2802,7 @@ class Pipe:
                         f"Could not auto-enable native function calling: {e}"
                     )
 
-            payload, headers, new_marker_metadata = await self._create_payload(
+            payload, headers, new_marker_metadata, api_tool_names = await self._create_payload(
                 body, __metadata__, __user__, __tools__, __event_emitter__, __files__
             )
 
@@ -2869,6 +2896,7 @@ class Pipe:
             tool_calls = []
             running_tool_tasks = []  # Async tasks for executing tools immediately
             tool_call_data_list = []  # Store tool metadata for result matching
+            api_tool_passthrough = False  # Flag for API tool passthrough mode
             # Note: tool_use_blocks and current_tool_caller removed - SDK preserves these in accumulated message
 
             # Server tool state (web_search, code_execution)
@@ -4057,6 +4085,18 @@ class Pipe:
                                                 tool_name,
                                                 len(running_tool_tasks),
                                             )
+                                        elif tool_name in api_tool_names:
+                                            # API-provided tool (no callable) — passthrough mode
+                                            # Return the tool input as JSON in the response content
+                                            # instead of trying to execute locally
+                                            logger.info(
+                                                f"🔄 API tool passthrough for '{tool_name}': returning tool input as response"
+                                            )
+                                            passthrough_json = json.dumps(
+                                                tool_input, ensure_ascii=False
+                                            )
+                                            await emit_message_delta(passthrough_json)
+                                            api_tool_passthrough = True
                                         else:
                                             # Unknown tool - add error result
                                             logger.warning(
@@ -4156,6 +4196,14 @@ class Pipe:
                                             await emit_message_delta(chunk)
                                             chunk = ""
                                             chunk_count = 0
+
+                                        # API tool passthrough — skip tool loop, return directly
+                                        if api_tool_passthrough and not running_tool_tasks:
+                                            logger.info(
+                                                "🔄 API tool passthrough complete — skipping tool loop"
+                                            )
+                                            conversation_ended = True
+                                            break
 
                                         # Wait for all running tool tasks to complete
                                         if running_tool_tasks:
@@ -4289,6 +4337,7 @@ class Pipe:
                                         # Reset for next iteration
                                         running_tool_tasks = []
                                         tool_call_data_list = []
+                                        api_tool_passthrough = False
                                         has_pending_tool_calls = True
                                     elif stop_reason == "max_tokens":
                                         chunk += "Claude has Reached the maximum token limit!"
