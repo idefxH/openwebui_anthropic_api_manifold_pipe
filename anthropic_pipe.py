@@ -4,7 +4,7 @@ id: anthropic_new
 author: Podden (https://github.com/Podden/)
 github: https://github.com/Podden/openwebui_anthropic_api_manifold_pipe
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.8.11
+version: 0.8.12
 license: MIT
 requirements: pydantic>=2.0.0, anthropic>=0.75.0
 environment_variables:
@@ -37,6 +37,9 @@ Supports:
 - Programmatic Tool Calling (tools callable from code execution)
 
 Changelog:
+v0.8.12
+- Added ANTHROPIC_BASE_URL valve to allow routing all API requests through a custom proxy URL
+
 v0.8.11
 - Added Caching time CACHE_TTL valve to choose between 5 minutes (default) and 1 hour
 - Fixed TTS in Call Mode
