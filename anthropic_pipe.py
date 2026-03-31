@@ -4,7 +4,7 @@ id: anthropic_new
 author: Podden (https://github.com/Podden/)
 github: https://github.com/Podden/openwebui_anthropic_api_manifold_pipe
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.8.5
+version: 0.8.12
 license: MIT
 requirements: pydantic>=2.0.0, anthropic>=0.75.0
 environment_variables:
@@ -37,6 +37,76 @@ Supports:
 - Programmatic Tool Calling (tools callable from code execution)
 
 Changelog:
+v0.8.12
+<<<<<<< main
+- Added ANTHROPIC_BASE_URL valve to allow routing all API requests through a custom proxy URL
+=======
+- Fixed Tool Result output Grouping
+- Decluddered the if/else horror in event_type handling
+- Fixed OpenTerminal Tools
+>>>>>>> main
+
+v0.8.11
+- Added Caching time CACHE_TTL valve to choose between 5 minutes (default) and 1 hour
+- Fixed TTS in Call Mode
+- Added chat:completion done event in PHASE 7 for proper stream termination signalling
+- Fixed Tool Result and Thought Grouping for Openwebui 0.8.11
+- Fixed Programmatic Tool Call Issue
+
+v0.8.10
+- Pipe can now handle HTMLResponse Results from Tools (Rich UI with embedded iframes, HTML widgets, and file attachments)
+- Added Support for Openwebui Skills
+
+v0.8.9
+- Removed <details> tags from what's send to claude API to prevent hallucinations
+- Added Valves for Request and Tool call Timeouts
+- Increased MAX_TOOL_CALLS max limit for long agentic tasks
+- Added optional API Key set via UserValves (overrides header-level key)
+- Reintroduced the Ability for Claude to know how many tool calls are available until limit is hit
+- Removed 1 Mio Context Window Valve as it's now generally available
+
+v0.8.8
+- Fixed a Bug with interleaved thinking and tool calls where the API does not preserve the thinking blocks resulting in invalid requests
+- Tool Input and Code Execution Input is not correctly streamed in a collapsible container with spinner
+- Removed Status Update for Tool Calls and Code Execution as they are now streaming live with the new streaming strategy
+- Tool Call Errors get's correctly emitted now instead of silently ignored and causing unlimited spinning
+
+v0.8.7
+- Code execution blocks now use OpenWebUI native `<details type="code_interpreter">` format
+  - Spinner + "Analyzing…" / "Analyzed" transitions matching built-in code interpreter
+  - Duration tracking and display
+  - Output (stdout, stderr, tool call results) in HTML `output` attribute for CodeBlock rendering
+- Fixed live-streamed code blocks getting stuck on "Analyzing…" when new code_execution starts
+- Fixed empty "Analyzed" blocks by using accumulated code as fallback
+- Removed redundant status events for code execution ("Running code", "Code → Tool", "Code execution complete")
+- Fixed cache_control being placed on programmatic tool_use blocks with caller field
+- Removed _emit_code_execution_source calls (output now embedded in code_interpreter block)
+
+v0.8.6
+- Fixed Token Counting for new Analytics Tab
+- Properly formatted and grouped Thinking and Tool Result Blocks
+- Fixed Token Usage Status for 1 Mio Context Window
+
+v0.8.6
+- Fixed: Truncated streams (200 OK + no stop_reason after server tools) now auto-retry instead of silent empty response
+  - Detects when API returns thinking/server_tool blocks but no text and no stop_reason
+  - Auto-retries up to MAX_RETRIES times with clean state reset
+  - Shows user-visible status during retry and error message if all retries fail
+  - Root cause: Anthropic API overload (529) → SDK retry → 200 OK but truncated stream
+- Fixed: JSON.parse frontend error caused by pipe returning dict {} instead of empty string
+  - functions.py sent `data: {}` without [DONE] → frontend failed to parse as OpenAI chunk
+  - Now returns "" → proper finish_reason=stop + [DONE] SSE termination
+
+v0.8.6
+- Fixed: Truncated streams (200 OK + no stop_reason after server tools) now auto-retry instead of silent empty response
+  - Detects when API returns thinking/server_tool blocks but no text and no stop_reason
+  - Auto-retries up to MAX_RETRIES times with clean state reset
+  - Shows user-visible status during retry and error message if all retries fail
+  - Root cause: Anthropic API overload (529) → SDK retry → 200 OK but truncated stream
+- Fixed: JSON.parse frontend error caused by pipe returning dict {} instead of empty string
+  - functions.py sent `data: {}` without [DONE] → frontend failed to parse as OpenAI chunk
+  - Now returns "" → proper finish_reason=stop + [DONE] SSE termination
+
 v0.8.5
 - Refactored: Cache control logic consolidated into single `_apply_cache_control()` method
   - All scattered cache_control placement removed from `_create_payload()` and tool loop
@@ -44,12 +114,24 @@ v0.8.5
   - Bug fix: Tools now cached at all non-disabled levels (was missing at "messages" level)
   - Tool loop: properly handles programmatic vs standard tool calling cache placement
 - Fixed: Effort level "max" now exclusively reserved for Opus 4.6 (was incorrectly allowed for Sonnet 4.6)
+- Fixed: pause_turn stop reason now auto-continues instead of ending with error message
+- Fixed: bash_code_execution_tool_result missing explicit error_code check — errors were silently ignored
+- Fixed: text_editor_code_execution_tool_result missing explicit error_code check
+- Fixed: code_execution_tool_result missing explicit error_code check
+- All server tool errors (web_search, web_fetch, code_execution, bash, text_editor) now emit user-visible error messages
 
 v0.8.4
 - Fixed: Streaming overloaded_error (HTTP 200 + SSE error) now retries instead of failing immediately (GH #19)
 - Fixed: Non-streaming OverloadedError (529) was falling through to generic APIStatusError handler instead of retrying
 - Added dedicated OverloadedError exception handler with proper retry logic
 - APIStatusError handler now checks e.body for overloaded_error type and retries if applicable
+
+v0.8.3
+- Text files created via text_editor (md, txt, csv, json, etc.) now display inline as markdown instead of code blocks
+- Code files created via text_editor use proper syntax highlighting based on file extension
+- Dynamic filtering valve description updated with speed vs quality tradeoff info (~60s vs ~7s)
+- Added concise API payload logging at DEBUG level (model, tools, system size, container, max_tokens, thinking mode)
+- Added tool result content size logging for tool call loop debugging
 
 v0.8.2
 - Streamlined code_execution UI for web search/fetch with dynamic filtering
@@ -95,13 +177,6 @@ v0.6.3
 - Added messages for stop_reason in case of refusal, stop_sequence or context window exceeded
 - Added ENABLE_INTERLEAVED_THINKING valve for enabling Thinking between Tool Calls
 - Homogenized Thinking and Tool Call/Results streaming to match build in OpenAI/Ollama system
-
-v0.8.3
-- Text files created via text_editor (md, txt, csv, json, etc.) now display inline as markdown instead of code blocks
-- Code files created via text_editor use proper syntax highlighting based on file extension
-- Dynamic filtering valve description updated with speed vs quality tradeoff info (~60s vs ~7s)
-- Added concise API payload logging at DEBUG level (model, tools, system size, container, max_tokens, thinking mode)
-- Added tool result content size logging for tool call loop debugging
 
 v0.6.2
 - Reordered Payload for better Caching
@@ -149,7 +224,6 @@ v0.5.6
 - Added Context Editing feature (clear_tool_uses, clear_thinking) with configurable strategies
 - Added Tool Search feature (BM25/Regex) with deferred tool loading
 - Status events for context clearing with token counts
-- Warning notification for thinking+cache conflict
 
 v0.5.5
 - Fixed effort parameter support by upgrading Anthropic SDK from 0.60.0 to 0.75.0
@@ -307,6 +381,7 @@ import html
 import json
 import logging
 import time
+from dataclasses import dataclass, field
 from urllib.parse import quote, unquote
 from typing import Any, Callable, List, Union, Dict, Optional
 from pydantic import BaseModel, Field
@@ -322,11 +397,14 @@ from anthropic import (
     NotFoundError,
     UnprocessableEntityError,
 )
+
 try:
     from anthropic import OverloadedError
 except ImportError:
-    # anthropic < 0.75.0 — fall back to APIStatusError for 529 handling
-    OverloadedError = APIStatusError
+    # anthropic SDK < 0.45 doesn't have OverloadedError
+    # Create a placeholder that will never match (handled via APIStatusError instead)
+    class OverloadedError(Exception):
+        pass
 from typing import Literal
 from fastapi import Request
 
@@ -337,12 +415,15 @@ logger = logging.getLogger(__name__)
 # Pre-compiled patterns for performance - avoids re-compiling on every call
 # =============================================================================
 
-# Pattern to match thinking blocks in message content (for removal from history)
-# Matches both old format (<details><summary>🧠...) and new native format (<details type="reasoning"...)
-PATTERN_THINKING_BLOCK = re.compile(
-    r'<details[^>]*(?:type="reasoning"|<summary>🧠)[^>]*>.*?</details>\s*',
-    flags=re.DOTALL,
-)
+# NOTE: Thinking blocks must NEVER be removed from assistant messages!
+# Per Anthropic API docs:
+# - During tool use loops: thinking blocks MUST be preserved unmodified in assistant content
+# - Multi-turn: thinking blocks from prior turns CAN be omitted (API filters them),
+#   but preserving them is preferred
+# - The entire sequence of consecutive thinking blocks must match the original model output
+# - signature field is critical and must be preserved exactly
+# - Interleaved thinking (Claude 4): thinking blocks can appear BETWEEN tool calls
+# Previously PATTERN_THINKING_BLOCK was defined here but never used - removed as dead code.
 
 # Pattern to extract User Context from OpenWebUI Memory System in system prompts
 # Matches everything after "\nUser Context:\n" to end of string
@@ -373,6 +454,20 @@ PATTERN_EMPTY_ATTACHED = re.compile(
     r"<attached_files>\s*</attached_files>\s*", re.DOTALL
 )
 
+# Pattern to strip OpenWebUI <details type="tool_calls"> blocks from conversation history.
+# These are UI-rendering artifacts that cause Claude 4.6 models to pattern-match and
+# generate fake tool call HTML instead of making actual API tool_use calls.
+PATTERN_TOOL_CALLS_DETAILS = re.compile(
+    r'\n?<details type="tool_calls"[^>]*>.*?</details>\n?',
+    flags=re.DOTALL,
+)
+
+# Pattern to strip OpenWebUI <details type="code_interpreter"> blocks from conversation history.
+PATTERN_CODE_INTERPRETER_DETAILS = re.compile(
+    r'\n?<details type="code_interpreter"[^>]*>.*?</details>\n?',
+    flags=re.DOTALL,
+)
+
 # Note: Some patterns are compiled dynamically at runtime because they depend
 # on user-provided data (filenames, file IDs). See:
 #   - _remove_specific_sources_from_rag_message() - dynamic filename pattern
@@ -401,6 +496,15 @@ except ImportError:
     get_builtin_tools = None
     BUILTIN_TOOLS_AVAILABLE = False
 
+# Import process_tool_result for Rich UI (HTMLResponse, embeds, files)
+try:
+    from open_webui.utils.middleware import process_tool_result
+
+    PROCESS_TOOL_RESULT_AVAILABLE = True
+except ImportError:
+    process_tool_result = None
+    PROCESS_TOOL_RESULT_AVAILABLE = False
+
 # Import OpenWebUI Files and Storage for PDF native upload
 try:
     from open_webui.models.files import Files
@@ -425,168 +529,167 @@ CLAUDE_MEMORY_DIR = os.path.join(
 )
 
 
+@dataclass
+class PipeRenderStrategy:
+    """Per-request rendering strategy toggles (no shared state across users)."""
+
+    stream_reasoning_live: bool = True
+    stream_code_execution_live: bool = False
+    stream_tool_results_live: bool = False
+
+
+@dataclass
+class PipeRequestContext:
+    """Request-scoped helpers/state. Must be instantiated inside pipe()."""
+
+    pipe: Any
+    event_emitter: Callable[[Dict[str, Any]], Awaitable[None]]
+    render_strategy: PipeRenderStrategy = field(default_factory=PipeRenderStrategy)
+    final_message: list[str] = field(default_factory=list)
+
+    async def emit_event(self, event: dict) -> None:
+        await self.pipe.emit_event(event, self.event_emitter)
+
+    async def emit_delta(self, content: str) -> None:
+        await self.emit_event(
+            {
+                "type": "chat:completion",
+                "data": {"choices": [{"delta": {"content": content}}]},
+            }
+        )
+        self.final_message.append(content)
+
+    async def emit_replace(self, content: str) -> None:
+        await self.emit_event({"type": "replace", "data": {"content": content}})
+        self.final_message.clear()
+        self.final_message.append(content)
+
+    async def update_content_block(self, old_block: str, new_block: str) -> None:
+        """Replace old_block in accumulated content with new_block, preserving surrounding text."""
+        if old_block:
+            text = self.text()
+            idx = text.find(old_block)
+            if idx != -1:
+                text = text[:idx] + new_block + text[idx + len(old_block):]
+                await self.emit_replace(text)
+                return
+        # First emit or old block not found — append and replace with full text
+        self.final_message.append(new_block)
+        await self.emit_replace(self.text())
+
+    def text(self) -> str:
+        return "".join(self.final_message)
+
+
 class Pipe:
     API_VERSION = "2023-06-01"  # Current API version as of May 2025
-    MODEL_URL = "https://api.anthropic.com/v1/messages"
+    _DEFAULT_API_BASE = "https://api.anthropic.com"
 
-    # Centralized model capabilities database
-    # Note: Anthropic's /v1/models API only returns id, display_name, created_at, and type.
-    # It does NOT provide max_tokens, context_length, or capability flags.
-    # Therefore, we must maintain this static configuration.
-    MODEL_CAPABILITIES = {
-        # Claude 4 family
-        "claude-sonnet-4-20250514": {
-            "max_tokens": 64000,
-            "context_length": 200000,
-            "supports_thinking": True,
-            "supports_1m_context": True,
-            "supports_memory": True,
-            "supports_vision": True,
-            "supports_effort": False,
-            "supports_programmatic_calling": False,
-            "supports_adaptive_thinking": False,
-            "supports_effort_max": False,
-        },
-        "claude-opus-4-20250514": {
-            "max_tokens": 32000,
-            "context_length": 200000,
-            "supports_thinking": True,
-            "supports_1m_context": False,
-            "supports_memory": True,
-            "supports_vision": True,
-            "supports_effort": False,
-            "supports_programmatic_calling": False,
-            "supports_adaptive_thinking": False,
-            "supports_effort_max": False,
-        },
-        "claude-opus-4-1-20250805": {
-            "max_tokens": 32000,
-            "context_length": 200000,
-            "supports_thinking": True,
-            "supports_1m_context": False,
-            "supports_memory": True,
-            "supports_vision": True,
-            "supports_effort": False,
-            "supports_programmatic_calling": False,
-            "supports_adaptive_thinking": False,
-            "supports_effort_max": False,
-        },
-        "claude-sonnet-4-5-20250929": {
-            "max_tokens": 64000,
-            "context_length": 200000,
-            "supports_thinking": True,
-            "supports_1m_context": True,
-            "supports_memory": True,
-            "supports_vision": True,
-            "supports_effort": False,
-            "supports_programmatic_calling": True,
-            "supports_adaptive_thinking": False,
-            "supports_effort_max": False,
-        },
-        "claude-haiku-4-5-20251001": {
-            "max_tokens": 64000,
-            "context_length": 200000,
-            "supports_thinking": True,
-            "supports_1m_context": False,
-            "supports_memory": True,
-            "supports_vision": True,
-            "supports_effort": False,
-            "supports_programmatic_calling": False,  # Haiku 4.5 only supports allowed_callers=['direct']
-            "supports_adaptive_thinking": False,
-            "supports_effort_max": False,
-        },
-        "claude-opus-4-5-20251101": {
-            "max_tokens": 64000,
-            "context_length": 200000,
-            "supports_thinking": True,
-            "supports_1m_context": False,
-            "supports_memory": True,
-            "supports_vision": True,
-            "supports_effort": True,
-            "supports_programmatic_calling": True,
-            "supports_adaptive_thinking": False,
-            "supports_effort_max": False,
-        },
+    @property
+    def MODEL_URL(self):
+        base = self.valves.ANTHROPIC_BASE_URL.strip().rstrip("/") if hasattr(self, "valves") and self.valves.ANTHROPIC_BASE_URL.strip() else self._DEFAULT_API_BASE
+        return f"{base}/v1/messages"
+
+    # Capability overrides for fields NOT available from the /v1/models API.
+    # The API now provides: max_tokens, max_input_tokens, capabilities (thinking, effort, vision, etc.)
+    # These overrides only contain flags that must be derived from model identity.
+    MODEL_CAPABILITY_OVERRIDES = {
+        "claude-sonnet-4-20250514": {"supports_1m_context": True},
+        "claude-sonnet-4-5-20250929": {"supports_1m_context": True},
         "claude-opus-4-6": {
-            "max_tokens": 128000,
-            "context_length": 200000,
-            "supports_thinking": True,
-            "supports_adaptive_thinking": True,
             "supports_1m_context": True,
-            "supports_memory": True,
-            "supports_vision": True,
-            "supports_effort": True,
-            "supports_effort_max": True,
-            "supports_programmatic_calling": True,
             "supports_dynamic_filtering": True,
             "supports_fast_mode": True,
         },
         "claude-sonnet-4-6": {
-            "max_tokens": 64000,
-            "context_length": 200000,
-            "supports_thinking": True,
-            "supports_adaptive_thinking": True,
             "supports_1m_context": True,
-            "supports_memory": True,
-            "supports_vision": True,
-            "supports_effort": True,
-            "supports_effort_max": False,  # max effort is Opus 4.6 only
-            "supports_programmatic_calling": True,
             "supports_dynamic_filtering": True,
-            "supports_fast_mode": False,
-        }
+        },
     }
 
-    # Aliases map to dated model versions
-    MODEL_ALIASES = {
-        "claude-sonnet-4": "claude-sonnet-4-20250514",
-        "claude-opus-4": "claude-opus-4-20250514",
-        "claude-opus-4-1": "claude-opus-4-1-20250805",
-        "claude-sonnet-4-5": "claude-sonnet-4-5-20250929",
-        "claude-haiku-4-5": "claude-haiku-4-5-20251001",
-        "claude-opus-4-5": "claude-opus-4-5-20251101",
-    }
+    # Cached model capabilities from API (populated by get_anthropic_models)
+    _api_capabilities_cache: Dict[str, dict] = {}
+    _api_capabilities_cache_ts: float = 0.0
+    _API_CACHE_TTL = 86400  # 24 hours
 
     REQUEST_TIMEOUT = (
-        300  # Increased timeout for longer responses with extended thinking
+        300  # Default; overridden by valve REQUEST_TIMEOUT
     )
     THINKING_BUDGET_TOKENS = 4096  # Default thinking budget tokens (max 16K)
-    TOOL_CALL_TIMEOUT = 120  # Seconds before a tool call is treated as timed out
+    TOOL_CALL_TIMEOUT = 120  # Default; overridden by valve TOOL_CALL_TIMEOUT
 
     # =========================================================================
     # MODEL INFO & INITIALIZATION
     # =========================================================================
 
     @classmethod
+    def _parse_api_capabilities(cls, model) -> dict:
+        """Parse capabilities from an Anthropic API ModelInfo object into our internal format."""
+        caps = getattr(model, "capabilities", None)
+        _sup = lambda obj, attr="supported": getattr(obj, attr, False) if obj else False
+
+        thinking = getattr(caps, "thinking", None) if caps else None
+        thinking_types = getattr(thinking, "types", None) if thinking else None
+        effort = getattr(caps, "effort", None) if caps else None
+
+        max_tokens = getattr(model, "max_tokens", 0) or 0
+        max_input = getattr(model, "max_input_tokens", 0) or 0
+
+        info = {
+            "max_tokens": max_tokens if max_tokens > 0 else 4096,
+            "context_length": max_input if max_input > 0 else 200000,
+            "supports_thinking": _sup(thinking),
+            "supports_adaptive_thinking": _sup(getattr(thinking_types, "adaptive", None)) if thinking_types else False,
+            "supports_effort": _sup(effort),
+            "supports_effort_max": _sup(getattr(effort, "max", None)) if effort else False,
+            "supports_vision": _sup(getattr(caps, "image_input", None)) if caps else True,
+            "supports_programmatic_calling": _sup(getattr(caps, "code_execution", None)) if caps else False,
+            # All Claude 4+ models support memory
+            "supports_memory": True,
+            # Defaults for fields not in API — overridden by MODEL_CAPABILITY_OVERRIDES
+            "supports_1m_context": False,
+            "supports_dynamic_filtering": False,
+            "supports_fast_mode": False,
+        }
+
+        # Apply model-specific overrides for fields not available from API
+        model_id = model.id if hasattr(model, "id") else ""
+        overrides = cls.MODEL_CAPABILITY_OVERRIDES.get(model_id, {})
+        info.update(overrides)
+
+        return info
+
+    @classmethod
     def get_model_info(cls, model_name: str) -> dict:
         """
-        Get model capabilities by name, resolving aliases automatically.
-        Returns default capabilities if model is unknown.
+        Get model capabilities by name. Reads from API cache first,
+        falls back to safe defaults for unknown models.
         """
-        # Resolve alias to actual model name
-        resolved_name = cls.MODEL_ALIASES.get(model_name, model_name)
+        if model_name in cls._api_capabilities_cache:
+            return cls._api_capabilities_cache[model_name]
 
-        # Get capabilities or return defaults
-        return cls.MODEL_CAPABILITIES.get(
-            resolved_name,
-            {
-                "max_tokens": 4096,
-                "context_length": 200000,
-                "supports_thinking": True,
-                "supports_1m_context": False,
-                "supports_memory": False,
-                "supports_vision": True,
-                "supports_effort": False,
-                "supports_programmatic_calling": False,
-                "supports_dynamic_filtering": False,
-                "supports_adaptive_thinking": False,
-                "supports_effort_max": False,
-                "supports_fast_mode": False,
-            },
-        )
+        # Return conservative defaults for unknown models
+        return {
+            "max_tokens": 4096,
+            "context_length": 200000,
+            "supports_thinking": True,
+            "supports_1m_context": False,
+            "supports_memory": False,
+            "supports_vision": True,
+            "supports_effort": False,
+            "supports_programmatic_calling": False,
+            "supports_dynamic_filtering": False,
+            "supports_adaptive_thinking": False,
+            "supports_effort_max": False,
+            "supports_fast_mode": False,
+        }
 
     class Valves(BaseModel):
         ANTHROPIC_API_KEY: str = "Your API Key Here"
+        ANTHROPIC_BASE_URL: str = Field(
+            default="",
+            description="Custom base URL for the Anthropic API (e.g. for a proxy). Leave empty to use the default Anthropic endpoint (https://api.anthropic.com).",
+        )
         ENABLE_FAST_MODE: bool = Field(
             default=False,
             description="Enable Fast Mode for Opus 4.6. Up to 2.5x faster output at higher costs",
@@ -596,10 +699,6 @@ class Pipe:
         #     default=False,
         #     description="Enable Claude memory tool (files stored per-user under data/claude_memories/)",
         # )
-        ENABLE_1M_CONTEXT: bool = Field(
-            default=False,
-            description="Enable 1M token context window for Claude Sonnet 4 (requires Tier 4 API access)",
-        )
         ENABLE_INTERLEAVED_THINKING: bool = Field(
             default=True,
             description="Enable interleaved thinking. Claude can generate thinking blocks between tool calls instead of only at the end.",
@@ -615,7 +714,7 @@ class Pipe:
         MAX_TOOL_CALLS: int = Field(
             default=15,
             ge=1,
-            le=50,
+            le=9999,
             description="Maximum number of tool execution loops allowed per request. Each loop involves Claude generating tool calls, executing them, and feeding results back. Prevents infinite loops.",
         )
         MAX_RETRIES: int = Field(
@@ -632,6 +731,10 @@ class Pipe:
         ] = Field(
             default="cache tools array, system prompt and messages",
             description="Cache control scope for prompts",
+        )
+        CACHE_TTL: Literal["5 minutes", "1 hour"] = Field(
+            default="5 minutes",
+            description="Cache time-to-live. 5 minutes is default Anthropic TTL; 1 hour requires no extra cost but keeps caches warm longer across conversations.",
         )
         WEB_SEARCH_USER_CITY: str = Field(
             default="",
@@ -709,8 +812,24 @@ class Pipe:
             default="global",
             description='Data residency for API requests. 1.1x Token Cost for "us".',
         )
+        REQUEST_TIMEOUT: int = Field(
+            default=300,
+            ge=30,
+            le=1800,
+            description="Request timeout in seconds for Anthropic API calls. Increase if using slow local rerankers or large context (e.g. 600 for Top-K 15+).",
+        )
+        TOOL_CALL_TIMEOUT: int = Field(
+            default=30,
+            ge=10,
+            le=600,
+            description="Timeout in seconds for individual tool call execution.",
+        )
 
     class UserValves(BaseModel):
+        ANTHROPIC_API_KEY: str = Field(
+            default="",
+            description="Personal Anthropic API key. If set, overrides the admin-configured key.",
+        )
         ENABLE_THINKING: bool = Field(
             default=False,
             description="Enable Extended Thinking",
@@ -784,9 +903,6 @@ class Pipe:
         self.id = "anthropic"
         self.valves = self.Valves()
         self.logger = logger
-        # Track if we've warned about thinking+cache conflict per chat_id
-        self._warned_thinking_cache_conflict: set = set()
-        # Cache for validated skills: {api_key: {skill_name: skill_info_or_None}}
         self._validated_skills_cache: Dict[str, Dict[str, Optional[Dict[str, Any]]]] = (
             {}
         )
@@ -794,59 +910,77 @@ class Pipe:
     async def get_anthropic_models(self) -> List[dict]:
         """
         Fetches the current list of Anthropic models using the official Anthropic Python SDK.
-        Fallback to static list on error. Returns OpenWebUI model dicts.
+        Parses capabilities from the API response and caches them.
+        Returns OpenWebUI model dicts.
         """
+        # Return cached result if still fresh
+        if (
+            self._api_capabilities_cache
+            and time.time() - self._api_capabilities_cache_ts < self._API_CACHE_TTL
+        ):
+            models = []
+            for name, info in self._api_capabilities_cache.items():
+                models.append(self._build_openwebui_model_entry(name, info))
+            return models
+
         from anthropic import AsyncAnthropic
 
         models = []
+        new_cache: Dict[str, dict] = {}
         try:
             api_key = self.valves.ANTHROPIC_API_KEY
-            client = AsyncAnthropic(api_key=api_key)
+            base_url = self.valves.ANTHROPIC_BASE_URL.strip() or None
+            client = AsyncAnthropic(api_key=api_key, **({"base_url": base_url} if base_url else {}))
             async for m in client.models.list():
                 name = m.id
                 display_name = getattr(m, "display_name", name)
 
-                # Get capabilities from centralized config
-                info = self.get_model_info(name)
+                # Parse capabilities directly from API response
+                info = self._parse_api_capabilities(m)
+                info["_display_name"] = display_name
+                new_cache[name] = info
 
-                models.append(
-                    {
-                        "id": f"anthropic/{name}",
-                        "name": display_name,
-                        "context_length": info["context_length"],
-                        "supports_vision": info["supports_vision"],
-                        "supports_thinking": info["supports_thinking"],
-                        "is_hybrid_model": info["supports_thinking"],
-                        "max_output_tokens": info["max_tokens"],
-                        "info": {
-                            "meta": {
-                                "capabilities": {
-                                    "status_updates": True  # Enable status events in OpenWebUI 0.6.33+
-                                }
-                            }
-                        },
-                    }
-                )
+                entry = self._build_openwebui_model_entry(name, info, display_name)
+                models.append(entry)
+
+            # Update class-level cache
+            Pipe._api_capabilities_cache = new_cache
+            Pipe._api_capabilities_cache_ts = time.time()
+            logger.info(f"Cached capabilities for {len(new_cache)} models from API")
             return models
         except Exception as e:
             logging.warning(
-                f"Could not fetch models from SDK/API, using static list. Reason: {e}"
+                f"Could not fetch models from SDK/API: {e}"
             )
-            # Fallback to static list
-            for name, info in self.MODEL_CAPABILITIES.items():
-                models.append(
-                    {
-                        "id": f"anthropic/{name}",
-                        "name": name,
-                        "context_length": info["context_length"],
-                        "supports_vision": info["supports_vision"],
-                        "supports_thinking": info["supports_thinking"],
-                        "is_hybrid_model": info["supports_thinking"],
-                        "max_output_tokens": info["max_tokens"],
-                        "info": {"meta": {"capabilities": {"status_updates": True}}},
+            # If we have stale cache, use it
+            if self._api_capabilities_cache:
+                logging.info("Using stale capability cache as fallback")
+                for name, info in self._api_capabilities_cache.items():
+                    models.append(self._build_openwebui_model_entry(name, info))
+                return models
+            # No cache available — return empty (API key likely invalid)
+            return models
+
+    @staticmethod
+    def _build_openwebui_model_entry(
+        name: str, info: dict, display_name: str = ""
+    ) -> dict:
+        return {
+            "id": f"anthropic/{name}",
+            "name": display_name or name,
+            "context_length": info["context_length"],
+            "supports_vision": info["supports_vision"],
+            "supports_thinking": info["supports_thinking"],
+            "is_hybrid_model": info["supports_thinking"],
+            "max_output_tokens": info["max_tokens"],
+            "info": {
+                "meta": {
+                    "capabilities": {
+                        "status_updates": True
                     }
-                )
-        return models
+                }
+            },
+        }
 
     async def pipes(self) -> List[dict]:
         return await self.get_anthropic_models()
@@ -1268,7 +1402,8 @@ class Pipe:
             import hashlib
             import uuid
 
-            client = AsyncAnthropic(api_key=api_key)
+            base_url = self.valves.ANTHROPIC_BASE_URL.strip() or None
+            client = AsyncAnthropic(api_key=api_key, **({"base_url": base_url} if base_url else {}))
 
             # Get file metadata first
             file_meta = await client.beta.files.retrieve_metadata(file_id=file_id)
@@ -1346,7 +1481,8 @@ class Pipe:
         client = None
         try:
             from anthropic import AsyncAnthropic
-            client = AsyncAnthropic(api_key=self.valves.ANTHROPIC_API_KEY)
+            base_url = self.valves.ANTHROPIC_BASE_URL.strip() or None
+            client = AsyncAnthropic(api_key=self.valves.ANTHROPIC_API_KEY, **({"base_url": base_url} if base_url else {}))
         except ImportError:
             logger.warning("Anthropic SDK not available for file upload")
             return blocks_by_user_msg, processed_filenames
@@ -1458,6 +1594,13 @@ class Pipe:
     # CACHE CONTROL
     # =========================================================================
 
+    def _cache_control_marker(self) -> dict:
+        """Return the cache_control dict based on the CACHE_TTL valve setting."""
+        marker = {"type": "ephemeral"}
+        if self.valves.CACHE_TTL == "1 hour":
+            marker["ttl"] = "1h"
+        return marker
+
     def _apply_cache_control(self, payload: dict, is_tool_loop: bool = False) -> None:
         """Apply cache_control breakpoints to the payload right before sending to the API.
 
@@ -1492,18 +1635,20 @@ class Pipe:
         # --- Step 2: Cache tools (breakpoint 1) ---
         # Always cache tools at every non-disabled level — tools rarely change
         # and having a separate breakpoint ensures cache hits even when system/messages change.
+        cache_marker = self._cache_control_marker()
+
         tools = payload.get("tools", [])
         if tools:
             # Find last non-deferred tool for the breakpoint
             placed = False
             for i in range(len(tools) - 1, -1, -1):
                 if not tools[i].get("defer_loading", False):
-                    tools[i]["cache_control"] = {"type": "ephemeral"}
+                    tools[i]["cache_control"] = cache_marker
                     placed = True
                     break
             if not placed:
                 # All deferred — cache the last one anyway
-                tools[-1]["cache_control"] = {"type": "ephemeral"}
+                tools[-1]["cache_control"] = cache_marker
 
         if cache_level == "cache tools array only":
             return
@@ -1515,7 +1660,7 @@ class Pipe:
             for i in range(len(system) - 1, -1, -1):
                 block = system[i]
                 if block.get("type") == "text" and block.get("text", "").strip():
-                    block["cache_control"] = {"type": "ephemeral"}
+                    block["cache_control"] = cache_marker
                     break
 
         if cache_level == "cache tools array and system prompt":
@@ -1547,22 +1692,27 @@ class Pipe:
                         content = msg.get("content", [])
                         if content:
                             # tool_result blocks are cacheable
-                            content[-1]["cache_control"] = {"type": "ephemeral"}
+                            content[-1]["cache_control"] = cache_marker
                         break
         else:
             # Initial request: cache the last stable user message
             self._cache_last_stable_message(messages)
 
     def _place_cache_on_last_cacheable_block(self, content_blocks: list) -> None:
-        """Add cache_control to the last block that isn't thinking/redacted_thinking."""
+        """Add cache_control to the last block that isn't thinking/redacted_thinking
+        or a tool_use called by code execution (API rejects cache_control on those)."""
         if not content_blocks:
             return
         for i in range(len(content_blocks) - 1, -1, -1):
             block = content_blocks[i]
-            if isinstance(block, dict) and block.get("type") not in (
-                "thinking", "redacted_thinking"
-            ):
-                block["cache_control"] = {"type": "ephemeral"}
+            if isinstance(block, dict):
+                btype = block.get("type")
+                if btype in ("thinking", "redacted_thinking"):
+                    continue
+                # tool_use blocks called by code_execution cannot have cache_control
+                if btype == "tool_use" and block.get("caller"):
+                    continue
+                block["cache_control"] = self._cache_control_marker()
                 return
 
     def _cache_last_stable_message(self, messages: list) -> None:
@@ -1848,8 +1998,10 @@ class Pipe:
                 has_code_execution = True
             # else: dynamic filtering tools present, no programmatic → let API auto-inject
 
-        # Create Headers
-        api_key = self.valves.ANTHROPIC_API_KEY
+        # Create Headers - check UserValves API key first
+        user_valves = __user__.get("valves") if __user__ else None
+        user_api_key = getattr(user_valves, "ANTHROPIC_API_KEY", "") if user_valves else ""
+        api_key = user_api_key.strip() if user_api_key and user_api_key.strip() else self.valves.ANTHROPIC_API_KEY
 
         headers = {
             "x-api-key": api_key,
@@ -1966,31 +2118,8 @@ class Pipe:
                     clear_tool_uses["clear_tool_inputs"] = True
                 context_management.append(clear_tool_uses)
 
-                # Check for thinking + cache conflict and warn once per conversation
-            if (
-                context_editing_strategy in ["clear_thinking", "clear_both"]
-                and self.valves.CACHE_CONTROL
-                == "cache tools array, system prompt and messages"
-            ):
-                chat_id = __metadata__.get("chat_id", "")
-                if chat_id and chat_id not in self._warned_thinking_cache_conflict:
-                    self._warned_thinking_cache_conflict.add(chat_id)
-                    await self.emit_event(
-                        {
-                            "type": "notification",
-                            "data": {
-                                "type": "warning",
-                                "content": "⚠️ Thinking block clearing is enabled with message caching. This may invalidate cached content when thinking blocks are cleared.",
-                            },
-                        },
-                        __event_emitter__,
-                    )
             if context_management:
                 payload["context_management"] = {"edits": context_management}
-
-        # Add 1M context header if enabled and model supports it
-        if self.valves.ENABLE_1M_CONTEXT and model_info["supports_1m_context"]:
-            beta_headers.append("context-1m-2025-08-07")
 
         # Add effort beta header and output_config if effort is configured
         if model_info["supports_effort"] and effort_config:
@@ -2406,10 +2535,6 @@ class Pipe:
 
         return claude_tools, api_tool_names
 
-    def _remove_thinking_blocks(self, content: str) -> str:
-        """Remove thinking blocks from assistant message content to prevent re-send to API."""
-        return PATTERN_THINKING_BLOCK.sub("", content)
-
     def _convert_content_to_claude_format(
         self, content: Union[str, List[dict], None], role: str = "user"
     ) -> List[dict]:
@@ -2423,9 +2548,23 @@ class Pipe:
             return []
 
         if isinstance(content, str):
-            # Only assistant messages can contain thinking blocks
+            # NOTE: Do NOT remove thinking blocks from assistant messages!
+            # Per Anthropic docs: thinking blocks MUST be preserved unmodified during tool use loops.
+            # The entire sequence of consecutive thinking blocks must match the original model output.
+            # For multi-turn: prior turn thinking CAN be omitted (API auto-filters), but preserving is preferred.
+            # With interleaved thinking (Claude 4), thinking blocks can appear BETWEEN tool calls too.
+            # Thinking blocks come back as serialized text (with <details type="reasoning">...) from OpenWebUI,
+            # and the API requires them to remain unchanged.
+
+            # Strip OpenWebUI UI-rendering artifacts from conversation history.
+            # <details type="tool_calls"> and <details type="code_interpreter"> are display-only
+            # HTML that OpenWebUI stores in message content. If sent to Claude 4.6 models,
+            # they pattern-match these and generate fake tool call HTML as text output
+            # instead of making actual API tool_use calls.
             if role == "assistant":
-                content = self._remove_thinking_blocks(content)
+                content = PATTERN_TOOL_CALLS_DETAILS.sub("", content)
+                content = PATTERN_CODE_INTERPRETER_DETAILS.sub("", content)
+
             # Only return non-empty text blocks
             if content.strip():
                 return [{"type": "text", "text": content}]
@@ -2588,6 +2727,292 @@ class Pipe:
                         })
         return claude_tool_results
 
+    def _safe_json(self, obj: Any) -> Any:
+        """Recursively convert obj to JSON-serializable form."""
+
+        if isinstance(obj, (str, int, float, bool)) or obj is None:
+            return obj
+        if isinstance(obj, dict):
+            return {k: self._safe_json(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [self._safe_json(v) for v in obj]
+        if hasattr(obj, "dict"):
+            try:
+                return self._safe_json(obj.dict())
+            except Exception:
+                pass
+        if hasattr(obj, "model_dump"):
+            try:
+                return self._safe_json(obj.model_dump())
+            except Exception:
+                pass
+        return f"<UNSERIALIZABLE {type(obj).__name__}>"
+
+    async def _emit_debug_citation(
+        self,
+        request_ctx: PipeRequestContext,
+        name: str,
+        value: Any,
+    ) -> None:
+        serial = self._safe_json(value)
+        await request_ctx.emit_event(
+            {
+                "type": "citation",
+                "data": {
+                    "document": [json.dumps(serial, indent=2)],
+                    "metadata": [{"source": name}],
+                    "source": {"name": name},
+                },
+            }
+        )
+
+    def _handle_message_start_usage(
+        self,
+        event: Any,
+        *,
+        include_usage: bool,
+        total_usage: Optional[dict[str, int]],
+        stream_output_tokens: int,
+    ) -> int:
+        """Handle message_start usage accounting and return updated stream output tokens."""
+
+        message = getattr(event, "message", None)
+        if not message:
+            return stream_output_tokens
+
+        request_id = getattr(message, "id", None)
+        logger.debug(f" Message started with ID: {request_id}")
+
+        if not include_usage or total_usage is None:
+            return stream_output_tokens
+
+        usage = getattr(message, "usage", {})
+        if not usage:
+            return stream_output_tokens
+
+        input_tokens = getattr(usage, "input_tokens", 0)
+        current_output_tokens = getattr(usage, "output_tokens", 0)
+
+        total_usage["input_tokens"] += input_tokens
+        diff = current_output_tokens - stream_output_tokens
+        total_usage["output_tokens"] += diff
+        stream_output_tokens = current_output_tokens
+        total_usage["total_tokens"] = input_tokens + current_output_tokens
+
+        if self.valves.CACHE_CONTROL != "cache disabled":
+            cache_creation_input_tokens = getattr(usage, "cache_creation_input_tokens", 0) or 0
+            cache_read_input_tokens = getattr(usage, "cache_read_input_tokens", 0) or 0
+            total_usage["cache_creation_input_tokens"] += cache_creation_input_tokens
+            total_usage["cache_read_input_tokens"] = cache_read_input_tokens
+            total_usage["total_tokens"] += cache_creation_input_tokens + cache_read_input_tokens
+            logger.debug(
+                f" Usage stats: input={input_tokens}, output={current_output_tokens}, "
+                f"cache_creation={cache_creation_input_tokens}, cache_read={cache_read_input_tokens}"
+            )
+        else:
+            logger.debug(f" Usage stats: input={input_tokens}, output={current_output_tokens}")
+        logger.debug(f" Accumulated usage: {total_usage}")
+
+        return stream_output_tokens
+
+    async def _handle_stream_exception(
+        self,
+        exc: Exception,
+        *,
+        retry_attempts: int,
+        request_ctx: PipeRequestContext,
+    ) -> tuple[bool, int, str]:
+        """Central stream exception policy.
+
+        Returns: (should_retry, updated_retry_attempts, response_suffix)
+        """
+
+        max_retries = self.valves.MAX_RETRIES
+
+        non_retry_map: dict[type[Exception], str] = {
+            RateLimitError: f"\n\n⚠️ Rate limit exceeded - maximum retries ({max_retries}) reached. Please try again later.",
+            AuthenticationError: f"\n\nError: API key issues. Reason: {getattr(exc, 'message', str(exc))}",
+            PermissionDeniedError: f"\n\nError: Permission denied. Reason: {getattr(exc, 'message', str(exc))}",
+            NotFoundError: f"\n\nError: Resource not found. Reason: {getattr(exc, 'message', str(exc))}",
+            BadRequestError: f"\n\nError: Invalid request format. Reason: {getattr(exc, 'message', str(exc))}",
+            UnprocessableEntityError: f"\n\nError: Unprocessable entity. Reason: {getattr(exc, 'message', str(exc))}",
+        }
+
+        for error_type, suffix in non_retry_map.items():
+            if isinstance(exc, error_type):
+                await self.handle_errors(exc, request_ctx.event_emitter)
+                return (False, retry_attempts, suffix)
+
+        retryable_with_status: list[tuple[type[Exception], str, str]] = [
+            (OverloadedError, "⏳ API overloaded, retrying...", "🔧 API overloaded"),
+            (InternalServerError, "⏳ Server error, retrying...", "🔧 Server error"),
+            (APIConnectionError, "🌐 Connection error, retrying...", "🌐 Network connection failed"),
+        ]
+
+        for error_type, status_label, fail_label in retryable_with_status:
+            if isinstance(exc, error_type):
+                retry_attempts += 1
+                if retry_attempts <= max_retries:
+                    await request_ctx.emit_event(
+                        {
+                            "type": "status",
+                            "data": {
+                                "description": f"{status_label} ({retry_attempts}/{max_retries})",
+                                "done": False,
+                            },
+                        }
+                    )
+                    return (True, retry_attempts, "")
+
+                await self.handle_errors(exc, request_ctx.event_emitter)
+                if isinstance(exc, APIConnectionError):
+                    return (
+                        False,
+                        retry_attempts,
+                        f"\n\n{fail_label} after {max_retries} attempts. Please check your connection.",
+                    )
+                return (
+                    False,
+                    retry_attempts,
+                    f"\n\n{fail_label} - maximum retries ({max_retries}) reached. Please try again later.",
+                )
+
+        if isinstance(exc, APIStatusError):
+            error_body = getattr(exc, "body", None) or {}
+            error_info = error_body.get("error", {}) if isinstance(error_body, dict) else {}
+            is_overloaded = error_info.get("type") == "overloaded_error"
+
+            if is_overloaded and retry_attempts < max_retries:
+                retry_attempts += 1
+                await request_ctx.emit_event(
+                    {
+                        "type": "status",
+                        "data": {
+                            "description": f"⏳ API overloaded (streaming), retrying... ({retry_attempts}/{max_retries})",
+                            "done": False,
+                        },
+                    }
+                )
+                return (True, retry_attempts, "")
+
+            await self.handle_errors(exc, request_ctx.event_emitter)
+            if is_overloaded:
+                return (
+                    False,
+                    retry_attempts,
+                    f"\n\n🔧 API overloaded (streaming) - maximum retries ({max_retries}) reached. Please try again later.",
+                )
+            return (
+                False,
+                retry_attempts,
+                f"\n\nError: Anthropic API error. Reason: {getattr(exc, 'message', str(exc))}",
+            )
+
+        await self.handle_errors(exc, request_ctx.event_emitter)
+        return (
+            False,
+            retry_attempts,
+            f"\n\nError: {type(exc).__name__} occurred. Reason: {exc}",
+        )
+
+    async def _apply_sdk_stop_reason_fallback(
+        self,
+        *,
+        sdk_final_message: Any,
+        conversation_ended: bool,
+        has_pending_tool_calls: bool,
+        tool_calls: list[dict[str, Any]],
+        tool_loop_iteration: int,
+        payload_for_stream: dict[str, Any],
+        stream_event_counts: dict[str, int],
+        request_ctx: PipeRequestContext,
+    ) -> tuple[bool, bool, list[dict[str, Any]]]:
+        """Apply fallback stop-reason logic when message_delta was missing."""
+
+        if not sdk_final_message or conversation_ended or has_pending_tool_calls:
+            return conversation_ended, has_pending_tool_calls, tool_calls
+
+        sdk_stop = getattr(sdk_final_message, "stop_reason", None)
+        sdk_content = getattr(sdk_final_message, "content", [])
+
+        if sdk_stop:
+            logger.info(f"📍 Fallback stop_reason from SDK message: {sdk_stop}")
+            if sdk_stop == "end_turn":
+                conversation_ended = True
+            elif sdk_stop == "tool_use":
+                has_pending_tool_calls = True
+                if not tool_calls:
+                    for block in sdk_content:
+                        if getattr(block, "type", None) == "tool_use":
+                            logger.warning(
+                                f"📍 Rebuilding tool_call from SDK: {getattr(block, 'name', '?')}"
+                            )
+                            tool_calls.append(
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": getattr(block, "id", ""),
+                                    "content": "Error: tool call was not processed during streaming",
+                                    "is_error": True,
+                                }
+                            )
+            elif sdk_stop == "pause_turn":
+                has_pending_tool_calls = True
+                await request_ctx.emit_event(
+                    {
+                        "type": "status",
+                        "data": {
+                            "description": "⏳ Long-running turn paused, continuing...",
+                            "done": False,
+                        },
+                    }
+                )
+            elif sdk_stop in (
+                "max_tokens",
+                "refusal",
+                "stop_sequence",
+                "model_context_window_exceeded",
+            ):
+                conversation_ended = True
+                if sdk_stop == "max_tokens":
+                    await request_ctx.emit_delta("\n\n⚠️ Maximum token limit reached.")
+                elif sdk_stop == "model_context_window_exceeded":
+                    await request_ctx.emit_delta("\n\n⚠️ Context window exceeded.")
+        elif not sdk_content:
+            logger.warning(
+                f"⚠️ Empty API response (no stop_reason, no content). "
+                f"Container: {payload_for_stream.get('container', 'NONE')}. "
+                f"Events: {stream_event_counts}. Treating as end_turn."
+            )
+            conversation_ended = True
+            if tool_loop_iteration > 1:
+                await request_ctx.emit_delta(
+                    "\n\n⚠️ Code execution continuation returned empty response. "
+                    "The container may have timed out."
+                )
+        else:
+            # stop_reason is None but content exists (e.g. thinking + server_tool blocks
+            # without any text). This typically happens when the API is overloaded and
+            # returns a truncated stream after 200 OK. Anthropic warns:
+            # "When receiving a streaming response via SSE, it's possible that an error
+            # can occur after returning a 200 response."
+            # We leave conversation_ended=False here so the main loop's safety-break
+            # section can detect this and trigger an auto-retry.
+            block_types = [getattr(b, "type", "?") for b in sdk_content]
+            has_text = any(
+                getattr(b, "type", None) == "text"
+                and len(getattr(b, "text", "") or "") > 0
+                for b in sdk_content
+            )
+            logger.warning(
+                f"⚠️ Truncated stream: no stop_reason but content present. "
+                f"Blocks: {block_types}. has_text={has_text}. "
+                f"Container: {payload_for_stream.get('container', 'NONE')}. "
+                f"Events: {stream_event_counts}."
+            )
+            # Don't set conversation_ended — let the safety-break handle retry logic
+
+        return conversation_ended, has_pending_tool_calls, tool_calls
+
     # =========================================================================
     # MAIN ENTRY POINT
     # =========================================================================
@@ -2610,85 +3035,14 @@ class Pipe:
         # =========================================================================
         # PHASE 1: RESPONSE ACCUMULATION STATE
         # =========================================================================
-        # Initialize final_message first so it's available for nested functions
-        final_message: list[str] = []
+        request_ctx = PipeRequestContext(pipe=self, event_emitter=__event_emitter__)
+        final_message = request_ctx.final_message
+        emit_event_local = request_ctx.emit_event
+        emit_message_delta = request_ctx.emit_delta
+        emit_message_replace = request_ctx.emit_replace
+        update_content_block = request_ctx.update_content_block
+        final_text = request_ctx.text
 
-        async def emit_event_local(event: dict):
-            """Request-local event emitter wrapper"""
-            await self.emit_event(event, __event_emitter__)
-
-        async def emit_message_delta(content: str) -> None:
-            await emit_event_local(
-                {"type": "chat:message:delta", "data": {"content": content}}
-            )
-            final_message.append(content)
-
-        async def emit_message_replace(content: str) -> None:
-            """Replace the entire message content. Updates final_message to match."""
-            await emit_event_local(
-                {"type": "replace", "data": {"content": content}}
-            )
-            final_message.clear()
-            final_message.append(content)
-
-        def final_text() -> str:
-            return "".join(final_message)
-
-        # Consecutive code execution merging state
-        # When multiple code_execution blocks happen back-to-back, merge into one <details>
-        pending_code_exec_parts: list[dict] = []  # [{code, language, stdout, stderr, return_code, download_links, tool_calls_info}]
-        pending_code_exec_start_idx: int = -1  # Position in final_message where first code exec block starts
-
-        def _build_merged_code_exec_block(parts: list[dict]) -> str:
-            """Build a single merged <details> block from multiple code execution parts."""
-            if not parts:
-                return ""
-            if len(parts) == 1:
-                # Single block — use normal format
-                p = parts[0]
-                return self._format_code_input_block(
-                    p["code"], p["language"],
-                    return_code=p.get("return_code"),
-                    download_links=p.get("download_links"),
-                    tool_calls_info=p.get("tool_calls_info"),
-                )
-            # Multiple blocks — merge into one <details>
-            count = len(parts)
-            result_parts = []
-            result_parts.append(f"\n<details>\n<summary>💻 Code Execution — {count} steps</summary>\n")
-            for i, p in enumerate(parts, 1):
-                lang = p.get("language", "python")
-                code = p.get("code", "")
-                rc = p.get("return_code")
-                dl = p.get("download_links", [])
-                tc = p.get("tool_calls_info", [])
-                exit_info = f" ❌ exit {rc}" if rc is not None and rc != 0 else ""
-                result_parts.append(f"\n**Step {i}** ({lang}){exit_info}\n")
-                if code:
-                    result_parts.append(f"```{lang}\n{code}\n```\n")
-                if tc:
-                    result_parts.append("🔧 Tool Calls: ")
-                    result_parts.append(", ".join(t.get("name", "?") for t in tc))
-                    result_parts.append("\n")
-                if dl:
-                    for link in dl:
-                        result_parts.append(f"- {link}\n")
-            result_parts.append("\n</details>\n")
-            return "".join(result_parts)
-
-        async def flush_pending_code_exec():
-            """Flush accumulated consecutive code execution blocks as one merged block."""
-            nonlocal pending_code_exec_parts, pending_code_exec_start_idx
-            if not pending_code_exec_parts:
-                return
-            merged_block = _build_merged_code_exec_block(pending_code_exec_parts)
-            if pending_code_exec_start_idx >= 0:
-                prefix = "".join(final_message[:pending_code_exec_start_idx])
-                await emit_message_replace(prefix + merged_block)
-            else:
-                await emit_message_delta(merged_block)
-            pending_code_exec_parts = []
-            pending_code_exec_start_idx = -1
 
         try:
             # =========================================================================
@@ -2704,10 +3058,12 @@ class Pipe:
                 elif user_valves:
                     logger.debug(f"UserValves: {user_valves}")
 
-            # Get API key
-            api_key = self.valves.ANTHROPIC_API_KEY
-            if not api_key:
-                error_msg = "Error: No API key configured"
+            # Get API key - check UserValves first, then fall back to admin valve
+            user_valves = __user__.get("valves")
+            user_api_key = getattr(user_valves, "ANTHROPIC_API_KEY", "") if user_valves else ""
+            api_key = user_api_key.strip() if user_api_key and user_api_key.strip() else self.valves.ANTHROPIC_API_KEY
+            if not api_key or api_key == "Your API Key Here":
+                error_msg = "Error: No API key configured. Set it in admin Valves or your personal UserValves."
                 logger.error(f"{error_msg}")
                 await emit_event_local(
                     {
@@ -2738,6 +3094,41 @@ class Pipe:
                         if __user__
                         else False
                     )
+                    # Resolve skill IDs for view_skill builtin tool
+                    skill_ids = []
+                    try:
+                        openwebui_model_id = __metadata__.get("model_id") or body.get("model", "")
+                        if openwebui_model_id and MODELS_AVAILABLE:
+                            owui_model = Models.get_model_by_id(openwebui_model_id)
+                            if owui_model:
+                                # ModelModel has .meta (ModelMeta pydantic model), not .info
+                                meta = owui_model.meta
+                                if meta:
+                                    meta_dict = meta.model_dump() if hasattr(meta, "model_dump") else (meta if isinstance(meta, dict) else {})
+                                    model_skill_ids = set(meta_dict.get("skillIds", []))
+                                else:
+                                    model_skill_ids = set()
+                                logger.debug(f"Model {openwebui_model_id} skill IDs: {model_skill_ids}")
+                                if model_skill_ids:
+                                    from open_webui.models.skills import Skills as SkillsModel
+
+                                    user_id = __user__.get("id", "") if __user__ else ""
+                                    accessible = {
+                                        s.id
+                                        for s in SkillsModel.get_skills_by_user_id(user_id, "read")
+                                    }
+                                    logger.debug(f"Accessible skills for user: {accessible}")
+                                    skill_ids = [
+                                        sid
+                                        for sid in model_skill_ids
+                                        if sid in accessible
+                                        and (s := SkillsModel.get_skill_by_id(sid))
+                                        and s.is_active
+                                    ]
+                                    logger.debug(f"Resolved skill_ids: {skill_ids}")
+                    except Exception as e:
+                        logger.debug(f"Could not resolve skill IDs: {e}")
+
                     builtin_tools = get_builtin_tools(
                         __request__,
                         {
@@ -2749,6 +3140,7 @@ class Pipe:
                             "__message_id__": (
                                 __metadata__.get("message_id") if __metadata__ else None
                             ),
+                            "__skill_ids__": skill_ids,
                         },
                         features={"memory": memory_enabled},
                         model={},
@@ -2759,6 +3151,19 @@ class Pipe:
                 except Exception as e:
                     logger.warning(f"Could not load builtin tools: {e}")
                     builtin_tools = {}
+
+            # Merge external tools from metadata (Open Terminal, external tool servers)
+            # These have callables for execution but are not in __tools__ or builtin_tools
+            metadata_tools = __metadata__.get("tools", {}) if __metadata__ else {}
+            if metadata_tools:
+                for t_name, t_data in metadata_tools.items():
+                    if t_name not in builtin_tools and (not __tools__ or t_name not in __tools__):
+                        if isinstance(t_data, dict) and t_data.get("callable"):
+                            builtin_tools[t_name] = t_data
+                if builtin_tools:
+                    logger.debug(
+                        f"After metadata merge, builtin_tools: {list(builtin_tools.keys())}"
+                    )
 
             # STEP 3: Auto-enable native function calling if tools are present
             # This prevents OpenWebUI's function_calling task system from being triggered
@@ -2806,67 +3211,31 @@ class Pipe:
                 body, __metadata__, __user__, __tools__, __event_emitter__, __files__
             )
 
-            def _safe_json(obj: Any) -> Any:
-                """Recursively convert obj to JSON-serializable form."""
-
-                if isinstance(obj, (str, int, float, bool)) or obj is None:
-                    return obj
-                if isinstance(obj, dict):
-                    return {k: _safe_json(v) for k, v in obj.items()}
-                if isinstance(obj, list):
-                    return [_safe_json(v) for v in obj]
-                if hasattr(obj, "dict"):
-                    try:
-                        return _safe_json(obj.dict())
-                    except Exception:  # pragma: no cover - best effort
-                        pass
-                if hasattr(obj, "model_dump"):
-                    try:
-                        return _safe_json(obj.model_dump())
-                    except Exception:  # pragma: no cover - best effort
-                        pass
-                return f"<UNSERIALIZABLE {type(obj).__name__}>"
-
-            async def emit(name: str, value: Any) -> None:
-
-                if __event_emitter__ is None:
-                    return
-
-                serial = _safe_json(value)
-                await __event_emitter__(
-                    {
-                        "type": "citation",
-                        "data": {
-                            "document": [json.dumps(serial, indent=2)],
-                            "metadata": [
-                                {
-                                    "source": name,
-                                }
-                            ],
-                            "source": {"name": name},
-                        },
-                    }
-                )
-
             if __user__["valves"].DEBUG_MODE:
-                await emit("Payload", payload)
-                await emit("Headers", headers)
-                await emit("body", body)
-                await emit("__metadata__", __metadata__ or {})
-                await emit("__user__", __user__)
-                await emit("__files__", __files__ or [])
-                await emit("__tools__", __tools__ or {})
-                await emit("new_marker_metadata", new_marker_metadata or {})
-                await emit("Valves: ", self.valves.__dict__)
-                await emit("UserValves: ", __user__["valves"].__dict__)
+                await self._emit_debug_citation(request_ctx, "Payload", payload)
+                await self._emit_debug_citation(request_ctx, "Headers", headers)
+                await self._emit_debug_citation(request_ctx, "body", body)
+                await self._emit_debug_citation(request_ctx, "__metadata__", __metadata__ or {})
+                await self._emit_debug_citation(request_ctx, "__user__", __user__)
+                await self._emit_debug_citation(request_ctx, "__files__", __files__ or [])
+                await self._emit_debug_citation(request_ctx, "__tools__", __tools__ or {})
+                await self._emit_debug_citation(request_ctx, "new_marker_metadata", new_marker_metadata or {})
+                await self._emit_debug_citation(request_ctx, "Valves: ", self.valves.__dict__)
+                await self._emit_debug_citation(request_ctx, "UserValves: ", __user__["valves"].__dict__)
                 if __task__:
-                    await emit("__task__", __task_body__)
+                    await self._emit_debug_citation(request_ctx, "__task__", __task_body__)
 
             # =========================================================================
             # PHASE 3: STREAMING STATE INITIALIZATION
             # =========================================================================
             api_key = headers.get("x-api-key", self.valves.ANTHROPIC_API_KEY)
-            client = AsyncAnthropic(api_key=api_key, default_headers=headers)
+            # Use UserValves API key if available (override header-level key too)
+            if user_api_key and user_api_key.strip():
+                api_key = user_api_key.strip()
+                logger.debug("Using user-provided API key from UserValves")
+            request_timeout = self.valves.REQUEST_TIMEOUT
+            base_url = self.valves.ANTHROPIC_BASE_URL.strip() or None
+            client = AsyncAnthropic(api_key=api_key, default_headers=headers, timeout=request_timeout, **({"base_url": base_url} if base_url else {}))
             payload_for_stream = {k: v for k, v in payload.items() if k != "stream"}
             include_usage = body.get("stream_options", {}).get("include_usage", False)
             if include_usage:
@@ -2884,6 +3253,7 @@ class Pipe:
             thinking_message = ""
             thinking_start_time = None  # Track when thinking started for duration calc
             thinking_stream_start_idx = -1  # Position in final_message where thinking content starts
+            thinking_last_block = ""  # Tracks current formatted thinking block for content-preserving replace
 
             # SDK-accumulated message: captured after each stream completes
             # Replaces manual api_assistant_blocks/thinking_blocks accumulation
@@ -2893,10 +3263,12 @@ class Pipe:
             current_block_type = None  # Track current block type for stop events
             has_pending_tool_calls = False
             tools_buffer = ""
+            tool_input_buffer = ""  # Accumulate just the input JSON for live streaming
             tool_calls = []
             running_tool_tasks = []  # Async tasks for executing tools immediately
             tool_call_data_list = []  # Store tool metadata for result matching
             api_tool_passthrough = False  # Flag for API tool passthrough mode
+            tool_progress_blocks = {}  # Map tool_id → current in-progress block text for replacement
             # Note: tool_use_blocks and current_tool_caller removed - SDK preserves these in accumulated message
 
             # Server tool state (web_search, code_execution)
@@ -2912,8 +3284,10 @@ class Pipe:
             code_exec_is_web_filtering = False  # True when code_execution is just dynamic filtering for web tools
             code_exec_tool_calls_info = []  # Accumulate tool call info for unified display
             code_exec_stream_start_idx = -1  # Position in final_message where code exec content starts
-            consecutive_code_exec_count = 0  # Track consecutive code_execution blocks for merging
-            consecutive_code_exec_parts = []  # Accumulate parts for merged code_execution blocks
+            code_exec_last_block = ""  # Tracks current formatted code block for content-preserving replace
+            code_exec_current_code = ""  # Accumulated code for live streaming inside details
+            code_exec_current_lang = "python"  # Language for live streaming
+            code_exec_start_time = 0.0  # time.time() when code execution started
             last_code_language = (
                 "bash"  # Track language of last code block for output association
             )
@@ -3044,71 +3418,16 @@ class Pipe:
                         async for event in stream:
                             event_type = getattr(event, "type", None)
                             stream_event_counts[event_type] = stream_event_counts.get(event_type, 0) + 1
+                            logger.debug(f"Received stream event: {event_type} | counts: {stream_event_counts} | payload: {event}")
                             if event_type == "message_start":
-                                message = getattr(event, "message", None)
-                                if message:
-                                    request_id = getattr(message, "id", None)
-                                    logger.debug(
-                                        f" Message started with ID: {request_id}"
-                                    )
-                                    # Note: Container ID is NOT available in message_start for streaming.
-                                    # It arrives in message_delta instead. See message_delta handler.
-                                    if include_usage:
-                                        usage = getattr(message, "usage", {})
-                                        if usage:
-                                            input_tokens = getattr(
-                                                usage, "input_tokens", 0
-                                            )
-                                            current_output_tokens = getattr(
-                                                usage, "output_tokens", 0
-                                            )
-                                            # Accumulate billable tokens (for cost tracking)
-                                            total_usage["input_tokens"] += input_tokens
-                                            # Handle output tokens (cumulative within stream)
-                                            diff = (
-                                                current_output_tokens
-                                                - stream_output_tokens
-                                            )
-                                            total_usage["output_tokens"] += diff
-                                            stream_output_tokens = current_output_tokens
-
-                                            # Calculate total context size from last turn
-                                            total_usage["total_tokens"] = (
-                                                input_tokens + current_output_tokens
-                                            )
-
-                                            if (
-                                                self.valves.CACHE_CONTROL
-                                                != "cache disabled"
-                                            ):
-                                                cache_creation_input_tokens = getattr(
-                                                    usage,
-                                                    "cache_creation_input_tokens",
-                                                    0,
-                                                ) or 0
-                                                cache_read_input_tokens = getattr(
-                                                    usage, "cache_read_input_tokens", 0
-                                                ) or 0
-                                                total_usage[
-                                                    "cache_creation_input_tokens"
-                                                ] += cache_creation_input_tokens
-                                                total_usage[
-                                                    "cache_read_input_tokens"
-                                                ] = cache_read_input_tokens
-                                                total_usage["total_tokens"] += (
-                                                    cache_creation_input_tokens
-                                                    + cache_read_input_tokens
-                                                )
-                                                logger.debug(
-                                                    f" Usage stats: input={input_tokens}, output={current_output_tokens}, cache_creation={cache_creation_input_tokens}, cache_read={cache_read_input_tokens}"
-                                                )
-                                            else:
-                                                logger.debug(
-                                                    f" Usage stats: input={input_tokens}, output={current_output_tokens}"
-                                                )
-                                            logger.debug(
-                                                f" Accumulated usage: {total_usage}"
-                                            )
+                                # Note: Container ID is not in message_start for streaming;
+                                # it arrives in message_delta.
+                                stream_output_tokens = self._handle_message_start_usage(
+                                    event,
+                                    include_usage=include_usage,
+                                    total_usage=total_usage if include_usage else None,
+                                    stream_output_tokens=stream_output_tokens,
+                                )
 
                             # ---------------------------------------------------------
                             # EVENT: content_block_start
@@ -3122,75 +3441,31 @@ class Pipe:
                                 current_block_type = content_type
                                 if not content_block:
                                     continue
-
-                                # Flush pending consecutive code execution blocks when a non-code block starts
-                                if content_type in ("text", "thinking", "redacted_thinking") and pending_code_exec_parts:
-                                    await flush_pending_code_exec()
-
                                 if content_type == "text":
                                     chunk += content_block.text or ""
-                                if content_type == "thinking":
+                                elif content_type == "thinking":
                                     is_model_thinking = True
                                     thinking_start_time = time.time()
                                     thinking_message = ""
                                     thinking_stream_start_idx = len(final_message)
-                                if content_type == "redacted_thinking":
-                                    # Redacted thinking blocks are preserved by the SDK's accumulated
-                                    # message — they will be correctly included in the next API call
+                                elif content_type == "redacted_thinking":
                                     is_model_thinking = True
-                                if content_type == "tool_use":
+                                elif content_type == "tool_use":
                                     tool_name = getattr(
                                         content_block, "name", "unknown"
                                     )
-
-                                    # Note: caller field for programmatic tool calling is now
-                                    # preserved by the SDK's accumulated message automatically.
-                                    # No manual tracking needed.
-
                                     logger.debug(
                                         f"🔧 Tool use block started: {tool_name}"
                                     )
-
-                                    # Emit status immediately when tool_use block starts
                                     if in_code_execution and code_exec_is_web_filtering:
                                         # User tool called from within code_execution → NOT just web filtering
                                         code_exec_is_web_filtering = False
                                         code_exec_has_user_tools = True
-                                        # Emit the deferred "Running code" status
-                                        await emit_event_local(
-                                            {
-                                                "type": "status",
-                                                "data": {
-                                                    "description": "⚡ Running code...",
-                                                    "done": False,
-                                                },
-                                            }
-                                        )
-                                    if in_code_execution and not code_exec_is_web_filtering:
-                                        # Programmatic tool call - show as sub-step of code execution
-                                        await emit_event_local(
-                                            {
-                                                "type": "status",
-                                                "data": {
-                                                    "description": f"⚡ Code → 🔧 {tool_name}",
-                                                    "done": False,
-                                                },
-                                            }
-                                        )
-                                    else:
-                                        await emit_event_local(
-                                            {
-                                                "type": "status",
-                                                "data": {
-                                                    "description": f"🔧 Executing tool: {tool_name}",
-                                                    "done": False,
-                                                },
-                                            }
-                                        )
 
                                     # For programmatic tool calls, the API may provide
                                     # the full input at content_block_start (no input_json_delta events)
                                     initial_input = getattr(content_block, "input", None) or {}
+                                    tool_id_at_start = getattr(content_block, "id", "")
                                     if initial_input:
                                         # Input is pre-populated (programmatic call) - include it directly
                                         logger.debug(f"🔧 Tool input pre-populated at start: {json.dumps(initial_input)[:200]}")
@@ -3210,7 +3485,17 @@ class Pipe:
                                             f'"input": '
                                         )
 
-                                if content_type == "server_tool_use":
+                                    # Show in-progress tool call block immediately (not for programmatic/code_exec)
+                                    if not in_code_execution:
+                                        in_progress_block = self._format_tool_result_block(
+                                            tool_id_at_start, tool_name, initial_input or {}, "", done=False
+                                        )
+                                        tool_progress_blocks[tool_id_at_start] = in_progress_block
+                                        final_message.append(in_progress_block)
+                                        await emit_message_replace(final_text())
+                                    # Reset input buffer for streaming tool arguments
+                                    tool_input_buffer = ""
+                                elif content_type == "server_tool_use":
                                     # Track active server tool (web_search, code_execution)
                                     # No need for tools_buffer - server handles execution
                                     active_server_tool_name = getattr(
@@ -3255,6 +3540,16 @@ class Pipe:
                                             }
                                         )
                                     elif active_server_tool_name == "code_execution":
+                                        # Finalize any previous live-streamed block before starting new one
+                                        if code_exec_current_code:
+                                            duration = time.time() - code_exec_start_time if code_exec_start_time else None
+                                            block = self._format_code_execution_block(
+                                                code_exec_current_code, code_exec_current_lang,
+                                                done=True, duration=duration,
+                                            )
+                                            await update_content_block(code_exec_last_block, block)
+                                            code_exec_last_block = ""
+
                                         in_code_execution = True
                                         # Start assuming web filtering — confirmed when web_search/web_fetch appears inside
                                         # Flipped to False if user tools (tool_use blocks) are called
@@ -3263,10 +3558,25 @@ class Pipe:
                                         code_exec_had_web_tools = False
                                         code_exec_tool_calls_info = []
                                         code_exec_stream_start_idx = len(final_message)
+                                        code_exec_current_code = ""
+                                        code_exec_current_lang = "python"
+                                        code_exec_start_time = time.time()
                                         # Don't emit "Running code" yet — defer until we know it's not web filtering
+                                    elif active_server_tool_name in ("bash_code_execution", "text_editor_code_execution"):
+                                        # Finalize any previous live-streamed block before starting new one
+                                        if code_exec_current_code:
+                                            duration = time.time() - code_exec_start_time if code_exec_start_time else None
+                                            block = self._format_code_execution_block(
+                                                code_exec_current_code, code_exec_current_lang,
+                                                done=True, duration=duration,
+                                            )
+                                            await update_content_block(code_exec_last_block, block)
+                                            code_exec_last_block = ""
 
-                                # Handle bash code execution results
-                                if content_type == "bash_code_execution_tool_result":
+                                        code_exec_current_code = ""
+                                        code_exec_current_lang = "bash" if active_server_tool_name == "bash_code_execution" else "python"
+                                        code_exec_start_time = time.time()
+                                elif content_type == "bash_code_execution_tool_result":
                                     logger.debug(
                                         f"Processing bash_code_execution_tool_result: {content_block}"
                                     )
@@ -3274,6 +3584,16 @@ class Pipe:
                                         content_block, "content", None
                                     )
                                     if result_block:
+                                        # Check for server tool errors (unavailable, execution_time_exceeded, container_expired, etc.)
+                                        result_block_type = getattr(result_block, "type", "")
+                                        if result_block_type == "bash_code_execution_tool_result_error":
+                                            error_code = getattr(result_block, "error_code", "unknown")
+                                            error_msg = f"⚠️ Code execution error: {error_code}"
+                                            logger.warning(f"bash_code_execution error: {error_code}")
+                                            await emit_message_delta(f"{error_msg}")
+                                            last_code_content = ""
+                                            continue
+
                                         stdout = getattr(result_block, "stdout", "")
                                         stderr = getattr(result_block, "stderr", "")
                                         return_code = getattr(
@@ -3315,32 +3635,21 @@ class Pipe:
                                             or download_links
                                         ):
                                             if code_exec_is_web_filtering and code_exec_had_web_tools:
-                                                # Dynamic filtering confirmed: suppress code execution UI
                                                 logger.debug("Suppressed bash code execution block (web filtering)")
                                             else:
-                                                # Accumulate for consecutive merging
-                                                if pending_code_exec_start_idx < 0:
-                                                    pending_code_exec_start_idx = len(final_message)
-                                                pending_code_exec_parts.append({
-                                                    "code": last_code_content, "language": "bash",
-                                                    "stdout": stdout, "stderr": stderr,
-                                                    "return_code": return_code, "download_links": download_links,
-                                                })
-                                                # Emit output as source/citation event
-                                                await self._emit_code_execution_source(
-                                                    emit_event_local, last_code_content, "bash",
-                                                    stdout, stderr, return_code, download_links
+                                                # Update the live-streamed code block with final result
+                                                duration = time.time() - code_exec_start_time if code_exec_start_time else None
+                                                block = self._format_code_execution_block(
+                                                    last_code_content, "bash",
+                                                    done=True, duration=duration,
+                                                    stdout=stdout, stderr=stderr,
+                                                    return_code=return_code,
+                                                    download_links=download_links,
                                                 )
-                                                logger.debug("Accumulated bash code execution block for merging")
-
-                                            # Clear buffered code
+                                                await update_content_block(code_exec_last_block, block)
+                                                code_exec_last_block = ""
                                             last_code_content = ""
-
-                                # Handle text editor code execution results
-                                if (
-                                    content_type
-                                    == "text_editor_code_execution_tool_result"
-                                ):
+                                elif content_type == "text_editor_code_execution_tool_result":
                                     logger.debug(
                                         f"Processing text_editor_code_execution_tool_result: {content_block}"
                                     )
@@ -3353,6 +3662,15 @@ class Pipe:
                                             f"Text editor result type: {result_type}"
                                         )
 
+                                        # Check for server tool errors (file_not_found, string_not_found, unavailable, etc.)
+                                        if result_type == "text_editor_code_execution_tool_result_error":
+                                            error_code = getattr(result_block, "error_code", "unknown")
+                                            error_msg = f"⚠️ Text editor error: {error_code}"
+                                            logger.warning(f"text_editor_code_execution error: {error_code}")
+                                            await emit_message_delta(f"{error_msg}")
+                                            last_code_content = ""
+                                            continue
+
                                         if code_exec_is_web_filtering and code_exec_had_web_tools:
                                             # Dynamic filtering confirmed: suppress text editor UI
                                             logger.debug("Suppressed text editor block (web filtering)")
@@ -3364,20 +3682,19 @@ class Pipe:
                                                 == "text_editor_code_execution_create_result"
                                             ):
                                                 if last_code_content and last_code_language == "__inline_text__":
-                                                    # Text file → display content inline as markdown
                                                     msg = f"\n\n{last_code_content}\n\n"
                                                     await emit_message_delta(msg)
-                                                    logger.debug("Displayed text file content inline")
                                                     last_code_content = ""
                                                     last_code_language = ""
                                                 elif last_code_content:
-                                                    # Code file → accumulate for consecutive merging
-                                                    if pending_code_exec_start_idx < 0:
-                                                        pending_code_exec_start_idx = len(final_message)
-                                                    pending_code_exec_parts.append({
-                                                        "code": last_code_content, "language": last_code_language or "python",
-                                                    })
-                                                    logger.debug("Accumulated text editor create block for merging")
+                                                    # Replace live-streamed block with final version
+                                                    duration = time.time() - code_exec_start_time if code_exec_start_time else None
+                                                    block = self._format_code_execution_block(
+                                                        last_code_content, last_code_language or "python",
+                                                        done=True, duration=duration,
+                                                    )
+                                                    await update_content_block(code_exec_last_block, block)
+                                                    code_exec_last_block = ""
                                                     last_code_content = ""
 
                                             elif (
@@ -3390,9 +3707,7 @@ class Pipe:
                                                 if content:
                                                     msg = f"\n<details>\n<summary>📄 File Content</summary>\n\n```\n{content}\n```\n</details>\n"
                                                     await emit_message_delta(msg)
-
-                                # Programmatic code_execution result (tool calling via code)
-                                if content_type == "code_execution_tool_result":
+                                elif content_type == "code_execution_tool_result":
                                     logger.debug(
                                         "Processing code_execution_tool_result"
                                     )
@@ -3401,6 +3716,24 @@ class Pipe:
                                     stderr = ""
                                     return_code = None
                                     if result_block:
+                                        # Check for server tool errors
+                                        result_block_type = (
+                                            result_block.get("type", "") if isinstance(result_block, dict)
+                                            else getattr(result_block, "type", "")
+                                        )
+                                        if result_block_type == "code_execution_tool_result_error":
+                                            error_code = (
+                                                result_block.get("error_code", "unknown") if isinstance(result_block, dict)
+                                                else getattr(result_block, "error_code", "unknown")
+                                            )
+                                            error_msg = f"⚠️ Code execution error: {error_code}"
+                                            logger.warning(f"code_execution error: {error_code}")
+                                            await emit_message_delta(f"{error_msg}")
+                                            last_code_content = ""
+                                            in_code_execution = False
+                                            code_exec_is_web_filtering = False
+                                            continue
+
                                         # Handle both dict (legacy) and object (new API) formats
                                         if isinstance(result_block, dict):
                                             stdout = result_block.get("stdout", "")
@@ -3412,29 +3745,21 @@ class Pipe:
                                             return_code = getattr(result_block, "return_code", None)
 
                                     if code_exec_is_web_filtering and code_exec_had_web_tools:
-                                        # Dynamic filtering confirmed: web tools ran inside code_execution → suppress UI
                                         logger.debug("Suppressed code_execution_tool_result (web filtering)")
                                         last_code_content = ""
                                     elif stdout or stderr or return_code is not None or code_exec_tool_calls_info:
-                                        # Accumulate for consecutive merging
-                                        if pending_code_exec_start_idx < 0:
-                                            # Use code_exec_stream_start_idx if available (for replace strategy)
-                                            pending_code_exec_start_idx = (
-                                                code_exec_stream_start_idx if code_exec_stream_start_idx >= 0
-                                                else len(final_message)
-                                            )
-                                        pending_code_exec_parts.append({
-                                            "code": last_code_content, "language": "python",
-                                            "stdout": stdout, "stderr": stderr,
-                                            "return_code": return_code,
-                                            "tool_calls_info": code_exec_tool_calls_info,
-                                        })
-                                        # Emit output as source/citation event immediately
-                                        await self._emit_code_execution_source(
-                                            emit_event_local, last_code_content, "python",
-                                            stdout, stderr, return_code, [],
-                                            tool_calls_info=code_exec_tool_calls_info
+                                        # Update the live-streamed code block with final result
+                                        duration = time.time() - code_exec_start_time if code_exec_start_time else None
+                                        code_to_show = last_code_content or code_exec_current_code
+                                        block = self._format_code_execution_block(
+                                            code_to_show, "python",
+                                            done=True, duration=duration,
+                                            stdout=stdout, stderr=stderr,
+                                            return_code=return_code,
+                                            tool_calls_info=code_exec_tool_calls_info,
                                         )
+                                        await update_content_block(code_exec_last_block, block)
+                                        code_exec_last_block = ""
                                         last_code_content = ""
 
                                     # Emit "complete" status only if it wasn't web filtering
@@ -3449,34 +3774,33 @@ class Pipe:
                                     code_exec_stream_start_idx = -1
 
                                     if not was_web_filtering:
-                                        await emit_event_local(
-                                            {
-                                                "type": "status",
-                                                "data": {
-                                                    "description": "✅ Code execution complete",
-                                                    "done": True,
-                                                },
-                                            }
-                                        )
-
-                                if content_type == "web_search_tool_result":
+                                        pass  # code_interpreter block handles "Analyzed" state visually
+                                elif content_type == "web_search_tool_result":
                                     logger.debug(
                                         f" Processing web search result event: {event}"
                                     )
                                     content_items = getattr(
-                                        content_block, "content", []
+                                        content_block, "content", None
                                     )
-                                    if content_items and len(content_items) > 0:
-                                        error_code = getattr(
-                                            content_block, "error_code", None
+                                    # Check for error: content is a single error object (not a list)
+                                    error_code = None
+                                    if content_items and not isinstance(content_items, list):
+                                        content_inner_type = getattr(content_items, "type", "")
+                                        if content_inner_type == "web_search_tool_result_error":
+                                            error_code = getattr(content_items, "error_code", "unknown")
+                                    if error_code:
+                                        error_msg = f"⚠️ Web search error: {error_code}"
+                                        logger.warning(f"web_search error: {error_code}")
+                                        await emit_event_local(
+                                            {
+                                                "type": "status",
+                                                "data": {
+                                                    "description": error_msg,
+                                                    "done": True,
+                                                },
+                                            }
                                         )
-                                        if error_code:
-                                            await self.handle_errors(
-                                                Exception(
-                                                    f"Web search error: {error_code}"
-                                                )
-                                            )
-                                        else:
+                                    elif content_items and isinstance(content_items, list) and len(content_items) > 0:
                                             # Extract first result title for status
                                             first_result = (
                                                 content_items[0]
@@ -3508,9 +3832,7 @@ class Pipe:
                                                     },
                                                 }
                                             )
-
-                                # Handle web fetch results
-                                if content_type == "web_fetch_tool_result":
+                                elif content_type == "web_fetch_tool_result":
                                     logger.debug("Processing web_fetch_tool_result")
                                     # Check for errors (error is in content.error_code)
                                     result_content = getattr(content_block, "content", None)
@@ -3539,9 +3861,7 @@ class Pipe:
                                                 },
                                             }
                                         )
-
-                                # Handle tool search results (only if tool search is enabled)
-                                if content_type == "tool_search_tool_result":
+                                elif content_type == "tool_search_tool_result":
                                     logger.debug(
                                         f" Processing tool search result event: {event}"
                                     )
@@ -3630,9 +3950,7 @@ class Pipe:
                                                     },
                                                 }
                                             )
-
-                                # Handle context cleared events
-                                if content_type == "context_cleared":
+                                elif content_type == "context_cleared":
                                     cleared_info = getattr(content_block, "cleared", {})
                                     cleared_type = (
                                         getattr(cleared_info, "type", "unknown")
@@ -3672,191 +3990,232 @@ class Pipe:
                             # ---------------------------------------------------------
                             elif event_type == "content_block_delta":
                                 delta = getattr(event, "delta", None)
-                                if delta:
-                                    delta_type = getattr(delta, "type", None)
-                                    if delta_type == "thinking_delta":
-                                        thinking_text = getattr(delta, "thinking", "")
-                                        thinking_message += thinking_text
-                                        # Stream thinking as plain text (formatted on block close)
-                                        if thinking_text:
-                                            await emit_message_delta(thinking_text)
-                                    elif delta_type == "signature_delta":
-                                        # Accumulate signature deltas (arrives in multiple chunks like thinking_delta)
-                                        # SDK accumulates signature automatically via +=
-                                        # No manual tracking needed
-                                        pass
-                                    elif delta_type == "text_delta":
-                                        text_delta = getattr(delta, "text", "")
+                                delta_type = getattr(delta, "type", None)
+                                if delta_type == "thinking_delta":
+                                    thinking_text = getattr(delta, "thinking", "")
+                                    thinking_message += thinking_text
+                                    # Stream thinking inside <details> wrapper for native collapsible UI
+                                    if thinking_text:
+                                        formatted = self._format_thinking_block(thinking_message, duration=None)
+                                        await update_content_block(thinking_last_block, formatted)
+                                        thinking_last_block = formatted
+                                elif delta_type == "signature_delta":
+                                    # No manual tracking needed
+                                    pass
+                                elif delta_type == "text_delta":
+                                    text_delta = getattr(delta, "text", "")
 
-                                        # Emit "Responding..." status on first text delta (only once)
-                                        if (
-                                            not first_text_emitted
-                                            and not is_model_thinking
-                                            and not active_server_tool_name
-                                        ):
-                                            await emit_event_local(
-                                                {
-                                                    "type": "status",
-                                                    "data": {
-                                                        "description": "Responding...",
-                                                        "done": False,
-                                                    },
-                                                }
-                                            )
-                                            first_text_emitted = True
+                                    # Emit "Responding..." status on first text delta (only once)
+                                    if (
+                                        not first_text_emitted
+                                        and not is_model_thinking
+                                        and not active_server_tool_name
+                                    ):
+                                        await emit_event_local(
+                                            {
+                                                "type": "status",
+                                                "data": {
+                                                    "description": "Responding...",
+                                                    "done": False,
+                                                },
+                                            }
+                                        )
+                                        first_text_emitted = True
 
-                                        chunk += text_delta
-                                        chunk_count += 1
-                                    elif delta_type == "input_json_delta":
-                                        partial = getattr(delta, "partial_json", "")
+                                    chunk += text_delta
+                                    chunk_count += 1
+                                elif delta_type == "input_json_delta":
+                                    partial = getattr(delta, "partial_json", "")
 
-                                        # Handle server tool input separately from client tools
-                                        if active_server_tool_name:
-                                            # Server tool (web_search, code_execution) - accumulate and extract query
-                                            server_tool_input_buffer += partial
+                                    # Handle server tool input separately from client tools
+                                    if active_server_tool_name:
+                                        # Server tool (web_search, code_execution) - accumulate and extract query
+                                        server_tool_input_buffer += partial
 
-                                            if active_server_tool_name == "web_search":
-                                                try:
-                                                    # Try to parse the accumulated JSON to extract query
-                                                    parsed = json.loads(
-                                                        server_tool_input_buffer
+                                        if active_server_tool_name == "web_search":
+                                            try:
+                                                # Try to parse the accumulated JSON to extract query
+                                                parsed = json.loads(
+                                                    server_tool_input_buffer
+                                                )
+                                                if "query" in parsed:
+                                                    new_query = parsed["query"]
+                                                    logger.debug(
+                                                        f"Web search query complete: '{new_query}'"
                                                     )
-                                                    if "query" in parsed:
-                                                        new_query = parsed["query"]
-                                                        logger.debug(
-                                                            f"Web search query complete: '{new_query}'"
-                                                        )
 
-                                                        # Emit status only once when we get the complete query
-                                                        if (
+                                                    # Emit status only once when we get the complete query
+                                                    if (
+                                                        new_query
+                                                        and new_query
+                                                        != current_search_query
+                                                    ):
+                                                        current_search_query = (
                                                             new_query
-                                                            and new_query
-                                                            != current_search_query
-                                                        ):
-                                                            current_search_query = (
-                                                                new_query
-                                                            )
-                                                            await emit_event_local(
-                                                                {
-                                                                    "type": "status",
-                                                                    "data": {
-                                                                        "description": f"🔍 Searching for: {current_search_query}",
-                                                                        "done": False,
-                                                                    },
-                                                                }
-                                                            )
-                                                except Exception as e:
-                                                    logger.debug(
-                                                        f"Web search query extraction error: {e}"
-                                                    )
-                                            elif active_server_tool_name == "web_fetch":
-                                                try:
-                                                    parsed = json.loads(server_tool_input_buffer)
-                                                    if "url" in parsed:
-                                                        fetch_url = parsed["url"]
-                                                        # Show truncated URL in status
-                                                        display_url = fetch_url[:60] + "..." if len(fetch_url) > 60 else fetch_url
-                                                        await emit_event_local(
-                                                            {
-                                                                "type": "status",
-                                                                "data": {
-                                                                    "description": f"🌐 Fetching: {display_url}",
-                                                                    "done": False,
-                                                                },
-                                                            }
-                                                        )
-                                                except Exception:
-                                                    pass
-                                            elif (
-                                                active_server_tool_name
-                                                == "code_execution"
-                                            ):
-                                                # Code execution (programmatic tool calling) - extract code for display
-                                                try:
-                                                    parsed = json.loads(server_tool_input_buffer)
-                                                    if "code" in parsed:
-                                                        code_execution_code = parsed["code"]
-                                                except (json.JSONDecodeError, KeyError):
-                                                    pass
-                                            elif (
-                                                active_server_tool_name
-                                                == "bash_code_execution"
-                                            ):
-                                                # Bash code execution - extract command (the actual code)
-                                                try:
-                                                    parsed = json.loads(
-                                                        server_tool_input_buffer
-                                                    )
-                                                    if "command" in parsed:
-                                                        bash_execution_command = parsed[
-                                                            "command"
-                                                        ]
-                                                        logger.debug(
-                                                            f"Bash execution command: {bash_execution_command[:100]}..."
-                                                        )
-                                                except Exception as e:
-                                                    logger.debug(
-                                                        f"Bash execution input extraction error: {e}"
-                                                    )
-                                            elif (
-                                                active_server_tool_name
-                                                == "text_editor_code_execution"
-                                            ):
-                                                # Text editor input - extract command and file_text
-                                                try:
-                                                    parsed = json.loads(
-                                                        server_tool_input_buffer
-                                                    )
-                                                    if "command" in parsed:
-                                                        text_editor_command = parsed[
-                                                            "command"
-                                                        ]
-                                                    if "path" in parsed:
-                                                        text_editor_file_path = parsed[
-                                                            "path"
-                                                        ]
-                                                    if "file_text" in parsed:
-                                                        text_editor_file_content = (
-                                                            parsed["file_text"]
-                                                        )
-                                                        logger.debug(
-                                                            f"Text editor creating file '{text_editor_file_path}' with {len(text_editor_file_content)} chars"
-                                                        )
-                                                except Exception as e:
-                                                    logger.debug(
-                                                        f"Text editor input extraction error: {e}"
-                                                    )
-                                            elif active_server_tool_name in [
-                                                "tool_search_tool_regex",
-                                                "tool_search_tool_bm25",
-                                            ]:
-                                                # Tool search input - extract and show query
-                                                try:
-                                                    parsed = json.loads(
-                                                        server_tool_input_buffer
-                                                    )
-                                                    if "query" in parsed:
-                                                        search_query = parsed["query"]
-                                                        logger.debug(
-                                                            f"Tool search query: '{search_query}'"
                                                         )
                                                         await emit_event_local(
                                                             {
                                                                 "type": "status",
                                                                 "data": {
-                                                                    "description": f"🔍 Searching tools: {search_query}",
+                                                                    "description": f"🔍 Searching for: {current_search_query}",
                                                                     "done": False,
                                                                 },
                                                             }
                                                         )
-                                                except Exception as e:
-                                                    logger.debug(
-                                                        f"Tool search query extraction error: {e}"
+                                            except Exception as e:
+                                                logger.debug(
+                                                    f"Web search query extraction error: {e}"
+                                                )
+                                        elif active_server_tool_name == "web_fetch":
+                                            try:
+                                                parsed = json.loads(server_tool_input_buffer)
+                                                if "url" in parsed:
+                                                    fetch_url = parsed["url"]
+                                                    # Show truncated URL in status
+                                                    display_url = fetch_url[:60] + "..." if len(fetch_url) > 60 else fetch_url
+                                                    await emit_event_local(
+                                                        {
+                                                            "type": "status",
+                                                            "data": {
+                                                                "description": f"🌐 Fetching: {display_url}",
+                                                                "done": False,
+                                                            },
+                                                        }
                                                     )
-                                        else:
-                                            # Client-side tool - accumulate in tools_buffer
-                                            tools_buffer += partial
-                                    elif delta_type == "citations_delta":
+                                            except Exception:
+                                                pass
+                                        elif (
+                                            active_server_tool_name
+                                            == "code_execution"
+                                        ):
+                                            # Code execution (programmatic tool calling) - extract code for display
+                                            try:
+                                                parsed = json.loads(server_tool_input_buffer)
+                                                if "code" in parsed:
+                                                    code_execution_code = parsed["code"]
+                                                    # Live stream code inside details block
+                                                    if not code_exec_is_web_filtering or not code_exec_had_web_tools:
+                                                        code_exec_current_code = code_execution_code
+                                                        code_exec_current_lang = parsed.get("language", "python")
+                                                        block = self._format_code_execution_block(
+                                                            code_exec_current_code, code_exec_current_lang,
+                                                        )
+                                                        await update_content_block(code_exec_last_block, block)
+                                                        code_exec_last_block = block
+                                            except (json.JSONDecodeError, KeyError):
+                                                pass
+                                        elif (
+                                            active_server_tool_name
+                                            == "bash_code_execution"
+                                        ):
+                                            # Bash code execution - extract command (the actual code)
+                                            try:
+                                                parsed = json.loads(
+                                                    server_tool_input_buffer
+                                                )
+                                                if "command" in parsed:
+                                                    bash_execution_command = parsed[
+                                                        "command"
+                                                    ]
+                                                    # Live stream bash code inside details block
+                                                    if not code_exec_is_web_filtering or not code_exec_had_web_tools:
+                                                        code_exec_current_code = bash_execution_command
+                                                        code_exec_current_lang = "bash"
+                                                        block = self._format_code_execution_block(
+                                                            code_exec_current_code, code_exec_current_lang,
+                                                        )
+                                                        await update_content_block(code_exec_last_block, block)
+                                                        code_exec_last_block = block
+                                                    logger.debug(
+                                                        f"Bash execution command: {bash_execution_command[:100]}..."
+                                                    )
+                                            except Exception as e:
+                                                logger.debug(
+                                                    f"Bash execution input extraction error: {e}"
+                                                )
+                                        elif (
+                                            active_server_tool_name
+                                            == "text_editor_code_execution"
+                                        ):
+                                            # Text editor input - extract command and file_text
+                                            try:
+                                                parsed = json.loads(
+                                                    server_tool_input_buffer
+                                                )
+                                                if "command" in parsed:
+                                                    text_editor_command = parsed[
+                                                        "command"
+                                                    ]
+                                                if "path" in parsed:
+                                                    text_editor_file_path = parsed[
+                                                        "path"
+                                                    ]
+                                                if "file_text" in parsed:
+                                                    text_editor_file_content = (
+                                                        parsed["file_text"]
+                                                    )
+                                                    # Live stream file content inside details block
+                                                    if text_editor_command == "create" and text_editor_file_content:
+                                                        TEXT_EXTENSIONS = {".md", ".txt", ".csv", ".json", ".xml", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".log", ".rst", ".html", ".htm", ".css"}
+                                                        file_ext = os.path.splitext(text_editor_file_path)[1].lower() if text_editor_file_path else ""
+                                                        if file_ext not in TEXT_EXTENSIONS:
+                                                            EXT_TO_LANG = {".py": "python", ".js": "javascript", ".ts": "typescript", ".sh": "bash", ".sql": "sql"}
+                                                            lang = EXT_TO_LANG.get(file_ext, "python")
+                                                            block = self._format_code_execution_block(text_editor_file_content, lang)
+                                                            await update_content_block(code_exec_last_block, block)
+                                                            code_exec_last_block = block
+                                            except Exception as e:
+                                                logger.debug(
+                                                    f"Text editor input extraction error: {e}"
+                                                )
+                                        elif active_server_tool_name in [
+                                            "tool_search_tool_regex",
+                                            "tool_search_tool_bm25",
+                                        ]:
+                                            # Tool search input - extract and show query
+                                            try:
+                                                parsed = json.loads(
+                                                    server_tool_input_buffer
+                                                )
+                                                if "query" in parsed:
+                                                    search_query = parsed["query"]
+                                                    logger.debug(
+                                                        f"Tool search query: '{search_query}'"
+                                                    )
+                                                    await emit_event_local(
+                                                        {
+                                                            "type": "status",
+                                                            "data": {
+                                                                "description": f"🔍 Searching tools: {search_query}",
+                                                                "done": False,
+                                                            },
+                                                        }
+                                                    )
+                                            except Exception as e:
+                                                logger.debug(
+                                                    f"Tool search query extraction error: {e}"
+                                                )
+                                    else:
+                                        # Client-side tool - accumulate in tools_buffer
+                                        tools_buffer += partial
+                                        tool_input_buffer += partial
+
+                                        # Live stream tool input to UI (like thinking blocks stream text)
+                                        if not in_code_execution and tool_id_at_start in tool_progress_blocks:
+                                            parsed_input = self._try_parse_partial_json(tool_input_buffer)
+                                            if parsed_input is not None:
+                                                old_block = tool_progress_blocks[tool_id_at_start]
+                                                new_block = self._format_tool_result_block(
+                                                    tool_id_at_start, tool_name, parsed_input, "", done=False
+                                                )
+                                                # Replace old in-progress text with updated text
+                                                text = final_text()
+                                                text = text.replace(old_block, new_block, 1)
+                                                tool_progress_blocks[tool_id_at_start] = new_block
+                                                final_message.clear()
+                                                final_message.append(text)
+                                                await request_ctx.emit_event({"type": "replace", "data": {"content": text}})
+                                elif delta_type == "citations_delta":
                                         # Web search citations arrive BEFORE the text they cite.
                                         # Emit marker for PREVIOUS citation when a new one arrives
                                         # (so marker appears AFTER the cited text, not before it).
@@ -3882,12 +4241,8 @@ class Pipe:
                                 content_type = (
                                     getattr(content_block, "type", None)
                                     if content_block
-                                    else None
+                                    else current_block_type  # Fallback: raw SDK stop events lack content_block
                                 )
-                                # Fallback to tracked type if event doesn't have it (common in SDK)
-                                if not content_type and current_block_type:
-                                    content_type = current_block_type
-
                                 event_name = getattr(event, "name", "")
 
                                 if content_type == "text":
@@ -3895,71 +4250,51 @@ class Pipe:
                                     if pending_citation_markers:
                                         chunk += "".join(f"[{n}]" for n in pending_citation_markers)
                                         pending_citation_markers = []
-                                    if chunk.strip():
-                                        await emit_message_delta(chunk + "\n")
+                                    if chunk:
+                                        if not chunk.endswith("\n"):
+                                            chunk += "\n"
+                                        await emit_message_delta(chunk)
                                         chunk = ""
                                         chunk_count = 0
-                                # Reset server tool tracking when block stops
-                                if content_type == "server_tool_use":
+                                    elif final_message and not final_text().endswith("\n"):
+                                        # Chunk was already flushed by throttle — ensure \n separator
+                                        await emit_message_delta("\n")
+                                elif content_type == "server_tool_use":
                                     logger.debug(
                                         f"Server tool block stopped: {active_server_tool_name}"
                                     )
 
-                                    # Show collected code for bash_code_execution
+                                    # Code is now streamed live inside <details> during input_json_delta
+                                    # Just set last_code_content/language for result handlers
                                     if (
                                         active_server_tool_name == "bash_code_execution"
                                         and bash_execution_command
                                     ):
-                                        # Buffer code for later combination with output
-                                        # (output comes via bash_code_execution_tool_result event)
                                         last_code_language = "bash"
                                         last_code_content = bash_execution_command
-                                        logger.debug(
-                                            f"Buffered bash code for later formatting: {len(bash_execution_command)} chars"
-                                        )
-                                    # Show collected code for text_editor create command
                                     elif (
                                         active_server_tool_name
                                         == "text_editor_code_execution"
                                         and text_editor_command == "create"
                                         and text_editor_file_content
                                     ):
-                                        # Detect text-based files to display inline instead of as code
                                         TEXT_EXTENSIONS = {".md", ".txt", ".csv", ".json", ".xml", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".log", ".rst", ".html", ".htm", ".css"}
                                         file_ext = os.path.splitext(text_editor_file_path)[1].lower() if text_editor_file_path else ""
                                         if file_ext in TEXT_EXTENSIONS:
-                                            # Text file → display inline, not as code block
                                             last_code_content = text_editor_file_content
                                             last_code_language = "__inline_text__"
-                                            logger.debug(
-                                                f"Buffered text file '{text_editor_file_path}' ({file_ext}) for inline display: {len(text_editor_file_content)} chars"
-                                            )
                                         else:
-                                            # Code/binary file → show as code block
-                                            # Detect language from extension
                                             EXT_TO_LANG = {".py": "python", ".js": "javascript", ".ts": "typescript", ".sh": "bash", ".sql": "sql", ".r": "r", ".rb": "ruby", ".java": "java", ".c": "c", ".cpp": "cpp", ".go": "go", ".rs": "rust"}
                                             last_code_language = EXT_TO_LANG.get(file_ext, "python")
                                             last_code_content = text_editor_file_content
-                                            logger.debug(
-                                                f"Buffered code file '{text_editor_file_path}' as {last_code_language}: {len(text_editor_file_content)} chars"
-                                            )
                                     elif (
                                         active_server_tool_name == "code_execution"
                                         and code_execution_code
                                     ):
-                                        # Buffer code for unified block (shown when code_execution_tool_result arrives)
-                                        # Don't stream the code live - just show status and wait for result
                                         last_code_language = "python"
                                         last_code_content = code_execution_code
-                                        logger.debug(
-                                            f"Buffered code_execution code: {len(code_execution_code)} chars"
-                                        )
                                     elif active_server_tool_name == "web_fetch":
-                                        # web_fetch stop — status will be updated when result arrives
                                         pass
-                                    else:
-                                        # Add line break after other server tool use
-                                        await emit_message_delta("\n")
 
                                     active_server_tool_name = None
                                     active_server_tool_id = None
@@ -3969,9 +4304,7 @@ class Pipe:
                                     text_editor_command = ""
                                     bash_execution_command = ""
                                     code_execution_code = ""
-
-                                # Close tools_buffer for normal tool_use content blocks AND execute immediately
-                                if content_type == "tool_use" and tools_buffer:
+                                elif content_type == "tool_use" and tools_buffer:
                                     # Check if it's valid JSON already, if not close it
                                     try:
                                         json.loads(tools_buffer)
@@ -4088,7 +4421,6 @@ class Pipe:
                                         elif tool_name in api_tool_names:
                                             # API-provided tool (no callable) — passthrough mode
                                             # Return the tool input as JSON in the response content
-                                            # instead of trying to execute locally
                                             logger.info(
                                                 f"🔄 API tool passthrough for '{tool_name}': returning tool input as response"
                                             )
@@ -4123,25 +4455,18 @@ class Pipe:
 
                                     # Reset buffer for next tool
                                     tools_buffer = ""
-
-                                if is_model_thinking and content_type in ("thinking", "redacted_thinking"):
+                                elif is_model_thinking and content_type in ("thinking", "redacted_thinking"):
                                     if content_type == "thinking" and thinking_message:
                                         duration = time.time() - (thinking_start_time or time.time())
                                         formatted = self._format_thinking_block(thinking_message, duration)
-                                        # Replace the live-streamed thinking with the formatted block
-                                        if thinking_stream_start_idx >= 0:
-                                            prefix = "".join(final_message[:thinking_stream_start_idx])
-                                            await emit_message_replace(prefix + formatted)
-                                            logger.debug(f"Replaced thinking block ({len(thinking_message)} chars, {duration:.1f}s)")
-                                        else:
-                                            await emit_message_delta(formatted)
-                                            logger.debug(f"Emitted thinking block ({len(thinking_message)} chars, {duration:.1f}s)")
+                                        await update_content_block(thinking_last_block, formatted)
+                                        thinking_last_block = ""
+                                        logger.debug(f"Finalized thinking block ({len(thinking_message)} chars, {duration:.1f}s)")
                                     elif content_type == "redacted_thinking":
                                         logger.debug("Redacted thinking block completed (preserved by SDK)")
                                     is_model_thinking = False
                                     thinking_message = ""
                                     thinking_stream_start_idx = -1
-
                                 # Reset tracked type
                                 current_block_type = None
 
@@ -4157,215 +4482,244 @@ class Pipe:
                                         current_output_tokens = getattr(
                                             usage, "output_tokens", 0
                                         )
-
-                                        # Calculate difference from last known output count for this stream
                                         diff = (
                                             current_output_tokens - stream_output_tokens
                                         )
                                         total_usage["output_tokens"] += diff
                                         stream_output_tokens = current_output_tokens
-
                                 delta = getattr(event, "delta", None)
-                                if delta:
-                                    # Extract container from message_delta
-                                    # Container ID arrives in message_delta, NOT message_start
-                                    delta_container = getattr(delta, "container", None)
-                                    if delta_container:
-                                        delta_container_id = getattr(delta_container, "id", None) if hasattr(delta_container, "id") else (delta_container.get("id") if isinstance(delta_container, dict) else str(delta_container))
-                                        if delta_container_id:
-                                            current_container_id = payload_for_stream.get("container")
-                                            if current_container_id != delta_container_id:
-                                                chunk += self._create_metadata_marker(
-                                                    "container_id",
-                                                    delta_container_id,
-                                                    messagenum=len(
-                                                        payload_for_stream.get("messages", [])
-                                                    ),
-                                                )
-                                                logger.debug(
-                                                    f"📦 Container ID from message_delta: {delta_container_id}"
-                                                )
-                                            payload_for_stream["container"] = delta_container_id
-
-                                    stop_reason = getattr(delta, "stop_reason", None)
-                                    if stop_reason:
-                                        logger.debug(f"📍 stop_reason received: {stop_reason}")
-                                    if stop_reason == "tool_use":
-                                        # Emit any remaining text chunk before tool results
-                                        if chunk.strip():
-                                            await emit_message_delta(chunk)
-                                            chunk = ""
-                                            chunk_count = 0
-
-                                        # API tool passthrough — skip tool loop, return directly
-                                        if api_tool_passthrough and not running_tool_tasks:
-                                            logger.info(
-                                                "🔄 API tool passthrough complete — skipping tool loop"
+                                code_execution_container_id = getattr(delta, "container", None)
+                                if code_execution_container_id:
+                                    delta_container_id = getattr(code_execution_container_id, "id", None) if hasattr(code_execution_container_id, "id") else (code_execution_container_id.get("id") if isinstance(code_execution_container_id, dict) else str(code_execution_container_id))
+                                    if delta_container_id:
+                                        current_container_id = payload_for_stream.get("container")
+                                        if current_container_id != delta_container_id:
+                                            chunk += self._create_metadata_marker(
+                                                "container_id",
+                                                delta_container_id,
+                                                messagenum=len(
+                                                    payload_for_stream.get("messages", [])
+                                                ),
                                             )
-                                            conversation_ended = True
-                                            break
-
-                                        # Wait for all running tool tasks to complete
-                                        if running_tool_tasks:
                                             logger.debug(
-                                                f"⏳ Waiting for %d tool tasks to complete...",
-                                                len(running_tool_tasks),
+                                                f"📦 Container ID from message_delta: {delta_container_id}"
+                                            )
+                                        payload_for_stream["container"] = delta_container_id
+
+                                stop_reason = getattr(delta, "stop_reason", None)
+                                if stop_reason:
+                                    logger.debug(f"📍 stop_reason received: {stop_reason}")
+                                if stop_reason == "tool_use":
+                                    # Emit any remaining text chunk before tool results
+                                    if chunk:
+                                        if not chunk.endswith("\n"):
+                                            chunk += "\n"
+                                        await emit_message_delta(chunk)
+                                        chunk = ""
+                                        chunk_count = 0
+
+                                    # API tool passthrough — skip tool loop, return directly
+                                    if api_tool_passthrough and not running_tool_tasks:
+                                        logger.info(
+                                            "🔄 API tool passthrough complete — skipping tool loop"
+                                        )
+                                        conversation_ended = True
+                                        break
+
+                                    # Wait for all running tool tasks to complete
+                                    if running_tool_tasks:
+                                        logger.debug(
+                                            f"⏳ Waiting for %d tool tasks to complete...",
+                                            len(running_tool_tasks),
+                                        )
+
+                                        try:
+                                            results = await asyncio.gather(
+                                                *running_tool_tasks
+                                            )
+                                            logger.debug(
+                                                f"✅ All %d tool tasks completed",
+                                                len(results),
                                             )
 
-                                            # Emit status event only when multiple tools are executing
-                                            if len(running_tool_tasks) > 1:
-                                                await emit_event_local(
-                                                    {
-                                                        "type": "status",
-                                                        "data": {
-                                                            "description": f"⏳ Waiting for {len(running_tool_tasks)} tool(s) to complete...",
-                                                            "done": False,
-                                                        },
-                                                    }
+                                            # Build tool_result messages and emit to UI
+                                            for tool_call_data, tool_result in zip(
+                                                tool_call_data_list, results
+                                            ):
+                                                tool_use_id = tool_call_data.get(
+                                                    "id", ""
                                                 )
-                                                # Give UI time to update
-                                                await asyncio.sleep(0.05)
-
-                                            try:
-                                                results = await asyncio.gather(
-                                                    *running_tool_tasks
+                                                tool_name = tool_call_data.get(
+                                                    "name", ""
                                                 )
-                                                logger.debug(
-                                                    f"✅ All %d tool tasks completed",
-                                                    len(results),
+                                                tool_input = tool_call_data.get(
+                                                    "input", {}
                                                 )
 
-                                                # Clear the waiting status
-                                                if len(results) > 1:
-                                                    await emit_event_local(
+                                                # Process tool result through OpenWebUI's handler
+                                                # for Rich UI (HTMLResponse, embeds, files)
+                                                tool_result_embeds = []
+                                                tool_result_files = []
+                                                if PROCESS_TOOL_RESULT_AVAILABLE and __request__:
+                                                    try:
+                                                        tool_result, tool_result_files, tool_result_embeds = (
+                                                            process_tool_result(
+                                                                __request__,
+                                                                tool_name,
+                                                                tool_result,
+                                                                "pipe",
+                                                                metadata=__metadata__,
+                                                                user=__user__,
+                                                            )
+                                                        )
+                                                    except Exception as e:
+                                                        logger.warning(f"process_tool_result failed for '{tool_name}': {e}")
+
+                                                # Emit files event if tool produced files
+                                                if tool_result_files and __event_emitter__:
+                                                    await __event_emitter__(
                                                         {
-                                                            "type": "status",
-                                                            "data": {
-                                                                "description": f"✅ {len(results)} tool(s) completed",
-                                                                "done": True,
-                                                            },
+                                                            "type": "files",
+                                                            "data": {"files": tool_result_files},
                                                         }
                                                     )
 
-                                                # Build tool_result messages and emit to UI
-                                                for tool_call_data, tool_result in zip(
-                                                    tool_call_data_list, results
-                                                ):
-                                                    tool_use_id = tool_call_data.get(
-                                                        "id", ""
-                                                    )
-                                                    tool_name = tool_call_data.get(
-                                                        "name", ""
-                                                    )
-                                                    tool_input = tool_call_data.get(
-                                                        "input", {}
-                                                    )
+                                                # Determine if error
+                                                is_error = isinstance(
+                                                    tool_result, str
+                                                ) and (
+                                                    tool_result.startswith("Error:")
+                                                    or tool_result.startswith("Error executing tool")
+                                                )
 
-                                                    # Determine if error
-                                                    is_error = isinstance(
-                                                        tool_result, str
-                                                    ) and tool_result.startswith(
-                                                        "Error:"
-                                                    )
+                                                # Build result block for API
+                                                # Ensure result is valid JSON string (not Python repr with single quotes)
+                                                if isinstance(tool_result, str):
+                                                    result_str = tool_result
+                                                else:
+                                                    try:
+                                                        result_str = json.dumps(tool_result, ensure_ascii=False)
+                                                    except (TypeError, ValueError):
+                                                        result_str = str(tool_result)
+                                                result_block = {
+                                                    "type": "tool_result",
+                                                    "tool_use_id": tool_use_id,
+                                                    "content": result_str,
+                                                }
+                                                if is_error:
+                                                    result_block["is_error"] = True
+                                                tool_calls.append(result_block)
 
-                                                    # Build result block for API
-                                                    # Ensure result is valid JSON string (not Python repr with single quotes)
-                                                    if isinstance(tool_result, str):
-                                                        result_str = tool_result
+                                                if in_code_execution:
+                                                    # Accumulate for unified code execution display
+                                                    code_exec_tool_calls_info.append({
+                                                        "name": tool_name,
+                                                        "input": tool_input,
+                                                        "result": result_str,
+                                                        "is_error": is_error,
+                                                    })
+                                                else:
+                                                    # Replace the in-progress block with completed version
+                                                    completed = self._format_tool_result_block(
+                                                        tool_use_id, tool_name, tool_input,
+                                                        str(tool_result), is_error=is_error, done=True,
+                                                        embeds=tool_result_embeds, files=tool_result_files,
+                                                    )
+                                                    old_block = tool_progress_blocks.pop(tool_use_id, None)
+                                                    if old_block:
+                                                        text = final_text()
+                                                        text = text.replace(old_block, completed, 1)
+                                                        final_message.clear()
+                                                        final_message.append(text)
+                                                        await request_ctx.emit_event({"type": "replace", "data": {"content": text}})
                                                     else:
-                                                        try:
-                                                            result_str = json.dumps(tool_result, ensure_ascii=False)
-                                                        except (TypeError, ValueError):
-                                                            result_str = str(tool_result)
-                                                    result_block = {
-                                                        "type": "tool_result",
-                                                        "tool_use_id": tool_use_id,
-                                                        "content": result_str,
-                                                    }
-                                                    if is_error:
-                                                        result_block["is_error"] = True
-                                                    tool_calls.append(result_block)
-
-                                                    if in_code_execution:
-                                                        # Accumulate for unified code execution display
-                                                        code_exec_tool_calls_info.append({
-                                                            "name": tool_name,
-                                                            "input": tool_input,
-                                                            "result": result_str,
-                                                            "is_error": is_error,
-                                                        })
-                                                    else:
-                                                        # Show completed tool result block instantly (replace, not delta)
-                                                        formatted = self._format_tool_result_block(
-                                                            tool_use_id, tool_name, tool_input,
-                                                            str(tool_result), is_error=is_error, done=True
-                                                        )
-                                                        final_message.append(formatted)
+                                                        # Fallback: append if placeholder not found
+                                                        final_message.append(completed)
                                                         await emit_message_replace(final_text())
 
-                                                logger.debug(
-                                                    f"Emitted {len(results)} tool result(s)"
+                                            logger.debug(
+                                                f"Emitted {len(results)} tool result(s)"
+                                            )
+                                        except Exception as ex:
+                                            logger.error(
+                                                f"❌ Tool execution failed: %s", ex
+                                            )
+                                            # Create error results and update in-progress blocks
+                                            for (
+                                                tool_call_data
+                                            ) in tool_call_data_list:
+                                                tool_use_id = tool_call_data.get(
+                                                    "id", ""
                                                 )
-                                            except Exception as ex:
-                                                logger.error(
-                                                    f"❌ Tool execution failed: %s", ex
+                                                tool_name = tool_call_data.get(
+                                                    "name", "unknown"
                                                 )
-                                                # Create error results
-                                                for (
-                                                    tool_call_data
-                                                ) in tool_call_data_list:
-                                                    tool_use_id = tool_call_data.get(
-                                                        "id", ""
-                                                    )
-                                                    tool_name = tool_call_data.get(
-                                                        "name", "unknown"
-                                                    )
-                                                    error_result = f"Error executing tool '{tool_name}': {str(ex)}"
-                                                    tool_calls.append(
-                                                        {
-                                                            "type": "tool_result",
-                                                            "tool_use_id": tool_use_id,
-                                                            "content": error_result,
-                                                            "is_error": True,
-                                                        }
-                                                    )
+                                                error_result = f"Error executing tool '{tool_name}': {str(ex)}"
+                                                tool_calls.append(
+                                                    {
+                                                        "type": "tool_result",
+                                                        "tool_use_id": tool_use_id,
+                                                        "content": error_result,
+                                                        "is_error": True,
+                                                    }
+                                                )
+                                                # Replace in-progress block with error block
+                                                tool_input = tool_call_data.get("input", {})
+                                                completed = self._format_tool_result_block(
+                                                    tool_use_id, tool_name, tool_input,
+                                                    error_result, is_error=True, done=True
+                                                )
+                                                old_block = tool_progress_blocks.pop(tool_use_id, None)
+                                                if old_block:
+                                                    text = final_text()
+                                                    text = text.replace(old_block, completed, 1)
+                                                    final_message.clear()
+                                                    final_message.append(text)
+                                                    await request_ctx.emit_event({"type": "replace", "data": {"content": text}})
 
-                                        logger.debug(
-                                            f" Tool use detected, collected {len(tool_calls)} tool results:\nTool_Call JSON: {tool_calls}"
-                                        )
+                                    logger.debug(
+                                        f" Tool use detected, collected {len(tool_calls)} tool results:\nTool_Call JSON: {tool_calls}"
+                                    )
 
-                                        # Reset for next iteration
-                                        running_tool_tasks = []
-                                        tool_call_data_list = []
-                                        api_tool_passthrough = False
-                                        has_pending_tool_calls = True
-                                    elif stop_reason == "max_tokens":
-                                        chunk += "Claude has Reached the maximum token limit!"
-                                    elif stop_reason == "end_turn":
-                                        conversation_ended = True
-                                    elif stop_reason == "pause_turn":
-                                        conversation_ended = True
-                                        chunk += (
-                                            "Claude was unable to process this request"
-                                        )
-                                    elif stop_reason == "refusal":
-                                        chunk += "Claude has refused to answer based on its content policies."
-                                        conversation_ended = True
-                                    elif stop_reason == "stop_sequence":
-                                        chunk += "Claude stopped generating based on stop sequence."
-                                        conversation_ended = True
-                                    elif stop_reason == "model_context_window_exceeded":
-                                        chunk += "Claude has reached the maximum context window for this model."
-                                        conversation_ended = True
+                                    # Reset for next iteration
+                                    running_tool_tasks = []
+                                    tool_call_data_list = []
+                                    tool_progress_blocks = {}
+                                    api_tool_passthrough = False
+                                    has_pending_tool_calls = True
+                                elif stop_reason == "max_tokens":
+                                    chunk += "Claude has Reached the maximum token limit!"
+                                elif stop_reason == "end_turn":
+                                    conversation_ended = True
+                                elif stop_reason == "pause_turn":
+                                    # API paused a long-running turn — auto-continue
+                                    has_pending_tool_calls = True  # reuses tool loop mechanism
+                                    # tool_calls stays empty → PHASE 5 detects pause_turn
+                                    await emit_event_local(
+                                        {
+                                            "type": "status",
+                                            "data": {
+                                                "description": "⏳ Long-running turn paused, continuing...",
+                                                "done": False,
+                                            },
+                                        }
+                                    )
+                                elif stop_reason == "refusal":
+                                    chunk += "Claude has refused to answer based on its content policies."
+                                    conversation_ended = True
+                                elif stop_reason == "stop_sequence":
+                                    chunk += "Claude stopped generating based on stop sequence."
+                                    conversation_ended = True
+                                elif stop_reason == "model_context_window_exceeded":
+                                    chunk += "Claude has reached the maximum context window for this model."
+                                    conversation_ended = True
 
                             # ---------------------------------------------------------
                             # EVENT: message_stop
                             # Stream complete for this turn
                             # ---------------------------------------------------------
                             elif event_type == "message_stop":
-                                # Flush any pending consecutive code execution blocks
-                                if pending_code_exec_parts:
-                                    await flush_pending_code_exec()
+                                pass  # No deferred blocks to flush
 
                             # ---------------------------------------------------------
                             # EVENT: message_error
@@ -4390,14 +4744,10 @@ class Pipe:
                                     )
 
                             if chunk_count > token_buffer_size:
-                                if chunk.strip():
+                                if chunk:
                                     await emit_message_delta(chunk)
                                     chunk = ""
                                     chunk_count = 0
-
-                        # Flush any remaining pending code execution blocks
-                        if pending_code_exec_parts:
-                            await flush_pending_code_exec()
 
                         # Capture SDK accumulated message after stream is fully consumed
                         # This replaces manual api_assistant_blocks/thinking_blocks accumulation
@@ -4406,59 +4756,18 @@ class Pipe:
                     # Log stream event diagnostics
                     logger.debug(f"📊 Stream events: {stream_event_counts}")
 
-                    # --- SDK FALLBACK STOP REASON DETECTION ---
-                    # In some cases (especially container continuations for programmatic tool calling),
-                    # the API returns a stream with message_start but NO message_delta event.
-                    # This means stop_reason was never detected during streaming.
-                    # Use the SDK's accumulated message as fallback.
-                    if sdk_final_message and not conversation_ended and not has_pending_tool_calls:
-                        sdk_stop = getattr(sdk_final_message, "stop_reason", None)
-                        sdk_content = getattr(sdk_final_message, "content", [])
+                    conversation_ended, has_pending_tool_calls, tool_calls = await self._apply_sdk_stop_reason_fallback(
+                        sdk_final_message=sdk_final_message,
+                        conversation_ended=conversation_ended,
+                        has_pending_tool_calls=has_pending_tool_calls,
+                        tool_calls=tool_calls,
+                        tool_loop_iteration=tool_loop_iteration,
+                        payload_for_stream=payload_for_stream,
+                        stream_event_counts=stream_event_counts,
+                        request_ctx=request_ctx,
+                    )
 
-                        if sdk_stop:
-                            logger.info(f"📍 Fallback stop_reason from SDK message: {sdk_stop}")
-                            if sdk_stop == "end_turn":
-                                conversation_ended = True
-                            elif sdk_stop == "tool_use":
-                                has_pending_tool_calls = True
-                                # Tools should have been processed during streaming.
-                                # If tool_calls is empty, rebuild from SDK message.
-                                if not tool_calls:
-                                    for block in sdk_content:
-                                        if getattr(block, "type", None) == "tool_use":
-                                            logger.warning(
-                                                f"📍 Rebuilding tool_call from SDK: {getattr(block, 'name', '?')}"
-                                            )
-                                            # These will need execution in PHASE 5
-                                            tool_calls.append({
-                                                "type": "tool_result",
-                                                "tool_use_id": getattr(block, "id", ""),
-                                                "content": "Error: tool call was not processed during streaming",
-                                                "is_error": True,
-                                            })
-                            elif sdk_stop in ("max_tokens", "pause_turn", "refusal", "stop_sequence", "model_context_window_exceeded"):
-                                conversation_ended = True
-                                if sdk_stop == "max_tokens":
-                                    await emit_message_delta("\n\n⚠️ Maximum token limit reached.")
-                                elif sdk_stop == "model_context_window_exceeded":
-                                    await emit_message_delta("\n\n⚠️ Context window exceeded.")
-                        elif not sdk_content:
-                            # Empty response: no stop_reason AND no content blocks
-                            # This happens when the API fails to resume a container
-                            logger.warning(
-                                f"⚠️ Empty API response (no stop_reason, no content). "
-                                f"Container: {payload_for_stream.get('container', 'NONE')}. "
-                                f"Events: {stream_event_counts}. Treating as end_turn."
-                            )
-                            conversation_ended = True
-                            if tool_loop_iteration > 1:
-                                await emit_message_delta(
-                                    "\n\n⚠️ Code execution continuation returned empty response. "
-                                    "The container may have timed out."
-                                )
-
-                    # Sende letzten Chunk, falls noch etwas Ã¼brig ist
-                    if chunk.strip():
+                    if chunk:
                         await emit_message_delta(chunk)
                         chunk = ""
                         chunk_count = 0
@@ -4482,7 +4791,9 @@ class Pipe:
                             f"SDK blocks: {sdk_block_types}"
                         )
                         # Check if we've reached the max tool call limit
-                        current_function_calls += 1
+                        # Count actual tool results (not loop iterations) for accurate tracking
+                        num_tool_results = sum(1 for tc in tool_calls if tc.get("type") == "tool_result")
+                        current_function_calls += num_tool_results
                         if current_function_calls >= max_function_calls:
                             await emit_event_local(
                                 {
@@ -4493,8 +4804,17 @@ class Pipe:
                                     },
                                 }
                             )
+                            await emit_event_local(
+                                {
+                                    "type": "notification",
+                                    "data": {
+                                        "type": "warning",
+                                        "content": f"Tool call limit ({max_function_calls}) reached. Increase MAX_TOOL_CALLS in valves if needed.",
+                                    },
+                                }
+                            )
                             await emit_message_delta(
-                                f"\n\n⚠️ **SYSTEM MESSAGE**: Maximum tool call limit ({max_function_calls}) reached. Some tool results may not have been processed."
+                                f"\n\n⚠️ **Tool call limit reached** ({current_function_calls}/{max_function_calls}). Some tool results may not have been processed. You can increase the limit in the model's valve settings."
                             )
                             break
 
@@ -4550,6 +4870,25 @@ class Pipe:
                                 {"role": "assistant", "content": assistant_content}
                             )
 
+                        # Safety: ensure every tool_use in assistant has a tool_result
+                        tool_use_ids_in_assistant = {
+                            b.get("id") for b in assistant_content
+                            if b.get("type") == "tool_use"
+                        }
+                        tool_result_ids = {
+                            b.get("tool_use_id") for b in tool_calls
+                            if b.get("type") == "tool_result"
+                        }
+                        missing_ids = tool_use_ids_in_assistant - tool_result_ids
+                        for missing_id in missing_ids:
+                            logger.warning(f"⚠️ Missing tool_result for tool_use {missing_id}, adding error result")
+                            tool_calls.append({
+                                "type": "tool_result",
+                                "tool_use_id": missing_id,
+                                "content": "Error: tool execution failed - no result was produced",
+                                "is_error": True,
+                            })
+
                         # Add user message with tool results (tool_calls already contains tool_result blocks)
                         user_content = tool_calls.copy()
                         if user_content:
@@ -4578,10 +4917,8 @@ class Pipe:
                             )
                             break
 
-                        # Reset state for next iteration
-                        current_function_calls += len(tool_calls)
-
                         # Check if we're approaching the limit BEFORE next iteration
+                        # (current_function_calls already updated above with actual tool result count)
                         remaining = max_function_calls - current_function_calls
                         if remaining <= 0:
                             # Hard limit reached - this shouldn't happen as we check above, but safety first
@@ -4592,7 +4929,7 @@ class Pipe:
                                 {
                                     "type": "status",
                                     "data": {
-                                        "description": f"⚠️ Final tool call available - after next tool use, conversation will be terminated",
+                                        "description": f"⚠️ Final tool call available ({current_function_calls}/{max_function_calls} used)",
                                         "done": False,
                                     },
                                 }
@@ -4608,23 +4945,37 @@ class Pipe:
                                         "content": [
                                             {
                                                 "type": "text",
-                                                "text": "⚠️ SYSTEM WARNING: This is your final tool call. After this next tool use, the conversation will be automatically terminated due to the tool call limit. Please provide a comprehensive text response instead of calling more tools, and suggest the user continue manually if needed.",
+                                                "text": f"⚠️ SYSTEM WARNING: Tool call limit nearly reached ({current_function_calls}/{max_function_calls} used). You have 1 tool call remaining. After the next tool use, the conversation will be automatically terminated. Please provide a comprehensive text response instead of calling more tools, and suggest the user continue manually if needed.",
                                             }
                                         ],
                                     }
                                 )
-                        elif remaining <= 3:
-                            # Approaching limit - inform user
+                        elif remaining <= 5:
+                            # Approaching limit - inform both user and Claude
                             await emit_event_local(
                                 {
                                     "type": "status",
                                     "data": {
-                                        "description": f"⚠️ Only {remaining} tool call(s) remaining before limit",
+                                        "description": f"⚠️ {remaining} tool call(s) remaining ({current_function_calls}/{max_function_calls} used)",
                                         "done": False,
                                     },
                                 }
                             )
                             await asyncio.sleep(0.05)
+
+                            # Notify Claude about remaining calls so it can plan accordingly
+                            if not self.valves.ENABLE_PROGRAMMATIC_TOOL_CALLING:
+                                payload_for_stream["messages"].append(
+                                    {
+                                        "role": "user",
+                                        "content": [
+                                            {
+                                                "type": "text",
+                                                "text": f"[SYSTEM: {remaining} tool call(s) remaining out of {max_function_calls}. Plan your remaining tool calls carefully.]",
+                                            }
+                                        ],
+                                    }
+                                )
 
                         has_pending_tool_calls = False
                         tool_calls = []
@@ -4640,13 +4991,90 @@ class Pipe:
                         pending_citation_markers = []  # Reset pending citations
                         continue
 
-                    # SAFETY: If we reach here, the stream completed but no tool loop
-                    # continuation was triggered. Break to prevent infinite requests.
-                    if not conversation_ended:
-                        logger.warning(
-                            "Stream completed without end_turn or tool handling - "
-                            "breaking to prevent infinite loop"
+                    # pause_turn continuation: API paused a long-running turn,
+                    # send the response back as-is to let Claude continue
+                    elif has_pending_tool_calls and not tool_calls:
+                        logger.info(
+                            f"⏸️ pause_turn continuation (iter {tool_loop_iteration})"
                         )
+                        if sdk_final_message:
+                            assistant_content = self._convert_sdk_message_to_api_blocks(sdk_final_message)
+                            if assistant_content:
+                                payload_for_stream["messages"].append(
+                                    {"role": "assistant", "content": assistant_content}
+                                )
+                        has_pending_tool_calls = False
+                        sdk_final_message = None
+                        chunk = ""
+                        chunk_count = 0
+                        current_search_query = ""
+                        citation_counter = 0
+                        pending_citation_markers = []
+                        continue
+
+                    # SAFETY / TRUNCATED STREAM RETRY:
+                    # If we reach here, the stream completed but no tool loop
+                    # continuation was triggered and conversation_ended is False.
+                    # This typically means a truncated stream (200 OK but no stop_reason).
+                    # Auto-retry with the same payload instead of silently breaking.
+                    if not conversation_ended:
+                        retry_attempts += 1
+                        if retry_attempts <= self.valves.MAX_RETRIES:
+                            # Determine what happened for logging
+                            sdk_block_types = (
+                                [getattr(b, "type", "?") for b in getattr(sdk_final_message, "content", [])]
+                                if sdk_final_message else []
+                            )
+                            logger.warning(
+                                f"⚠️ Truncated stream (no stop_reason, no tool handling). "
+                                f"SDK blocks: {sdk_block_types}. "
+                                f"Auto-retrying ({retry_attempts}/{self.valves.MAX_RETRIES})..."
+                            )
+                            await request_ctx.emit_event(
+                                {
+                                    "type": "status",
+                                    "data": {
+                                        "description": f"⚠️ Stream abgebrochen, Retry ({retry_attempts}/{self.valves.MAX_RETRIES})...",
+                                        "done": False,
+                                    },
+                                }
+                            )
+                            # Reset streaming state for retry — clear any partial content
+                            # from this truncated iteration so we get a clean response
+                            final_message.clear()
+                            sdk_final_message = None
+                            chunk = ""
+                            chunk_count = 0
+                            current_search_query = ""
+                            citation_counter = 0
+                            pending_citation_markers = []
+                            citations_list = []
+                            first_text_emitted = False
+                            # Reset thinking state
+                            thinking_message = ""
+                            thinking_start_time = None
+                            thinking_stream_start_idx = -1
+                            thinking_last_block = ""
+                            # Reset server tool state
+                            active_server_tool_name = None
+                            active_server_tool_id = None
+                            server_tool_input_buffer = ""
+                            in_code_execution = False
+                            code_exec_current_code = ""
+                            code_exec_last_block = ""
+                            current_block_type = None
+                            # payload_for_stream stays unchanged → same messages, same tools
+                            # Cache from previous messages is preserved server-side
+                            continue
+                        else:
+                            logger.error(
+                                f"❌ Truncated stream: max retries ({self.valves.MAX_RETRIES}) exhausted. "
+                                f"Returning error to user."
+                            )
+                            await request_ctx.emit_delta(
+                                "\n\n⚠️ Die Anthropic API hat den Stream mehrfach abgebrochen "
+                                f"({self.valves.MAX_RETRIES} Versuche). Bitte versuche es erneut."
+                            )
                     break
 
                 # ---------------------------------------------------------
@@ -4657,154 +5085,27 @@ class Pipe:
                 # - InternalServerError (500, 529): Retryable
                 # - APIConnectionError: Network issues, retryable
                 # ---------------------------------------------------------
-                except RateLimitError as e:
-                    # Rate limit error (429) - retryable
-                    await self.handle_errors(e, __event_emitter__)
-                    return final_text() + (
-                        f"\n\n⚠️ Rate limit exceeded - maximum retries ({self.valves.MAX_RETRIES}) reached. Please try again later."
-                    )
-                except AuthenticationError as e:
-                    # API key issues (401)
-                    await self.handle_errors(e, __event_emitter__)
-                    return final_text() + (
-                        f"\n\nError: API key issues. Reason: {e.message}"
-                    )
-                except PermissionDeniedError as e:
-                    # Permission issues (403)
-                    await self.handle_errors(e, __event_emitter__)
-                    return final_text() + (
-                        f"\n\nError: Permission denied. Reason: {e.message}"
-                    )
-                except NotFoundError as e:
-                    # Resource not found (404)
-                    await self.handle_errors(e, __event_emitter__)
-                    return final_text() + (
-                        f"\n\nError: Resource not found. Reason: {e.message}"
-                    )
-                except BadRequestError as e:
-                    # Invalid request format (400)
-                    await self.handle_errors(e, __event_emitter__)
-                    return final_text() + (
-                        f"\n\nError: Invalid request format. Reason: {e.message}"
-                    )
-
-                except UnprocessableEntityError as e:
-                    # Unprocessable entity (422)
-                    await self.handle_errors(e, __event_emitter__)
-                    return final_text() + (
-                        f"\n\nError: Unprocessable entity. Reason: {e.message}"
-                    )
-                except OverloadedError as e:
-                    # OverloadedError: SDK raises this for non-streaming 529 responses
-                    retry_attempts += 1
-                    if retry_attempts <= self.valves.MAX_RETRIES:
-                        logger.debug(
-                            f"API overloaded (529), retry {retry_attempts}/{self.valves.MAX_RETRIES}"
-                        )
-                        await emit_event_local(
-                            {
-                                "type": "status",
-                                "data": {
-                                    "description": f"⏳ API overloaded, retrying... ({retry_attempts}/{self.valves.MAX_RETRIES})",
-                                    "done": False,
-                                },
-                            }
-                        )
-                        continue
-                    else:
-                        await self.handle_errors(e, __event_emitter__)
-                        return final_text() + (
-                            f"\n\n🔧 API overloaded - maximum retries ({self.valves.MAX_RETRIES}) reached. Please try again later."
-                        )
-                except InternalServerError as e:
-                    # Server errors (500, 503, etc.) - retryable
-                    retry_attempts += 1
-                    if retry_attempts <= self.valves.MAX_RETRIES:
-                        logger.debug(
-                            f"Server error ({getattr(e, 'status_code', 500)}), retry {retry_attempts}/{self.valves.MAX_RETRIES}"
-                        )
-                        await emit_event_local(
-                            {
-                                "type": "status",
-                                "data": {
-                                    "description": f"⏳ Server error, retrying... ({retry_attempts}/{self.valves.MAX_RETRIES})",
-                                    "done": False,
-                                },
-                            }
-                        )
-                        continue
-                    else:
-                        await self.handle_errors(e, __event_emitter__)
-                        return final_text() + (
-                            f"\n\n🔧 Server error - maximum retries ({self.valves.MAX_RETRIES}) reached. Please try again later."
-                        )
-                except APIConnectionError as e:
-                    # Network/connection issues - potentially transient - retryable
-                    retry_attempts += 1
-                    if retry_attempts <= self.valves.MAX_RETRIES:
-                        logger.debug(
-                            f"Connection error, retry {retry_attempts}/{self.valves.MAX_RETRIES}"
-                        )
-
-                        await emit_event_local(
-                            {
-                                "type": "status",
-                                "data": {
-                                    "description": f"🌐 Connection error, retrying... ({retry_attempts}/{self.valves.MAX_RETRIES})",
-                                    "done": False,
-                                },
-                            }
-                        )
-                        continue  # Retry the request
-                    else:
-                        # Max retries exceeded
-                        await self.handle_errors(e, __event_emitter__)
-                        return final_text() + (
-                            f"\n\n🌐 Network connection failed after {self.valves.MAX_RETRIES} attempts. Please check your connection."
-                        )
-                except APIStatusError as e:
-                    # Check for streaming overloaded_error (arrives as APIStatusError
-                    # with HTTP 200, not OverloadedError with 529)
-                    error_body = getattr(e, "body", None) or {}
-                    error_info = (
-                        error_body.get("error", {})
-                        if isinstance(error_body, dict)
-                        else {}
-                    )
-                    is_overloaded = error_info.get("type") == "overloaded_error"
-
-                    if is_overloaded and retry_attempts < self.valves.MAX_RETRIES:
-                        retry_attempts += 1
-                        logger.debug(
-                            f"Streaming overloaded error, retry {retry_attempts}/{self.valves.MAX_RETRIES}"
-                        )
-                        await emit_event_local(
-                            {
-                                "type": "status",
-                                "data": {
-                                    "description": f"⏳ API overloaded (streaming), retrying... ({retry_attempts}/{self.valves.MAX_RETRIES})",
-                                    "done": False,
-                                },
-                            }
-                        )
-                        continue  # Retry the request
-
-                    # Non-retryable or max retries exceeded
-                    await self.handle_errors(e, __event_emitter__)
-                    if is_overloaded:
-                        return final_text() + (
-                            f"\n\n🔧 API overloaded (streaming) - maximum retries ({self.valves.MAX_RETRIES}) reached. Please try again later."
-                        )
-                    return final_text() + (
-                        f"\n\nError: Anthropic API error. Reason: {e.message}"
-                    )
                 except Exception as e:
-                    # Catch all other exceptions
-                    await self.handle_errors(e, __event_emitter__)
-                    return (
-                        final_text()
-                        + f"\n\nError: {type(e).__name__} occurred. Reason: {e}"
+                    # Finalize any open live code_exec block before handling error
+                    if code_exec_current_code:
+                        duration = time.time() - code_exec_start_time if code_exec_start_time else None
+                        block = self._format_code_execution_block(
+                            code_exec_current_code, code_exec_current_lang,
+                            done=True, duration=duration,
+                        )
+                        await update_content_block(code_exec_last_block, block)
+                        code_exec_last_block = ""
+                        code_exec_current_code = ""
+                    should_retry, retry_attempts, response_suffix = await self._handle_stream_exception(
+                        e,
+                        retry_attempts=retry_attempts,
+                        request_ctx=request_ctx,
                     )
+                    if should_retry:
+                        continue
+                    if response_suffix:
+                        return final_text() + response_suffix
+                    return final_text()
         except Exception as e:
             await self.handle_errors(e, __event_emitter__)
             return final_text()
@@ -4824,8 +5125,12 @@ class Pipe:
             # Use total_tokens from total_usage which now represents the last turn (Context Size)
             total_tokens = total_usage.get("total_tokens", 0)
 
-            # Percentage of assumed 200k context window (Claude 3.5 Sonnet extended)
-            percentage = min((total_tokens / 200000) * 100, 100)
+            # Determine context window based on model capability and valve setting
+            model_info = self.get_model_info(body["model"].split("/")[-1])
+            is_1m = model_info.get("supports_1m_context", False)
+            context_window = 1_000_000 if is_1m else 200_000
+            context_label = "1M" if is_1m else "200k"
+            percentage = min((total_tokens / context_window) * 100, 100)
 
             # Progress bar (10 segments)
             filled = int(percentage / 10)
@@ -4839,7 +5144,15 @@ class Pipe:
                 return str(n)
 
             final_status += (
-                f" [{bar}] {format_num(total_tokens)}/200k ({percentage:.1f}%)"
+                f" [{bar}] {format_num(total_tokens)}/{context_label} ({percentage:.1f}%)"
+            )
+
+        # Consolidate: emit a final replace with the complete message so OpenWebUI
+        # has the authoritative content (replaces any partial delta/replace state).
+        consolidated = final_text()
+        if consolidated:
+            await emit_event_local(
+                {"type": "replace", "data": {"content": consolidated}}
             )
 
         await emit_event_local(
@@ -4850,18 +5163,21 @@ class Pipe:
                 },
             }
         )
-        if include_usage:
-            await emit_event_local(
-                {
-                    "type": "chat:completion",
-                    "data": {
-                        "usage": total_usage,
-                    },
-                }
-            )
+        
+        logger.debug(f"Final status emitted: {final_status}")
+        logger.debug(f"Total usage: {total_usage}")
+        logger.debug(f"Final Message: {consolidated}")
+        
+        # Emit chat:completion done event so frontend knows streaming finished
+        # (triggers TTS finish, usage display, etc.)
+        done_data: dict = {"choices": [{"finish_reason": "stop", "delta": {"content": ""}}], "done": True}
+        if include_usage and total_usage:
+            done_data["usage"] = total_usage
+        await emit_event_local({"type": "chat:completion", "data": done_data})
+
         if __user__["valves"].DEBUG_MODE:
-            await emit("Final_Text", final_text())
-        return final_text()
+            # DEBUG: content already streamed via emit_event_local; skipping duplicate
+            pass
 
     # =========================================================================
     # TASK MODEL (TITLE, TAGS, FOLLOW-UPS)
@@ -4896,7 +5212,8 @@ class Pipe:
             # Make synchronous request to Anthropic API
             # For task requests, we don't have __user__ context, so use default key
             api_key = self.valves.ANTHROPIC_API_KEY
-            client = AsyncAnthropic(api_key=api_key)
+            base_url = self.valves.ANTHROPIC_BASE_URL.strip() or None
+            client = AsyncAnthropic(api_key=api_key, **({"base_url": base_url} if base_url else {}))
 
             response = await client.messages.create(**task_payload)
 
@@ -5254,15 +5571,15 @@ class Pipe:
         try:
             return await asyncio.wait_for(
                 tool_callable(**args),
-                timeout=self.TOOL_CALL_TIMEOUT,
+                timeout=self.valves.TOOL_CALL_TIMEOUT,
             )
         except asyncio.TimeoutError:
-            message = f"Error: Tool '{tool_name}' timed out after {self.TOOL_CALL_TIMEOUT} seconds"
+            message = f"Error: Tool '{tool_name}' timed out after {self.valves.TOOL_CALL_TIMEOUT} seconds"
             self.logger.debug(message)
             return message
         except Exception as exc:
             self.logger.debug(f"Tool '%s' failed", tool_name, exc_info=exc)
-            return f"Error executing tool '{tool_name}': {exc}"
+            return f"Error: Tool '{tool_name}' failed: {exc}"
 
     # =========================================================================
     # TEXT PROCESSING & MEMORY EXTRACTION
@@ -5389,23 +5706,70 @@ class Pipe:
     # SDK MESSAGE CONVERSION HELPER
     # Converts SDK BetaMessage content blocks to API-compatible dicts
     # =========================================================================
+    # CRITICAL: All blocks must be preserved to maintain thinking block positions.
+    # The SDK (and Anthropic's tool runner) keeps ALL blocks as-is when sending
+    # assistant content back during tool loops. Stripping server_tool_use or
+    # *_tool_result shifts thinking block indices, causing:
+    #   "thinking blocks cannot be modified"
+    # Only strip truly structural meta-events (context_cleared, compaction).
+    #
+    # Thinking + redacted_thinking get strict key sanitization to prevent
+    # cache_control or other extra fields from causing API errors.
+
+    # Block types that must be strictly sanitized (extra keys cause API errors)
+    _SANITIZE_BLOCK_KEYS = {
+        "thinking": {"type", "thinking", "signature"},  # signature MUST be preserved exactly
+        "redacted_thinking": {"type", "data"},           # opaque data, pass through unchanged
+    }
+
+    # Block types to skip entirely (structural meta-events, not real content)
+    _SKIP_BLOCK_TYPES = frozenset({"context_cleared", "compaction"})
+
     def _convert_sdk_message_to_api_blocks(self, message) -> list:
         """Convert SDK accumulated BetaMessage content to API-compatible block dicts.
 
-        Uses model_dump(exclude_none=True) on each block, then strips server-side
-        block types that confuse the API validator in multi-turn requests.
+        Mirrors the SDK's own tool runner behavior: keeps ALL content blocks
+        (including server_tool_use, *_tool_result) to preserve thinking block
+        positions. Only skips structural meta-events (context_cleared, compaction).
 
-        Strategy: Strip BOTH server_tool_use AND their paired *_tool_result blocks.
-        The container_id preserves code_execution state across turns. Keeping
-        server_tool_use without its result causes 'found without corresponding
-        code_execution_tool_result block'. Keeping both causes 'tool_use ids found
-        without tool_result blocks'. Stripping both works because the container
-        tracks all server-side execution state.
+        Strict key sanitization is applied ONLY to thinking/redacted_thinking
+        blocks (to prevent cache_control from being sent). All other blocks
+        are passed through with minimal processing.
         """
         blocks = []
         for block in message.content:
             block_dict = block.model_dump(exclude_none=True)
+            block_type = block_dict.get("type", "")
+
+            # Skip structural meta-events (not real content blocks)
+            if block_type in self._SKIP_BLOCK_TYPES:
+                continue
+
+            # Thinking/redacted_thinking: strict key sanitization
+            sanitize_keys = self._SANITIZE_BLOCK_KEYS.get(block_type)
+            if sanitize_keys is not None:
+                blocks.append({k: v for k, v in block_dict.items() if k in sanitize_keys})
+                continue
+
+            # Text blocks: strip citations (response-only presentation data)
+            if block_type == "text":
+                block_dict.pop("citations", None)
+                blocks.append(block_dict)
+                continue
+
+            # tool_use blocks: strip "direct" caller (API rejects it),
+            # but preserve programmatic caller (needed for code_execution routing)
+            if block_type == "tool_use":
+                caller = block_dict.get("caller")
+                if caller and caller.get("type") == "direct":
+                    block_dict.pop("caller", None)
+                blocks.append(block_dict)
+                continue
+
+            # All other blocks (server_tool_use, *_tool_result, etc.):
+            # pass through as-is to preserve thinking block positions
             blocks.append(block_dict)
+
         return blocks
 
     # =========================================================================
@@ -5429,14 +5793,14 @@ class Pipe:
         if duration is not None:
             duration_int = int(duration)
             return (
-                f'\n<details type="reasoning" done="true" duration="{duration_int}">\n'
+                f'<details type="reasoning" done="true" duration="{duration_int}">\n'
                 f"<summary>Thought for {duration_int} seconds</summary>\n"
                 f"{escaped_lines}\n"
                 f"</details>\n"
             )
         else:
             return (
-                f'\n<details type="reasoning" done="false">\n'
+                f'<details type="reasoning" done="false">\n'
                 f"<summary>Thinking…</summary>\n"
                 f"{escaped_lines}\n"
                 f"</details>\n"
@@ -5474,6 +5838,24 @@ class Pipe:
         result += "</details>\n"
         return result
 
+    @staticmethod
+    def _try_parse_partial_json(buffer: str):
+        """Try to parse partial JSON by attempting various closing strategies.
+
+        During input_json_delta streaming, the input JSON arrives incrementally.
+        This attempts to close the partial JSON to extract a parseable value
+        for live UI updates. Returns parsed dict/list/value on success, None on failure.
+        """
+        if not buffer or not buffer.strip():
+            return None
+        # Try as-is first (might already be complete)
+        for suffix in ("", "}", '"}', '"}}', "]}"):
+            try:
+                return json.loads(buffer + suffix)
+            except (json.JSONDecodeError, ValueError):
+                continue
+        return None
+
     def _format_tool_result_block(
         self,
         tool_call_id: str,
@@ -5482,6 +5864,8 @@ class Pipe:
         tool_output: str,
         is_error: bool = False,
         done: bool = True,
+        embeds: list = None,
+        files: list = None,
     ) -> str:
         """Format a tool result block with OpenWebUI native <details type='tool_calls'> format.
 
@@ -5490,6 +5874,8 @@ class Pipe:
 
         Args:
             done: If True, shows "Tool Executed". If False, shows "Executing..." with spinner.
+            embeds: List of embed content (HTML strings, URLs) from process_tool_result.
+            files: List of file dicts from process_tool_result.
         """
         # Escape arguments for HTML attribute
         escaped_args = (
@@ -5500,6 +5886,7 @@ class Pipe:
 
         done_str = "true" if done else "false"
         summary = "Tool Executed" if done else "Executing..."
+        error_attr = ' error="true"' if is_error and done else ""
 
         if done:
             # Escape result for HTML attribute
@@ -5524,15 +5911,17 @@ class Pipe:
                 )
 
             return (
-                f'\n<details type="tool_calls" done="{done_str}" id="{html.escape(tool_call_id)}" name="{html.escape(tool_name)}" '
-                f'arguments="{escaped_args}" result="{escaped_result}" files="" embeds="">\n'
+                f'<details type="tool_calls" done="{done_str}" id="{html.escape(tool_call_id)}" name="{html.escape(tool_name)}" '
+                f'arguments="{escaped_args}" result="{escaped_result}" '
+                f'files="{html.escape(json.dumps(files)) if files else ""}" '
+                f'embeds="{html.escape(json.dumps(embeds)) if embeds else ""}"{error_attr}>\n'
                 f"<summary>{summary}</summary>\n"
                 f"</details>\n"
             )
         else:
             # In-progress tool call - no result yet
             return (
-                f'\n<details type="tool_calls" done="{done_str}" id="{html.escape(tool_call_id)}" name="{html.escape(tool_name)}" '
+                f'<details type="tool_calls" done="{done_str}" id="{html.escape(tool_call_id)}" name="{html.escape(tool_name)}" '
                 f'arguments="{escaped_args}">\n'
                 f"<summary>{summary}</summary>\n"
                 f"</details>\n"
@@ -5601,49 +5990,60 @@ class Pipe:
         parts.append("</details>\n")
         return "".join(parts)
 
-    def _format_code_input_block(
+    def _format_code_execution_block(
         self,
         code: str,
-        language: str = "bash",
+        language: str = "python",
+        done: bool = False,
+        duration: float = None,
+        stdout: str = "",
+        stderr: str = "",
         return_code: int = None,
         download_links: list = None,
         tool_calls_info: list = None,
     ) -> str:
-        """Format code execution INPUT only as a collapsible <details> block.
-        Output is emitted separately as a source/citation event."""
-        tool_count = len(tool_calls_info) if tool_calls_info else 0
-        summary_suffix = f" — {tool_count} tool call{'s' if tool_count != 1 else ''}" if tool_count else ""
-        exit_info = f" ❌ exit {return_code}" if return_code is not None and return_code != 0 else ""
+        """Format code execution as <details type="code_interpreter"> matching OpenWebUI native format.
 
-        parts = []
-        parts.append(f"\n<details>\n<summary>💻 Code Execution ({language}){summary_suffix}{exit_info}</summary>\n")
-        if code:
-            parts.append(f"\n```{language}\n{code}\n```\n")
+        Uses the same HTML structure as OpenWebUI's built-in code_interpreter,
+        giving us spinner, Analyzing.../Analyzed transitions, and output display for free.
+        """
+        done_str = "true" if done else "false"
+        summary = "Analyzed" if done else "Analyzing…"
+
+        # Build display content (code block inside details body)
+        display = f"```{language}\n{code}\n```" if code else ""
+
+        # Build output JSON for the output attribute
+        # CodeBlock.svelte expects {stdout, stderr, result} keys
+        output_data = {}
+        if stdout:
+            output_data["stdout"] = stdout
+        if stderr:
+            output_data["stderr"] = stderr
+        # Build a result summary for tool calls and other info
+        result_parts = []
+        if return_code is not None and return_code != 0:
+            result_parts.append(f"Exit code: {return_code}")
         if tool_calls_info:
-            parts.append("\n🔧 **Tool Calls:**\n")
-            parts.append("| Tool | Arguments | Result |\n")
-            parts.append("|------|-----------|--------|\n")
             for tc in tool_calls_info:
                 name = tc.get("name", "?")
-                inp = tc.get("input", {})
-                inp_str = ", ".join(f"{k}={v}" for k, v in inp.items()) if isinstance(inp, dict) else str(inp)
-                result = tc.get("result", "")
-                try:
-                    parsed_result = json.loads(result) if isinstance(result, str) else result
-                    result_str = str(parsed_result.get("result", parsed_result)) if isinstance(parsed_result, dict) else str(parsed_result)
-                except (json.JSONDecodeError, ValueError):
-                    result_str = str(result)
-                if len(result_str) > 100:
-                    result_str = result_str[:97] + "..."
-                error_marker = " ❌" if tc.get("is_error") else ""
-                parts.append(f"| {name} | {inp_str} | {result_str}{error_marker} |\n")
-            parts.append("\n")
+                res = tc.get("result", "")[:200]
+                error = " ❌" if tc.get("is_error") else ""
+                result_parts.append(f"🔧 {name}: {res}{error}")
         if download_links:
-            parts.append("\n**Files:**\n")
-            for link in download_links:
-                parts.append(f"- {link}\n")
-        parts.append("</details>\n")
-        return "".join(parts)
+            result_parts.append("Files: " + ", ".join(download_links))
+        if result_parts:
+            output_data["result"] = "\n".join(result_parts)
+
+        # Build attributes
+        attrs = f'type="code_interpreter" done="{done_str}"'
+        if duration is not None and done:
+            attrs += f' duration="{duration:.1f}"'
+        if output_data:
+            output_json = json.dumps(output_data, ensure_ascii=False)
+            attrs += f' output="{html.escape(output_json)}"'
+
+        return f"<details {attrs}>\n<summary>{summary}</summary>\n{display}\n</details>\n"
 
     async def _emit_code_execution_source(
         self,
@@ -5749,7 +6149,8 @@ class Pipe:
             try:
                 from anthropic import AsyncAnthropic
 
-                client = AsyncAnthropic(api_key=api_key)
+                base_url = self.valves.ANTHROPIC_BASE_URL.strip() or None
+                client = AsyncAnthropic(api_key=api_key, **({"base_url": base_url} if base_url else {}))
 
                 # Fetch all available skills
                 available_skills = {}
