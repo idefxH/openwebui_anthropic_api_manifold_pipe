@@ -541,7 +541,12 @@ class PipeRequestContext:
 
 class Pipe:
     API_VERSION = "2023-06-01"  # Current API version as of May 2025
-    MODEL_URL = "https://api.anthropic.com/v1/messages"
+    _DEFAULT_API_BASE = "https://api.anthropic.com"
+
+    @property
+    def MODEL_URL(self):
+        base = self.valves.ANTHROPIC_BASE_URL.strip().rstrip("/") if hasattr(self, "valves") and self.valves.ANTHROPIC_BASE_URL.strip() else self._DEFAULT_API_BASE
+        return f"{base}/v1/messages"
 
     # Centralized model capabilities database
     # Note: Anthropic's /v1/models API only returns id, display_name, created_at, and type.
