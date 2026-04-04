@@ -4,7 +4,7 @@ id: anthropic_new
 author: Podden (https://github.com/Podden/)
 github: https://github.com/Podden/openwebui_anthropic_api_manifold_pipe
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.8.12
+version: 0.9.4
 license: MIT
 requirements: pydantic>=2.0.0, anthropic>=0.75.0
 environment_variables:
@@ -27,6 +27,7 @@ Supports:
 - Fine Grained Tool Streaming
 - Extended Thinking Toggle Action
 - Code Execution Tool
+- Compaction
 - Vision
 - Context Editing (clear tool results and thinking blocks)
 - Tool Search (BM25/Regex)
@@ -37,14 +38,32 @@ Supports:
 - Programmatic Tool Calling (tools callable from code execution)
 
 Changelog:
+v0.9.4
+- Added Cache Statistics to Token Count Message
+
+v0.9.3
+- Moved compaction and context editing valves to UserValves
+- SHOW_TOKEN_COUNT valve upgraded from bool to "Off"/"On"/"With Cache" — "With Cache" shows cache read/write tokens and TTL
+
+v0.9.2
+- added compaction and client-side compaction trim: drops messages before the last compaction boundary before sending
+and added message trim optimization
+
+v0.9.1
+- return whole message at the end and switched from chat:completion to message:delta event to prevent empty messages
+
+v0.9
+- Fixed total_usage access bug when usage capability is not enabled on model
+- Removed Sonnet 4 and Opus/Sonnet 4.5 from 1 Mio context windows support
+- Fetch model capabilites like max_input_token now directly from the API
+- Added support for thinking.display: "omitted" (https://platform.claude.com/docs/en/build-with-claude/adaptive-thinking#controlling-thinking-display)
+
 v0.8.12
-<<<<<<< main
+- Add API tool passthrough for external function calling
 - Added ANTHROPIC_BASE_URL valve to allow routing all API requests through a custom proxy URL
-=======
 - Fixed Tool Result output Grouping
 - Decluddered the if/else horror in event_type handling
 - Fixed OpenTerminal Tools
->>>>>>> main
 
 v0.8.11
 - Added Caching time CACHE_TTL valve to choose between 5 minutes (default) and 1 hour
@@ -468,6 +487,12 @@ PATTERN_CODE_INTERPRETER_DETAILS = re.compile(
     flags=re.DOTALL,
 )
 
+# Pattern to extract compaction blocks from assistant messages for API reconstruction.
+PATTERN_COMPACTION_DETAILS = re.compile(
+    r'<details type="compaction"[^>]*>\s*<summary>[^<]*</summary>\s*(.*?)\s*</details>',
+    flags=re.DOTALL,
+)
+
 # Note: Some patterns are compiled dynamically at runtime because they depend
 # on user-provided data (filenames, file IDs). See:
 #   - _remove_specific_sources_from_rag_message() - dynamic filename pattern
@@ -551,12 +576,7 @@ class PipeRequestContext:
         await self.pipe.emit_event(event, self.event_emitter)
 
     async def emit_delta(self, content: str) -> None:
-        await self.emit_event(
-            {
-                "type": "chat:completion",
-                "data": {"choices": [{"delta": {"content": content}}]},
-            }
-        )
+        await self.emit_event({"type": "message", "data": {"content": content}})
         self.final_message.append(content)
 
     async def emit_replace(self, content: str) -> None:
@@ -594,15 +614,11 @@ class Pipe:
     # The API now provides: max_tokens, max_input_tokens, capabilities (thinking, effort, vision, etc.)
     # These overrides only contain flags that must be derived from model identity.
     MODEL_CAPABILITY_OVERRIDES = {
-        "claude-sonnet-4-20250514": {"supports_1m_context": True},
-        "claude-sonnet-4-5-20250929": {"supports_1m_context": True},
         "claude-opus-4-6": {
-            "supports_1m_context": True,
             "supports_dynamic_filtering": True,
             "supports_fast_mode": True,
         },
         "claude-sonnet-4-6": {
-            "supports_1m_context": True,
             "supports_dynamic_filtering": True,
         },
     }
@@ -631,6 +647,7 @@ class Pipe:
         thinking = getattr(caps, "thinking", None) if caps else None
         thinking_types = getattr(thinking, "types", None) if thinking else None
         effort = getattr(caps, "effort", None) if caps else None
+        ctx_mgmt = getattr(caps, "context_management", None) if caps else None
 
         max_tokens = getattr(model, "max_tokens", 0) or 0
         max_input = getattr(model, "max_input_tokens", 0) or 0
@@ -644,10 +661,10 @@ class Pipe:
             "supports_effort_max": _sup(getattr(effort, "max", None)) if effort else False,
             "supports_vision": _sup(getattr(caps, "image_input", None)) if caps else True,
             "supports_programmatic_calling": _sup(getattr(caps, "code_execution", None)) if caps else False,
+            "supports_compaction": _sup(getattr(ctx_mgmt, "compact_20260112", None)) if ctx_mgmt else False,
             # All Claude 4+ models support memory
             "supports_memory": True,
             # Defaults for fields not in API — overridden by MODEL_CAPABILITY_OVERRIDES
-            "supports_1m_context": False,
             "supports_dynamic_filtering": False,
             "supports_fast_mode": False,
         }
@@ -673,11 +690,11 @@ class Pipe:
             "max_tokens": 4096,
             "context_length": 200000,
             "supports_thinking": True,
-            "supports_1m_context": False,
             "supports_memory": False,
             "supports_vision": True,
             "supports_effort": False,
             "supports_programmatic_calling": False,
+            "supports_compaction": False,
             "supports_dynamic_filtering": False,
             "supports_adaptive_thinking": False,
             "supports_effort_max": False,
@@ -757,7 +774,7 @@ class Pipe:
             description="Enable programmatic tool calling. Claude can call tools from within code execution. Requires code execution to be active.",
         )
         ENABLE_TOOL_SEARCH: bool = Field(
-            default=False,
+            default=True,
             description="Enable tool search. Allows Claude to search for tools by name/description when many tools are available.",
         )
         TOOL_SEARCH_TYPE: Literal["regex", "bm25"] = Field(
@@ -773,6 +790,109 @@ class Pipe:
         TOOL_SEARCH_EXCLUDE_TOOLS: List[str] = Field(
             default=["web_search", "web_fetch", "code_execution_20250825", "code_execution_20260120"],
             description="Tools to exclude from defer_loading when tool search is enabled. These tools will always be loaded immediately.",
+        )
+        DATA_RESIDENCY: Literal["global", "us"] = Field(
+            default="global",
+            description='Data residency for API requests. 1.1x Token Cost for "us".',
+        )
+        REQUEST_TIMEOUT: int = Field(
+            default=300,
+            ge=30,
+            le=1800,
+            description="Request timeout in seconds for Anthropic API calls. Increase if using slow local rerankers or large context (e.g. 600 for Top-K 15+).",
+        )
+        TOOL_CALL_TIMEOUT: int = Field(
+            default=30,
+            ge=10,
+            le=600,
+            description="Timeout in seconds for individual tool call execution.",
+        )
+
+    class UserValves(BaseModel):
+        ANTHROPIC_API_KEY: str = Field(
+            default="",
+            description="Personal Anthropic API key. If set, overrides the admin-configured key.",
+        )
+        ENABLE_THINKING: bool = Field(
+            default=False,
+            description="Enable Extended Thinking",
+        )
+        THINKING_BUDGET_TOKENS: int = Field(
+            default=8192,
+            ge=1024,
+            le=64000,
+            description="Thinking budget tokens",
+        )
+        THINKING_DISPLAY: Literal["summarized", "omitted"] = Field(
+            default="summarized",
+            description="Thinking display mode. 'summarized' returns summarized thinking (default). 'omitted' skips streaming thinking tokens for faster time-to-first-text.",
+        )
+        EFFORT: Literal["low", "medium", "high", "max"] = Field(
+            default="high",
+            description="Effort level for this user. Also Controllable with OpenWebUI's reasoning_effort parameter.",
+        )
+        USE_PDF_NATIVE_UPLOAD: bool = Field(
+            default=True,
+            description="Upload PDFs as native base64 documents instead of RAG text extraction. Enables visual PDF analysis (charts, images, layouts). Only applies to 'Use Full Document' mode.",
+        )
+        SHOW_TOKEN_COUNT: Literal["Off", "On", "With Cache"] = Field(
+            default="Off",
+            description="Show context window progress after each response. 'With Cache' also shows cache read/write tokens.",
+        )
+        WEB_SEARCH_MAX_USES: int = Field(
+            default=5,
+            ge=1,
+            le=20,
+            description="Maximum number of web searches",
+        )
+        WEB_FETCH_MAX_USES: int = Field(
+            default=5,
+            ge=1,
+            le=20,
+            description="Maximum number of web fetch requests per conversation turn",
+        )
+        WEB_SEARCH_USER_CITY: str = Field(
+            default="",
+            description="User's city for web search.",
+        )
+        WEB_SEARCH_USER_REGION: str = Field(
+            default="",
+            description="User's region/state for web search",
+        )
+        WEB_SEARCH_USER_COUNTRY: str = Field(
+            default="",
+            description="User's country code for web search",
+        )
+        WEB_SEARCH_USER_TIMEZONE: str = Field(
+            default="",
+            description="User's timezone for web search.",
+        )
+        ENABLE_DYNAMIC_FILTERING: bool = Field(
+            default=False,
+            description="Use dynamic filtering for web search/fetch on supported models (4.6+). Much slower (~60s vs ~7s) but produces higher quality results by orchestrating multiple searches/fetches and filtering content via code execution. Trades speed for context efficiency.",
+        )
+        # Files API and Skills Settings
+        USE_FILES_API: bool = Field(
+            default=False,
+            description="Upload files to Anthropic Files API for code execution access. Overrides native PDF upload. Requires code execution.",
+        )
+        SKILLS: List[str] = Field(
+            default=[],
+            description="Anthropic Skills to use (e.g., 'pptx', 'xlsx', 'docx', 'pdf' or custom skill IDs). Skills are validated against the API.",
+        )
+        ENABLE_COMPACTION: bool = Field(
+            default=False,
+            description="Enable automatic context compaction. When input tokens exceed the trigger threshold, the API summarizes older conversation context to save tokens.",
+        )
+        COMPACTION_TRIGGER_TOKENS: int = Field(
+            default=50000,
+            ge=50000,
+            le=1000000,
+            description="Token count that triggers compaction. Must be at least 50,000.",
+        )
+        COMPACTION_INSTRUCTIONS: str = Field(
+            default="",
+            description="Custom summarization instructions for compaction. Replaces the default prompt entirely when set.",
         )
         CONTEXT_EDITING_STRATEGY: Literal[
             "none", "clear_tool_results", "clear_thinking", "clear_both"
@@ -807,91 +927,6 @@ class Pipe:
         CONTEXT_EDITING_TOOL_CLEAR_TOOL_INPUT: bool = Field(
             default=False,
             description="Also clear tool input parameters when clearing tool results.",
-        )
-        DATA_RESIDENCY: Literal["global", "us"] = Field(
-            default="global",
-            description='Data residency for API requests. 1.1x Token Cost for "us".',
-        )
-        REQUEST_TIMEOUT: int = Field(
-            default=300,
-            ge=30,
-            le=1800,
-            description="Request timeout in seconds for Anthropic API calls. Increase if using slow local rerankers or large context (e.g. 600 for Top-K 15+).",
-        )
-        TOOL_CALL_TIMEOUT: int = Field(
-            default=30,
-            ge=10,
-            le=600,
-            description="Timeout in seconds for individual tool call execution.",
-        )
-
-    class UserValves(BaseModel):
-        ANTHROPIC_API_KEY: str = Field(
-            default="",
-            description="Personal Anthropic API key. If set, overrides the admin-configured key.",
-        )
-        ENABLE_THINKING: bool = Field(
-            default=False,
-            description="Enable Extended Thinking",
-        )
-        THINKING_BUDGET_TOKENS: int = Field(
-            default=8192,
-            ge=1024,
-            le=64000,
-            description="Thinking budget tokens",
-        )
-        EFFORT: Literal["low", "medium", "high", "max"] = Field(
-            default="high",
-            description="Effort level for this user. Also Controllable with OpenWebUI's reasoning_effort parameter.",
-        )
-        USE_PDF_NATIVE_UPLOAD: bool = Field(
-            default=True,
-            description="Upload PDFs as native base64 documents instead of RAG text extraction. Enables visual PDF analysis (charts, images, layouts). Only applies to 'Use Full Document' mode.",
-        )
-        SHOW_TOKEN_COUNT: bool = Field(
-            default=False,
-            description="Show Context Window Progress",
-        )
-        WEB_SEARCH_MAX_USES: int = Field(
-            default=5,
-            ge=1,
-            le=20,
-            description="Maximum number of web searches",
-        )
-        WEB_FETCH_MAX_USES: int = Field(
-            default=5,
-            ge=1,
-            le=20,
-            description="Maximum number of web fetch requests per conversation turn",
-        )
-        WEB_SEARCH_USER_CITY: str = Field(
-            default="",
-            description="User's city for web search.",
-        )
-        WEB_SEARCH_USER_REGION: str = Field(
-            default="",
-            description="User's region/state for web search",
-        )
-        WEB_SEARCH_USER_COUNTRY: str = Field(
-            default="",
-            description="User's country code for web search",
-        )
-        WEB_SEARCH_USER_TIMEZONE: str = Field(
-            default="",
-            description="User's timezone for web search.",
-        )
-        ENABLE_DYNAMIC_FILTERING: bool = Field(
-            default=True,
-            description="Use dynamic filtering for web search/fetch on supported models (4.6+). Much slower (~60s vs ~7s) but produces higher quality results by orchestrating multiple searches/fetches and filtering content via code execution. Trades speed for context efficiency.",
-        )
-        # Files API and Skills Settings
-        USE_FILES_API: bool = Field(
-            default=False,
-            description="Upload files to Anthropic Files API for code execution access. Overrides native PDF upload. Requires code execution.",
-        )
-        SKILLS: List[str] = Field(
-            default=[],
-            description="Anthropic Skills to use (e.g., 'pptx', 'xlsx', 'docx', 'pdf' or custom skill IDs). Skills are validated against the API.",
         )
         DEBUG_MODE: bool = Field(
             default=False,
@@ -1823,7 +1858,7 @@ class Pipe:
         if enable_thinking and model_info["supports_thinking"]:
             # Opus 4.6 (supports adaptive thinking) uses effort as the control
             if model_info["supports_adaptive_thinking"]:
-                payload["thinking"] = {"type": "adaptive"}
+                thinking_config = {"type": "adaptive"}
             else:
                 user_budget = __user__["valves"].THINKING_BUDGET_TOKENS
                 max_tokens = min(
@@ -1842,13 +1877,20 @@ class Pipe:
                     thinking_budget = (
                         min(user_budget, max_tokens - 1) if max_tokens > 1 else 1
                     )
-                payload["thinking"] = {
+                thinking_config = {
                     "type": "enabled",
                     "budget_tokens": thinking_budget,
                 }
                 logger.debug(
                     f"Using manual thinking with budget_tokens: {thinking_budget}, effort: {effective_effort}"
                 )
+
+            # Add display mode if not default
+            thinking_display = __user__["valves"].THINKING_DISPLAY
+            if thinking_display == "omitted":
+                thinking_config["display"] = "omitted"
+
+            payload["thinking"] = thinking_config
 
         # Check if user has memory system enabled
         user_has_memory_system_enabled = False
@@ -2069,7 +2111,7 @@ class Pipe:
             beta_headers.append("advanced-tool-use-2025-11-20")
 
         # Add context editing strategies if enabled
-        context_editing_strategy = self.valves.CONTEXT_EDITING_STRATEGY
+        context_editing_strategy = __user__["valves"].CONTEXT_EDITING_STRATEGY
         if context_editing_strategy != "none":
             if "context-management-2025-06-27" not in beta_headers:
                 beta_headers.append("context-management-2025-06-27")
@@ -2088,7 +2130,7 @@ class Pipe:
                     "type": "clear_thinking_20251015",
                     "keep": {
                         "type": "thinking_turns",
-                        "value": self.valves.CONTEXT_EDITING_THINKING_KEEP,
+                        "value": __user__["valves"].CONTEXT_EDITING_THINKING_KEEP,
                     },
                 }
                 context_management.append(clear_thinking)
@@ -2102,24 +2144,44 @@ class Pipe:
                     "type": "clear_tool_uses_20250919",
                     "trigger": {
                         "type": "input_tokens",
-                        "value": self.valves.CONTEXT_EDITING_TOOL_TRIGGER,
+                        "value": __user__["valves"].CONTEXT_EDITING_TOOL_TRIGGER,
                     },
                     "keep": {
                         "type": "tool_uses",
-                        "value": self.valves.CONTEXT_EDITING_TOOL_KEEP,
+                        "value": __user__["valves"].CONTEXT_EDITING_TOOL_KEEP,
                     },
                 }
-                if self.valves.CONTEXT_EDITING_TOOL_CLEAR_AT_LEAST > 0:
+                if __user__["valves"].CONTEXT_EDITING_TOOL_CLEAR_AT_LEAST > 0:
                     clear_tool_uses["clear_at_least"] = {
                         "type": "input_tokens",
-                        "value": self.valves.CONTEXT_EDITING_TOOL_CLEAR_AT_LEAST,
+                        "value": __user__["valves"].CONTEXT_EDITING_TOOL_CLEAR_AT_LEAST,
                     }
-                if self.valves.CONTEXT_EDITING_TOOL_CLEAR_TOOL_INPUT:
+                if __user__["valves"].CONTEXT_EDITING_TOOL_CLEAR_TOOL_INPUT:
                     clear_tool_uses["clear_tool_inputs"] = True
                 context_management.append(clear_tool_uses)
 
             if context_management:
                 payload["context_management"] = {"edits": context_management}
+
+        # Add compaction if enabled and model supports it
+        if __user__["valves"].ENABLE_COMPACTION and model_info.get("supports_compaction", False):
+            if "context-management-2025-06-27" not in beta_headers:
+                beta_headers.append("context-management-2025-06-27")
+            beta_headers.append("compact-2026-01-12")
+
+            compact_edit: dict[str, Any] = {
+                "type": "compact_20260112",
+                "trigger": {
+                    "type": "input_tokens",
+                    "value": __user__["valves"].COMPACTION_TRIGGER_TOKENS,
+                },
+            }
+            if __user__["valves"].COMPACTION_INSTRUCTIONS.strip():
+                compact_edit["instructions"] = __user__["valves"].COMPACTION_INSTRUCTIONS.strip()
+
+            if "context_management" not in payload:
+                payload["context_management"] = {"edits": []}
+            payload["context_management"]["edits"].append(compact_edit)
 
         # Add effort beta header and output_config if effort is configured
         if model_info["supports_effort"] and effort_config:
@@ -2250,6 +2312,24 @@ class Pipe:
                             "text": f"\n\n---\n**IMPORTANT:** The following is NOT part of the user's message, but context from a memory system to help answer the user's questions:\n\n{extracted_memories}",
                         }
                     )
+
+        # Client-side compaction trim: drop messages before the last compaction
+        # block. The API would ignore them anyway but this saves bandwidth and
+        # avoids sending stale context over the wire.
+        last_compaction_idx = -1
+        for idx, msg in enumerate(processed_messages):
+            if msg.get("role") == "assistant":
+                for block in msg.get("content", []):
+                    if isinstance(block, dict) and block.get("type") == "compaction":
+                        last_compaction_idx = idx
+                        break
+        if last_compaction_idx > 0:
+            dropped = len(processed_messages[:last_compaction_idx])
+            processed_messages = processed_messages[last_compaction_idx:]
+            logger.info(
+                f"Compaction trim: dropped {dropped} messages before compaction boundary"
+            )
+
         return system_messages, processed_messages, previous_marker_metadata
 
     def _convert_tools_to_claude_format(
@@ -2564,6 +2644,23 @@ class Pipe:
             if role == "assistant":
                 content = PATTERN_TOOL_CALLS_DETAILS.sub("", content)
                 content = PATTERN_CODE_INTERPRETER_DETAILS.sub("", content)
+
+                # Extract compaction display blocks as API-native {type: "compaction"}
+                # blocks so the API recognises the boundary and drops prior content.
+                compaction_matches = list(PATTERN_COMPACTION_DETAILS.finditer(content))
+                if compaction_matches:
+                    blocks = []
+                    last_end = 0
+                    for match in compaction_matches:
+                        before = content[last_end:match.start()].strip()
+                        if before:
+                            blocks.append({"type": "text", "text": before})
+                        blocks.append({"type": "compaction", "content": match.group(1).strip()})
+                        last_end = match.end()
+                    after = content[last_end:].strip()
+                    if after:
+                        blocks.append({"type": "text", "text": after})
+                    return blocks
 
             # Only return non-empty text blocks
             if content.strip():
@@ -3207,6 +3304,11 @@ class Pipe:
                         f"Could not auto-enable native function calling: {e}"
                     )
 
+            # Tell middleware to skip reasoning tag detection — the pipe renders
+            # its own <details type="reasoning"> blocks which must not be re-parsed.
+            if __metadata__ is not None:
+                __metadata__.setdefault("params", {})["reasoning_tags"] = False
+
             payload, headers, new_marker_metadata, api_tool_names = await self._create_payload(
                 body, __metadata__, __user__, __tools__, __event_emitter__, __files__
             )
@@ -3237,7 +3339,11 @@ class Pipe:
             base_url = self.valves.ANTHROPIC_BASE_URL.strip() or None
             client = AsyncAnthropic(api_key=api_key, default_headers=headers, timeout=request_timeout, **({"base_url": base_url} if base_url else {}))
             payload_for_stream = {k: v for k, v in payload.items() if k != "stream"}
-            include_usage = body.get("stream_options", {}).get("include_usage", False)
+            include_usage = (
+                __user__["valves"].SHOW_TOKEN_COUNT != "Off"
+                or body.get("stream_options", {}).get("include_usage", False)
+            )
+            total_usage: Optional[dict[str, int]] = None
             if include_usage:
                 total_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
                 if self.valves.CACHE_CONTROL != "cache disabled":
@@ -3254,6 +3360,10 @@ class Pipe:
             thinking_start_time = None  # Track when thinking started for duration calc
             thinking_stream_start_idx = -1  # Position in final_message where thinking content starts
             thinking_last_block = ""  # Tracks current formatted thinking block for content-preserving replace
+
+            # Compaction state
+            compaction_content = ""
+            compaction_last_block = ""  # Tracks current formatted compaction block for content-preserving replace
 
             # SDK-accumulated message: captured after each stream completes
             # Replaces manual api_assistant_blocks/thinking_blocks accumulation
@@ -3982,6 +4092,20 @@ class Pipe:
                                     logger.debug(
                                         f"Context cleared: type={cleared_type}, tokens={cleared_tokens}"
                                     )
+                                elif content_type == "compaction":
+                                    # Compaction started — API is summarizing the conversation
+                                    compaction_content = ""
+                                    compaction_last_block = ""
+                                    await emit_event_local(
+                                        {
+                                            "type": "status",
+                                            "data": {
+                                                "description": "📦 Compacting conversation context...",
+                                                "done": False,
+                                            },
+                                        }
+                                    )
+                                    logger.info("Compaction block started")
 
                             # ---------------------------------------------------------
                             # EVENT: content_block_delta
@@ -4002,6 +4126,13 @@ class Pipe:
                                 elif delta_type == "signature_delta":
                                     # No manual tracking needed
                                     pass
+                                elif delta_type == "compaction_delta":
+                                    # Accumulate compaction content progressively (may arrive in multiple deltas)
+                                    compaction_content += getattr(delta, "content", "")
+                                    # Stream progressively via update_content_block (like thinking)
+                                    formatted = self._format_compaction_block(compaction_content)
+                                    await update_content_block(compaction_last_block, formatted)
+                                    compaction_last_block = formatted
                                 elif delta_type == "text_delta":
                                     text_delta = getattr(delta, "text", "")
 
@@ -4259,6 +4390,18 @@ class Pipe:
                                     elif final_message and not final_text().endswith("\n"):
                                         # Chunk was already flushed by throttle — ensure \n separator
                                         await emit_message_delta("\n")
+                                elif content_type == "compaction":
+                                    # Compaction block finished streaming
+                                    logger.info(f"Compaction summary complete: {len(compaction_content)} chars")
+                                    await emit_event_local(
+                                        {
+                                            "type": "status",
+                                            "data": {
+                                                "description": f"📦 Context compacted ({len(compaction_content)} chars summary)",
+                                                "done": True,
+                                            },
+                                        }
+                                    )
                                 elif content_type == "server_tool_use":
                                     logger.debug(
                                         f"Server tool block stopped: {active_server_tool_name}"
@@ -4713,6 +4856,12 @@ class Pipe:
                                 elif stop_reason == "model_context_window_exceeded":
                                     chunk += "Claude has reached the maximum context window for this model."
                                     conversation_ended = True
+                                elif stop_reason == "compaction":
+                                    # Compaction triggered — response contains only the compaction block.
+                                    # We need to continue the conversation with the compacted context.
+                                    # Reuse tool loop mechanism to auto-continue.
+                                    has_pending_tool_calls = True
+                                    logger.info("Compaction stop_reason — will auto-continue")
 
                             # ---------------------------------------------------------
                             # EVENT: message_stop
@@ -5121,21 +5270,8 @@ class Pipe:
 
         final_status = "✅ Response Complete"
         # ============ Token Count Display ============
-        if include_usage and __user__["valves"].SHOW_TOKEN_COUNT and total_usage:
-            # Use total_tokens from total_usage which now represents the last turn (Context Size)
-            total_tokens = total_usage.get("total_tokens", 0)
-
-            # Determine context window based on model capability and valve setting
-            model_info = self.get_model_info(body["model"].split("/")[-1])
-            is_1m = model_info.get("supports_1m_context", False)
-            context_window = 1_000_000 if is_1m else 200_000
-            context_label = "1M" if is_1m else "200k"
-            percentage = min((total_tokens / context_window) * 100, 100)
-
-            # Progress bar (10 segments)
-            filled = int(percentage / 10)
-            bar = "█" * filled + "░" * (10 - filled)
-
+        show_token_setting = __user__["valves"].SHOW_TOKEN_COUNT
+        if include_usage and show_token_setting != "Off" and total_usage:
             def format_num(n: int) -> str:
                 if n >= 1_000_000:
                     return f"{n/1_000_000:.1f}M"
@@ -5143,9 +5279,31 @@ class Pipe:
                     return f"{n/1_000:.1f}K"
                 return str(n)
 
+            # Context window progress bar
+            total_tokens = total_usage.get("total_tokens", 0)
+            model_info = self.get_model_info(body["model"].split("/")[-1])
+            context_window = model_info.get("context_length", 200_000)
+            context_label = f"{context_window // 1000}k" if context_window < 1_000_000 else f"{context_window / 1_000_000:.0f}M"
+            percentage = min((total_tokens / context_window) * 100, 100)
+            filled = int(percentage / 10)
+            bar = "█" * filled + "░" * (10 - filled)
+
             final_status += (
                 f" [{bar}] {format_num(total_tokens)}/{context_label} ({percentage:.1f}%)"
             )
+
+            # Cache status display (only in "With Cache" mode)
+            if (
+                show_token_setting == "With Cache"
+                and self.valves.CACHE_CONTROL != "cache disabled"
+            ):
+                ttl_label = "1hr" if self.valves.CACHE_TTL == "1 hour" else "5min"
+                cache_write = total_usage.get("cache_creation_input_tokens", 0)
+                cache_read = total_usage.get("cache_read_input_tokens", 0)
+                final_status += (
+                    f" | 📝 {format_num(cache_write)} ({ttl_label})"
+                    f" | 📖 {format_num(cache_read)}"
+                )
 
         # Consolidate: emit a final replace with the complete message so OpenWebUI
         # has the authoritative content (replaces any partial delta/replace state).
@@ -5164,10 +5322,6 @@ class Pipe:
             }
         )
         
-        logger.debug(f"Final status emitted: {final_status}")
-        logger.debug(f"Total usage: {total_usage}")
-        logger.debug(f"Final Message: {consolidated}")
-        
         # Emit chat:completion done event so frontend knows streaming finished
         # (triggers TTS finish, usage display, etc.)
         done_data: dict = {"choices": [{"finish_reason": "stop", "delta": {"content": ""}}], "done": True}
@@ -5178,6 +5332,8 @@ class Pipe:
         if __user__["valves"].DEBUG_MODE:
             # DEBUG: content already streamed via emit_event_local; skipping duplicate
             pass
+
+        return final_text()
 
     # =========================================================================
     # TASK MODEL (TITLE, TAGS, FOLLOW-UPS)
@@ -5711,7 +5867,8 @@ class Pipe:
     # assistant content back during tool loops. Stripping server_tool_use or
     # *_tool_result shifts thinking block indices, causing:
     #   "thinking blocks cannot be modified"
-    # Only strip truly structural meta-events (context_cleared, compaction).
+    # Only strip truly structural meta-events (context_cleared).
+    # Compaction blocks MUST be preserved — the API uses them to drop prior context.
     #
     # Thinking + redacted_thinking get strict key sanitization to prevent
     # cache_control or other extra fields from causing API errors.
@@ -5722,15 +5879,16 @@ class Pipe:
         "redacted_thinking": {"type", "data"},           # opaque data, pass through unchanged
     }
 
-    # Block types to skip entirely (structural meta-events, not real content)
-    _SKIP_BLOCK_TYPES = frozenset({"context_cleared", "compaction"})
+    # Block types to skip entirely (structural meta-events)
+    _SKIP_BLOCK_TYPES = frozenset({"context_cleared"})
 
     def _convert_sdk_message_to_api_blocks(self, message) -> list:
         """Convert SDK accumulated BetaMessage content to API-compatible block dicts.
 
         Mirrors the SDK's own tool runner behavior: keeps ALL content blocks
-        (including server_tool_use, *_tool_result) to preserve thinking block
-        positions. Only skips structural meta-events (context_cleared, compaction).
+        (including server_tool_use, *_tool_result, compaction) to preserve
+        thinking block positions and compaction boundaries. Skips structural
+        meta-events (context_cleared).
 
         Strict key sanitization is applied ONLY to thinking/redacted_thinking
         blocks (to prevent cache_control from being sent). All other blocks
@@ -5743,6 +5901,14 @@ class Pipe:
 
             # Skip structural meta-events (not real content blocks)
             if block_type in self._SKIP_BLOCK_TYPES:
+                continue
+
+            # Compaction: preserve as {type: "compaction"} so the API
+            # recognises the boundary and drops all prior content blocks.
+            if block_type == "compaction":
+                content = block_dict.get("content", "")
+                if content:
+                    blocks.append({"type": "compaction", "content": content})
                 continue
 
             # Thinking/redacted_thinking: strict key sanitization
@@ -5776,6 +5942,15 @@ class Pipe:
     # IMMEDIATE BLOCK FORMATTING HELPERS
     # These format individual blocks immediately when they finish streaming
     # =========================================================================
+    def _format_compaction_block(self, summary: str) -> str:
+        """Format a compaction block as a collapsible <details> for display/storage."""
+        return (
+            '<details type="compaction">\n'
+            "<summary>📦 Context Summary</summary>\n\n"
+            f"{summary}\n\n"
+            "</details>\n\n"
+        )
+
     def _format_thinking_block(
         self, content: str, duration: Optional[float] = None
     ) -> str:
