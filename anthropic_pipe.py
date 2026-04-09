@@ -3238,6 +3238,7 @@ class Pipe:
             client = AsyncAnthropic(api_key=api_key, default_headers=headers, timeout=request_timeout, **({"base_url": base_url} if base_url else {}))
             payload_for_stream = {k: v for k, v in payload.items() if k != "stream"}
             include_usage = body.get("stream_options", {}).get("include_usage", False)
+            total_usage = None
             if include_usage:
                 total_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
                 if self.valves.CACHE_CONTROL != "cache disabled":
@@ -5178,6 +5179,7 @@ class Pipe:
         if __user__["valves"].DEBUG_MODE:
             # DEBUG: content already streamed via emit_event_local; skipping duplicate
             pass
+        return consolidated
 
     # =========================================================================
     # TASK MODEL (TITLE, TAGS, FOLLOW-UPS)
